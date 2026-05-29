@@ -1,0 +1,1 @@
+We can already see that we need half the steps to perform better using a simple DG implementation.
