@@ -14,8 +14,8 @@ print(jax.devices())
 H = 0.6
 L = 1
 
-data_loader_left = WaveguideBoundaryData('data/pinn_boundary_left_circle_contrast20percent.csv')
-data_loader_right = WaveguideBoundaryData('data/pinn_boundary_right_circle_contrast20percent.csv')
+data_loader_left = WaveguideBoundaryData('data/pinn_boundary_left_barre_contrast20percent.csv')
+data_loader_right = WaveguideBoundaryData('data/pinn_boundary_right_barre_contrast20percent.csv')
 
 X_left, Y_left, U_re_left, U_im_left, freq = data_loader_left.get_training_data()
 X_right, Y_right, U_re_right, U_im_right, _ = data_loader_right.get_training_data()
@@ -74,7 +74,7 @@ y_gauss_legendre, w_gauss_legendre = np.polynomial.legendre.leggauss(n_gauss_leg
 
 n_input = 2
 n_layers_uv = [2*m, 64, 64, 64, 64, 2]
-n_layers_m = [n_input, 128, 128, 128, 1] # Augmentation de la taille du réseau m
+n_layers_m = [n_input, 128, 128, 128, 1]
 
 def init_layers(key, n_layers):
     layers = []
@@ -93,7 +93,7 @@ layers_m[-1]["b"] = -jnp.log(27/5)
 
 params_uv = {
     'layers': layers_uv,
-    'sigma': jnp.array([kmax, 0.5*kmax])
+    'sigma': jnp.array([kmax, 0])
 }
 
 def forward_func(layers, X):
@@ -290,11 +290,11 @@ def train(params_uv, layers_m, N, num_cycles, steps_u, steps_m, freq, eval_inter
     opt_state_m = adam_m.init(layers_m)
 
     # Poids pour les loss : [pde, bc, data, tv]
-    weights_u = jnp.array([1.0, 1.0, 1.0, 0.0])
-    weights_m = jnp.array([1.0, 0.0, 0.0, 1.0])
+    weights_u = jnp.array([1.0, 1.0, 100.0, 0.0])
+    weights_m = jnp.array([1.0, 0.0, 0.0, 0.0])
 
     print(f"\n{'='*60}")
-    print(f"--- Entraînement Alterné FWI (Corrigé) : f = {freq} Hz ---")
+    print(f"--- Entraînement Alterné FWI : f = {freq} Hz ---")
     print(f"{'='*60}")
 
     for cycle in range(num_cycles):
@@ -332,8 +332,8 @@ N = 1000
 eval_interval = 200
 
 # Paramètres du schéma alterné
-num_cycles = 10
-steps_u = 1000
+num_cycles = 50
+steps_u = 100
 steps_m = 500
 
 key, subkey = jax.random.split(key)
