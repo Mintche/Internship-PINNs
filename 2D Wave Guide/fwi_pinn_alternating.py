@@ -14,13 +14,13 @@ print(jax.devices())
 H = 0.6
 L = 1
 
-data_loader_left = WaveguideBoundaryData('data/pinn_boundary_left_barre_contrast20percent.csv')
-data_loader_right = WaveguideBoundaryData('data/pinn_boundary_right_barre_contrast20percent.csv')
+data_loader_left = WaveguideBoundaryData('data/pinn_boundary_left_barrehalf_contrast20percent_mode0.csv')
+data_loader_right = WaveguideBoundaryData('data/pinn_boundary_right_barrehalf_contrast20percent_mode0.csv')
 
 X_left, Y_left, U_re_left, U_im_left, freq = data_loader_left.get_training_data()
 X_right, Y_right, U_re_right, U_im_right, _ = data_loader_right.get_training_data()
 
-f_test = 600.0
+f_test = 300.0
 Y_left = Y_left[f_test]
 Y_right = Y_right[f_test]
 
@@ -290,7 +290,7 @@ def train(params_uv, layers_m, N, num_cycles, steps_u, steps_m, freq, eval_inter
     opt_state_m = adam_m.init(layers_m)
 
     # Poids pour les loss : [pde, bc, data, tv]
-    weights_u = jnp.array([1.0, 1.0, 100.0, 0.0])
+    weights_u = jnp.array([1.0, 1.0, 1.0, 0.0])
     weights_m = jnp.array([1.0, 0.0, 0.0, 0.0])
 
     print(f"\n{'='*60}")
@@ -333,7 +333,7 @@ eval_interval = 200
 
 # Paramètres du schéma alterné
 num_cycles = 50
-steps_u = 100
+steps_u = 1000
 steps_m = 500
 
 key, subkey = jax.random.split(key)
