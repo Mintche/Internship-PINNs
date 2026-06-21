@@ -64,7 +64,7 @@ max_steps_adam_phase2 = 100001
 max_steps_lbfgs_phase2 = 201
 
 # Frequencies to run training on
-training_frequencies = np.array([300.0])
+training_frequencies = np.array([300.0,500.0,700.0])
 
 # ==============================================================================
 # SECTION 2: DATA LOADING & PREPROCESSING
@@ -224,17 +224,11 @@ def loss_fn(params_uv, layers_m, x, y, f, target_u_left, target_u_right, y_bnd_l
     
     def uv_y(x, y):
         return jax.jacfwd(uv, argnums=1)(x, y) * (2 / H)
-    
-    def m_x(x, y):
-        return jax.grad(m, argnums=0)(x, y) / L
-    
-    def m_y(x, y):
-        return jax.grad(m, argnums=1)(x, y) * (2 / H)
 
     def pde_residual(x, y):
         uv_xx = jax.jacfwd(jax.jacfwd(uv, argnums=0), argnums=0)(x, y) / L**2
         uv_yy = jax.jacfwd(jax.jacfwd(uv, argnums=1), argnums=1)(x, y) * (2 / H)**2
-        return ((uv_xx + uv_yy) + k2(x,y)*uv(x, y))/(2 * jnp.pi * f / c0)**2
+        return (uv_xx + uv_yy) + k2(x,y)*uv(x, y)
     
     k0 = 2 * jnp.pi * f / c0
     beta_n = jnp.sqrt(k0**2 - (n_modes * jnp.pi / H)**2 + 0j)
@@ -274,7 +268,7 @@ def loss_fn(params_uv, layers_m, x, y, f, target_u_left, target_u_right, y_bnd_l
     neum_loss = jnp.mean(jax.vmap(uv_y, in_axes=(0, None))(x, 1.0)**2 + jax.vmap(uv_y, in_axes=(0, None))(x, -1.0)**2)
     bc_loss = neum_loss + dtn_loss_left + dtn_loss_right
     
-    # Data + TV Loss
+    # Data
     if is_warmup:
         data_loss = 0.0
     else:
