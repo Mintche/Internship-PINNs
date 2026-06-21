@@ -1,0 +1,16 @@
+# Core deep learning framework (JAX + JAXlib)
+# For CPU installation, 'pip install jax jaxlib' is sufficient.
+# For GPU (CUDA) support, refer to the official JAX installation guide:
+# https://github.com/google/jax#installation
+jax
+jaxlib
+
+# Optimization library for JAX
+optax
+
+# Scientific computing and data analysis
+numpy
+pandas
+
+# Plotting and visualization
+matplotlib

@@ -1,11 +1,11 @@
+import os
 import jax
 import jax.numpy as jnp
 import functools
 import numpy as np
 import optax
 import matplotlib.pyplot as plt
-from data_load import WaveguideBoundaryData
-import os
+from data_loader import WaveguideBoundaryData
 
 print(jax.devices())
 
@@ -14,8 +14,13 @@ print(jax.devices())
 H = 0.6
 L = 1
 
-data_loader_left = WaveguideBoundaryData('data/pinn_boundary_left_barrehalf_contrast20percent_mode0.csv')
-data_loader_right = WaveguideBoundaryData('data/pinn_boundary_right_barrehalf_contrast20percent_mode0.csv')
+# Setup dynamic pathing relative to the script location
+script_dir = os.path.dirname(os.path.abspath(__file__))
+data_left_path = os.path.join(script_dir, 'data', 'pinn_boundary_left_barrehalf_contrast20percent_mode0.csv')
+data_right_path = os.path.join(script_dir, 'data', 'pinn_boundary_right_barrehalf_contrast20percent_mode0.csv')
+
+data_loader_left = WaveguideBoundaryData(data_left_path)
+data_loader_right = WaveguideBoundaryData(data_right_path)
 
 X_left, Y_left, U_re_left, U_im_left, freq = data_loader_left.get_training_data()
 X_right, Y_right, U_re_right, U_im_right, _ = data_loader_right.get_training_data()
@@ -392,8 +397,10 @@ def plot_results(params_uv, layers_m):
     plt.title('Re(u) PINN')
 
     plt.tight_layout()
-    os.makedirs('fig', exist_ok=True)
-    plt.savefig('fig/fwi_pinn_alternating_results.png', dpi=300, bbox_inches='tight')
-    print("Results saved to fig/fwi_pinn_alternating_results.png")
+    fig_dir = os.path.join(script_dir, 'fig')
+    os.makedirs(fig_dir, exist_ok=True)
+    save_path = os.path.join(fig_dir, 'fwi_pinn_alternating_results.png')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"Results saved to {save_path}")
 
 plot_results(params_uv, layers_m)

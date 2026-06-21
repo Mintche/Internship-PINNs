@@ -1,2 +1,9 @@
 /.venv
 /.vscode
+
+# Python bytecode and cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
