@@ -32,9 +32,9 @@ msq_max = 1.0 / (cmin**2)
 # Define which modes to use. Data files follow the naming convention:
 #   pinn_boundary_{left/right}_{defect_name}_contrast{X}percent_mode{N}.csv
 script_dir = os.path.dirname(os.path.abspath(__file__))
-defect_name = 'barrehalf'
+defect_name = 'circlebottomright'
 contrast_label = '20percent'
-training_modes = [0, 1]  # List of mode indices to use
+training_modes = [0, 1, 2]  # List of mode indices to use
 
 # Build data paths per mode: { mode_idx: (left_path, right_path) }
 data_paths = {}
@@ -52,8 +52,8 @@ key = jax.random.key(random_seed)
 # --- Neural Network Architectures ---
 m = 64  # Dimensionality of Fourier feature mapping
 n_input = 2
-n_layers_uv = [2 * m, 64, 64, 64, 64, 2]
-n_layers_m = [n_input, 64, 64, 1]
+n_layers_uv = [2 * m, 128, 128, 64, 64, 2]
+n_layers_m = [n_input, 128, 64, 1]
 
 # --- Gauss-Legendre Quadrature ---
 n_gauss_legendre = 20
@@ -70,13 +70,13 @@ eval_interval = 200      # Interval for evaluating losses and printing progress
 switch_threshold = 0.0   # Threshold for L-BFGS switch criterion
 switch_window = 10       # Window size for switch criterion
 
-max_steps_adam_phase1 = 20001
-max_steps_lbfgs_phase1 = 201
-max_steps_adam_phase2 = 100001
-max_steps_lbfgs_phase2 = 201
+max_steps_adam_phase1 = 40001
+max_steps_lbfgs_phase1 = 601
+max_steps_adam_phase2 = 150001
+max_steps_lbfgs_phase2 = 3001
 
 # Frequencies to run training on (curriculum learning: low to high)
-training_frequencies = np.array([400.0])
+training_frequencies = np.array([1400.0])
 
 # ==============================================================================
 # SECTION 2: DATA LOADING & PREPROCESSING
@@ -185,7 +185,7 @@ def init_layers_uv(key, n_layers, f_val, mode_val):
     return {'layers': layers_uv, 'sigma': jnp.array([kx, ky])}
 
 # --- Network Initialization ---
-# Sound speed parameter network (layers_m) — shared across all modes and frequencies
+# Slowness parameter network (layers_m) — shared across all modes and frequencies
 key, subkey_m = jax.random.split(key)
 layers_m = init_layers(subkey_m, n_layers_m)
 layers_m[-1]["b"] = -jnp.log(27.0 / 5.0)
@@ -360,7 +360,7 @@ def make_train_step_forward(adam_opt, lbfgs_opt):
     return train_step_forward
 
 
-def make_train_step_inverse_multimode(adam_opt_uv, adam_opt_m, lbfgs_opt_packed, n_modes_to_use):
+def make_train_step_inverse_multimode(adam_opt_uv, adam_opt_m, lbfgs_opt_packed):
 
     @functools.partial(jax.jit, static_argnames=('N', 'use_lbfgs', 'n_modes_used'))
     def train_step_inverse(params_uv_list, layers_m, opt_states_uv, opt_state_m,
@@ -588,11 +588,11 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
 
             # Build optimizer for u-networks
             cosine_uv_p2 = optax.schedules.cosine_decay_schedule(
-                init_value=lr_uv, decay_steps=max_steps_adam_phase2, alpha=0.1)
+                init_value=lr_uv, decay_steps=100000, alpha=0.1)
             cosine_sigma_p2 = optax.schedules.cosine_decay_schedule(
-                init_value=lr_sigma, decay_steps=max_steps_adam_phase2//3, alpha=0.1)
+                init_value=lr_sigma, decay_steps=30000, alpha=0.1)
             cosine_m_p2 = optax.schedules.cosine_decay_schedule(
-                init_value=lr_m, decay_steps=max_steps_adam_phase2, alpha=0.1)
+                init_value=lr_m, decay_steps=100000, alpha=0.1)
 
             adam_base_p2 = optax.chain(
                 optax.clip_by_global_norm(1.0),
@@ -623,7 +623,7 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
             lbfgs_packed_p2 = optax.lbfgs()
 
             step_inverse = make_train_step_inverse_multimode(
-                adam_uv_p2, adam_m_p2, lbfgs_packed_p2, n_modes_used)
+                adam_uv_p2, adam_m_p2, lbfgs_packed_p2)
 
             # Initialize optimizer states: one per mode for u, one for m
             opt_states_uv = [adam_uv_p2.init(p) for p in param_uv_list]
@@ -639,7 +639,7 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
             u_norms = [mode_data[mi]['U_norm'][freq] for mi in training_modes]
 
             data_weight_schedule = optax.linear_schedule(
-                init_value=0.1, end_value=10.0,
+                init_value=0.1, end_value=100.0,
                 transition_steps=max(max_steps_adam_phase2 // 3, 1))
 
             loss_history_p2 = []
