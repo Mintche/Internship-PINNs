@@ -32,9 +32,11 @@ msq_max = 1.0 / (cmin**2)
 # Define which modes to use. Data files follow the naming convention:
 #   pinn_boundary_{left/right}_{defect_name}_contrast{X}percent_mode{N}.csv
 script_dir = os.path.dirname(os.path.abspath(__file__))
-defect_name = 'circlebottomright'
+defect_name = 'barrehalf'
 contrast_label = '20percent'
-training_modes = [0, 1, 2]  # List of mode indices to use
+training_modes = [0, 1, 2, 3]  # List of mode indices to use
+# Frequencies to run training on (curriculum learning: low to high)
+training_frequencies = np.array([900.0, 1000.0])
 
 # Build data paths per mode: { mode_idx: (left_path, right_path) }
 data_paths = {}
@@ -52,11 +54,11 @@ key = jax.random.key(random_seed)
 # --- Neural Network Architectures ---
 m = 64  # Dimensionality of Fourier feature mapping
 n_input = 2
-n_layers_uv = [2 * m, 128, 128, 64, 64, 2]
+n_layers_uv = [2 * m, 256, 128, 64, 2]
 n_layers_m = [n_input, 128, 64, 1]
 
 # --- Gauss-Legendre Quadrature ---
-n_gauss_legendre = 20
+n_gauss_legendre = 30
 
 # --- Optimizer Learning Rates ---
 lr_uv = 1e-3
@@ -75,8 +77,9 @@ max_steps_lbfgs_phase1 = 601
 max_steps_adam_phase2 = 150001
 max_steps_lbfgs_phase2 = 3001
 
-# Frequencies to run training on (curriculum learning: low to high)
-training_frequencies = np.array([1400.0])
+SHOW_PLOTS = True
+
+weights_phase1_ = jnp.array([1.0, 10.0, 0.0])
 
 # ==============================================================================
 # SECTION 2: DATA LOADING & PREPROCESSING
@@ -135,6 +138,26 @@ for mode_idx in training_modes:
 # Use the first mode's dataset_freq as reference (should be identical across modes)
 dataset_freq = mode_data[training_modes[0]]['dataset_freq']
 
+'''
+--- Reconcile training_frequencies with the data ---
+training_frequencies is hand-set above but every data lookup keys on it
+(mode_data[...][freq]). Snap each requested frequency to the nearest value that
+actually exists in the dataset so the keys always match, and fail loudly if a
+requested frequency has no close counterpart instead of raising a bare KeyError.
+'''
+
+_dataset_freqs = jnp.array([float(f) for f in dataset_freq])
+_snapped_freqs = []
+for _f in training_frequencies:
+    _j = int(jnp.argmin(jnp.abs(_dataset_freqs - float(_f))))
+    _nearest = float(_dataset_freqs[_j])
+    if abs(_nearest - float(_f)) > 1e-6 * jnp.max(jnp.abs(_nearest), 1.0):
+        raise ValueError(
+            f"Requested training frequency {float(_f)} Hz has no match in the dataset "
+            f"frequencies {sorted(_dataset_freqs.tolist())} (nearest = {_nearest} Hz).")
+    _snapped_freqs.append(_nearest)
+training_frequencies = jnp.array(_snapped_freqs)
+
 # Calculate dynamic boundary modes configuration
 fmax = jnp.max(dataset_freq)
 N_modes = int(jnp.round(2 * H * fmax / c0)) + 5
@@ -180,7 +203,7 @@ def init_layers(key, n_layers):
 
 def init_layers_uv(key, n_layers, f_val, mode_val):
     kx = 2 * jnp.pi * f_val / (contrast * c0)
-    ky = mode_val * jnp.pi / H
+    ky = (mode_val + int(mode_val==0)) * jnp.pi / H
     layers_uv = init_layers(key, n_layers)
     return {'layers': layers_uv, 'sigma': jnp.array([kx, ky])}
 
@@ -228,12 +251,16 @@ x_plot = np.linspace(-1, 1, 100)
 y_plot = np.linspace(0, 0.6, 50)
 c_grid = jax.vmap(jax.vmap(c, in_axes=(0, None)), in_axes=(None, 0))(x_plot, 2 * y_plot / H - 1)
 
+os.makedirs(os.path.join(script_dir, 'fig'), exist_ok=True)
 plt.figure(figsize=(7, 3.5))
 plt.pcolormesh(x_plot, y_plot, c_grid)
 plt.colorbar(label="Sound speed c(x, y)")
 plt.title("Initial Sound Speed Field")
 plt.tight_layout()
-plt.show()
+plt.savefig(os.path.join(script_dir, 'fig', f'initial_sound_speed.png'), dpi=150)
+if SHOW_PLOTS:
+    plt.show()
+plt.close()
 
 # ==============================================================================
 # SECTION 6: LOSS FUNCTION DEFINITIONS
@@ -322,7 +349,7 @@ def loss_fn(params_uv, layers_m, x, y, f, mode_index, target_u_left, target_u_ri
 def make_train_step_forward(adam_opt, lbfgs_opt):
     """Train step for Phase 1: only update one u-network, m is frozen."""
 
-    @functools.partial(jax.jit, static_argnames=('N', 'use_lbfgs', 'use_healthy_guide', 'mode_index'))
+    @functools.partial(jax.jit, static_argnames=('N', 'use_lbfgs', 'use_healthy_guide'))
     def train_step_forward(params_uv, layers_m, opt_state_uv, key, f_val, mode_index,
                            target_left, target_right, y_bnd_left, y_bnd_right, u_norm,
                            current_weights, N, use_lbfgs=False, use_healthy_guide=True):
@@ -460,7 +487,7 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
     loss_forward = {mi: [] for mi in training_modes}
     loss_inverse = []
 
-    weights_phase1 = jnp.array([1.0, 10.0, 0.0])
+    weights_phase1 = weights_phase1_
 
     best_params_uv = dict(params_uv)  # shallow copy of the dict
     n_modes_used = len(training_modes)
@@ -639,8 +666,8 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
             u_norms = [mode_data[mi]['U_norm'][freq] for mi in training_modes]
 
             data_weight_schedule = optax.linear_schedule(
-                init_value=0.1, end_value=100.0,
-                transition_steps=max(max_steps_adam_phase2 // 3, 1))
+                init_value=0.1, end_value=10.0,
+                transition_steps=max(10000, 1))
 
             loss_history_p2 = []
             switched_to_lbfgs_p2 = False
@@ -744,7 +771,9 @@ for f in training_frequencies:
         ax.set_title(f'Re(u) PINN at {f} Hz — Mode {mode_idx}')
         fig.colorbar(pcm, ax=ax, shrink=0.8, location='left')
         plt.tight_layout()
-        plt.show()
+        if SHOW_PLOTS:
+            plt.show()
+        plt.close()
 
 # --- Plot Phase 1 (Forward) Training Losses per mode ---
 for mode_idx in training_modes:
@@ -772,7 +801,9 @@ for mode_idx in training_modes:
     ax2.legend(loc="upper right")
     ax2.grid(True)
     plt.tight_layout()
-    plt.show()
+    if SHOW_PLOTS:
+        plt.show()
+    plt.close()
 
 # --- Plot Phase 2 (Inverse) Training Losses ---
 if len(loss_inverse) > 0:
@@ -803,7 +834,9 @@ if len(loss_inverse) > 0:
     modes_str = '_'.join([str(mi) for mi in training_modes])
     freqs_str = '_'.join([str(int(f)) for f in training_frequencies])
     plt.savefig(os.path.join(script_dir, 'fig', f'2D_WG_losses_modes{modes_str}_freqs{freqs_str}.pdf'))
-    plt.show()
+    if SHOW_PLOTS:
+        plt.show()
+    plt.close()
 
 # --- Plot final reconstructed sound speed field c(x, y) ---
 def c_final(x, y):
@@ -822,4 +855,6 @@ plt.title(f"Reconstructed c(x,y) — Modes [{modes_str}] | Freqs [{freqs_str}] H
 plt.tight_layout()
 plt.savefig(os.path.join(script_dir, 'fig',
     f'2D_WG_c_map_modes{"_".join([str(mi) for mi in training_modes])}_freqs{"_".join([str(int(f)) for f in training_frequencies])}.pdf'))
-plt.show()
+if SHOW_PLOTS:
+    plt.show()
+plt.close()
