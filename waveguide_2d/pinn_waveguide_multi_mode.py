@@ -49,7 +49,7 @@ max_mode_index = None       # None = load all available, or set e.g. 1 to cap at
 enforce_even_modes = True
 
 # Frequencies to run training on (curriculum learning: low to high)
-training_frequencies = np.array([600.0, 900.0])
+training_frequencies = np.array([1200.0, 1400.0, 1600.0])
 
 # Auto-discover available mode data files
 def discover_mode_files(script_dir, defect_name, contrast_label, max_mode_index=None):
@@ -203,10 +203,6 @@ for freq in training_frequencies:
                                    mode_data, enforce_even=enforce_even_modes)
     active_modes_per_freq[float(freq)] = active
     print(f"  f={freq:.0f} Hz → active modes: {active}")
-
-active_modes_per_freq[600.0] = [0, 1, 2] #to customize the training
-
-active_modes_per_freq[900.0] = [0, 1,  2, 3]
 
 # Collect all (freq, mode) pairs that will be used
 all_fm_pairs = set()
