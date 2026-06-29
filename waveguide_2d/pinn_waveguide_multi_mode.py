@@ -5,15 +5,10 @@ import matplotlib.pyplot as plt
 import jax
 import jax.numpy as jnp
 
-# Enforce float32 globally to prevent silent float64 promotion
 jax.config.update("jax_enable_x64", False)
 
 import optax
 from data_loader import WaveguideBoundaryData
-
-# Print JAX devices to verify setup
-print("JAX Devices:", jax.devices())
-print("Default JAX dtype:", jnp.ones(1).dtype)
 
 # ==============================================================================
 # SECTION 1: CONFIGURATION & HYPERPARAMETERS
@@ -24,14 +19,13 @@ H = 0.6  # Height of the waveguide
 L = 1.0  # Half-length of the waveguide
 
 # --- Physics Parameters ---
-c0 = 340.0         # Reference speed of sound
-cmax = 1.5 * c0    # Maximum speed of sound
-cmin = 0.5 * c0    # Minimum speed of sound
-contrast = 1.0
-
-# Calculated inverse-squared speed boundaries
-msq_min = 1.0 / (cmax**2)
-msq_max = 1.0 / (cmin**2)
+c0 = 340.0
+contrast_max = 0.4
+cmin = c0 * (1-contrast_max)
+cmax = c0 * (1+contrast_max)
+m0 = 1/c0**2
+m_min = 1 / cmax**2
+m_max = 1 / cmin**2
 
 # --- Data Configuration ---
 # Data files follow the naming convention:
@@ -41,19 +35,55 @@ defect_name = 'barrehalf'
 contrast_label = '20percent'
 
 # --- Mode Selection ---
-# max_mode_index: highest mode index to attempt loading (None = auto-detect all)
-# enforce_even_modes: if True, use an even number of excitation modes per frequency
-#   to balance symmetric (n=0,2,4..) and antisymmetric (n=1,3,5..) modes about y=H/2,
-#   avoiding a symmetry prior in the reconstructed celerity map.
-max_mode_index = None       # None = load all available, or set e.g. 1 to cap at mode 1
-enforce_even_modes = True
+max_mode_index = None
 
 # Frequencies to run training on (curriculum learning: low to high)
-training_frequencies = np.array([1200.0, 1400.0, 1600.0])
+training_frequencies = np.array([600.0])
 
-# Auto-discover available mode data files
+# Active modes per frequency — edit these to select which modes to use
+active_modes_per_freq = {
+    600.0: [0, 1]
+}
+
+# --- Random Seed ---
+random_seed = 0
+key = jax.random.key(random_seed)
+
+# --- Neural Network Architectures ---
+m_fourier_features = 64  # Dimensionality of Fourier feature mapping
+n_input = 2
+n_layers_uv = [2 * m_fourier_features, 128, 128, 64, 2]
+n_layers_m = [n_input, 128, 64, 1]
+
+# --- Gauss-Legendre Quadrature ---
+n_gauss_legendre = 40
+
+# --- Optimizer Learning Rates ---
+lr_uv = 1e-3
+lr_m = 3e-4
+lr_sigma = 1e-2
+
+# --- Training Hyperparameters ---
+N_adam = 4000            # Number of collocation points for Adam
+N_lbfgs = 1000           # Number of collocation points for L-BFGS
+eval_interval = 200      # Interval for evaluating losses and printing progress
+switch_threshold = 0.0   # Threshold for L-BFGS switch criterion
+switch_window = 10       # Window size for switch criterion
+
+max_steps_adam_phase1 = 40001
+max_steps_lbfgs_phase1 = 3001
+max_steps_adam_phase2 = 100001
+max_steps_lbfgs_phase2 = 12001
+
+SHOW_PLOTS = True
+
+weights_phase1 = jnp.array([1.0, 10.0, 0.0])
+
+# ==============================================================================
+# SECTION 2: DATA DISCOVERY
+# ==============================================================================
+
 def discover_mode_files(script_dir, defect_name, contrast_label, max_mode_index=None):
-    """Find all mode data files that exist on disk, up to max_mode_index."""
     data_paths = {}
     mode_idx = 0
     while True:
@@ -70,160 +100,13 @@ def discover_mode_files(script_dir, defect_name, contrast_label, max_mode_index=
             break
     return data_paths
 
-data_paths = discover_mode_files(script_dir, defect_name, contrast_label, max_mode_index)
-available_modes = sorted(data_paths.keys())
-print(f"Discovered mode data files for modes: {available_modes}")
-
-# --- Random Seed ---
-random_seed = 0
-key = jax.random.key(random_seed)
-
-# --- Neural Network Architectures ---
-m = 64  # Dimensionality of Fourier feature mapping
-n_input = 2
-n_layers_uv = [2 * m, 128, 128, 64, 2]
-n_layers_m = [n_input, 128, 64, 1]
-
-# --- Gauss-Legendre Quadrature ---
-n_gauss_legendre = 30
-
-# --- Optimizer Learning Rates ---
-lr_uv = 3e-4
-lr_m = 3e-5
-lr_sigma = 1e-2
-
-# --- Training Hyperparameters ---
-N_adam = 4000            # Number of collocation points for Adam
-N_lbfgs = 1000           # Number of collocation points for L-BFGS
-eval_interval = 200      # Interval for evaluating losses and printing progress
-switch_threshold = 0.0   # Threshold for L-BFGS switch criterion
-switch_window = 10       # Window size for switch criterion
-
-max_steps_adam_phase1 = 40001
-max_steps_lbfgs_phase1 = 601
-max_steps_adam_phase2 = 100001
-max_steps_lbfgs_phase2 = 3001
-
-SHOW_PLOTS = True
-
-weights_phase1_ = jnp.array([1.0, 10.0, 0.0])
-
 # ==============================================================================
-# SECTION 2: DATA LOADING & PREPROCESSING
-# ==============================================================================
-
-# Load boundary data for each discovered mode.
-# mode_data[mode_idx] stores Y coords, normalized fields, and available frequencies.
-mode_data = {}
-
-for mode_idx in available_modes:
-    left_path, right_path = data_paths[mode_idx]
-    loader_left = WaveguideBoundaryData(left_path)
-    loader_right = WaveguideBoundaryData(right_path)
-
-    X_left, Y_left_raw, U_re_left, U_im_left, mode_freq = loader_left.get_training_data()
-    X_right, Y_right_raw, U_re_right, U_im_right, _ = loader_right.get_training_data()
-
-    # Process Y coordinates (normalize to [-1, 1])
-    Y_left = jnp.array(Y_left_raw[mode_freq[0]], dtype=jnp.float32)
-    Y_right = jnp.array(Y_right_raw[mode_freq[0]], dtype=jnp.float32)
-
-    Y_norm_val = jnp.max(Y_left)
-    Y_left = 2 * Y_left / Y_norm_val - 1
-    Y_right = 2 * Y_right / Y_norm_val - 1
-
-    # Normalize complex wave fields per frequency
-    U_norm = {}
-    U_left_norm = {}
-    U_right_norm = {}
-
-    for f in mode_freq:
-        re_l = jnp.array(U_re_left[f], dtype=jnp.float32)
-        im_l = jnp.array(U_im_left[f], dtype=jnp.float32)
-        re_r = jnp.array(U_re_right[f], dtype=jnp.float32)
-        im_r = jnp.array(U_im_right[f], dtype=jnp.float32)
-
-        norm = jnp.sqrt(jnp.max(jnp.concatenate((
-            re_l**2 + im_l**2,
-            re_r**2 + im_r**2
-        ))))
-        
-        U_norm[f] = norm
-        re_l /= norm
-        im_l /= norm
-        re_r /= norm
-        im_r /= norm
-        
-        U_left_norm[f] = jnp.stack([re_l, im_l], axis=1)
-        U_right_norm[f] = jnp.stack([re_r, im_r], axis=1)
-
-    mode_data[mode_idx] = {
-        'Y_left': Y_left,
-        'Y_right': Y_right,
-        'U_left_norm': U_left_norm,
-        'U_right_norm': U_right_norm,
-        'U_norm': U_norm,
-        'dataset_freq': set(float(f) for f in mode_freq),  # set for O(1) lookup
-    }
-    print(f"  Mode {mode_idx}: {len(mode_freq)} frequencies loaded ({float(mode_freq[0]):.0f}–{float(mode_freq[-1]):.0f} Hz)")
-
-# Use mode 0's frequencies as the reference dataset (superset of all)
-dataset_freq = mode_data[0]['dataset_freq']
-
-# ==============================================================================
-# SECTION 2b: DYNAMIC MODE SELECTION PER FREQUENCY
-# ==============================================================================
-
-def compute_active_modes(freq, c0, H, available_modes, mode_data, enforce_even=True):
-    active = []
-    for n in available_modes:
-        f_cutoff = n * c0 / (2 * H)
-        if freq <= f_cutoff:
-            continue  # evanescent in healthy guide
-        # Check data availability
-        if freq not in mode_data[n]['dataset_freq']:
-            continue
-        active.append(n)
-    
-    if len(active) == 0:
-        # Fallback: mode 0 should always be available
-        raise ValueError(f"No propagative modes with data at {freq} Hz. "
-                         f"Check your training_frequencies.")
-    
-    # Enforce even count (drop highest mode if needed)
-    if enforce_even and len(active) > 1 and len(active) % 2 != 0:
-        active = active[:-1]  # drop the highest mode
-    
-    return active
-
-# Pre-compute active modes for each training frequency
-active_modes_per_freq = {}
-for freq in training_frequencies:
-    active = compute_active_modes(float(freq), c0, H, available_modes,
-                                   mode_data, enforce_even=enforce_even_modes)
-    active_modes_per_freq[float(freq)] = active
-    print(f"  f={freq:.0f} Hz → active modes: {active}")
-
-# Collect all (freq, mode) pairs that will be used
-all_fm_pairs = set()
-for freq, modes in active_modes_per_freq.items():
-    for mi in modes:
-        all_fm_pairs.add((freq, mi))
-
-# ==============================================================================
-# SECTION 3: FOURIER FEATURE MAPPING & SETUP
+# SECTION 3: FOURIER FEATURE MAPPING & QUADRATURE SETUP
 # ==============================================================================
 
 # Initialize random projection matrix for Fourier features
 key, subkey = jax.random.split(key)
-B_base = jax.random.normal(subkey, (m, 2))
-
-def gamma(x, y, sigma):
-    x_phys = x * L 
-    y_phys = (y + 1.0) * H / 2.0
-    v_phys = jnp.array([x_phys, y_phys])
-    B = B_base * sigma
-    return jnp.concatenate([jnp.cos(B @ v_phys), jnp.sin(B @ v_phys)])
+B_base = jax.random.normal(subkey, (m_fourier_features, 2))
 
 # --- Gauss-Legendre Quadrature Setup ---
 y_gauss_legendre, w_gauss_legendre = np.polynomial.legendre.leggauss(n_gauss_legendre)
@@ -242,13 +125,8 @@ C_quad = a_n[:, None] * jnp.cos(n_modes[:, None] * jnp.pi * y_quad[None, :] / H)
 def precompute_C_y(y_data, n_modes_arr, a_n_arr):
     return a_n_arr[None, :] * jnp.cos(n_modes_arr[None, :] * jnp.pi * (y_data[:, None] + 1.0) / 2.0)
 
-# Add precomputed C_y_left and C_y_right to mode_data
-for mi in mode_data:
-    mode_data[mi]['C_y_left'] = precompute_C_y(mode_data[mi]['Y_left'], n_modes, a_n)
-    mode_data[mi]['C_y_right'] = precompute_C_y(mode_data[mi]['Y_right'], n_modes, a_n)
-
 # ==============================================================================
-# SECTION 4: NEURAL NETWORK UTILITIES & INITIALIZATION
+# SECTION 4: NEURAL NETWORK UTILITIES
 # ==============================================================================
 
 # --- Xavier Initialization Utilities ---
@@ -262,27 +140,13 @@ def init_layers(key, n_layers):
     return layers
 
 def init_layers_uv(key, n_layers, f_val, mode_val):
-    kx = 2 * jnp.pi * f_val / (contrast * c0)
+    kx = 2 * jnp.pi * f_val / c0
     ky = (mode_val + int(mode_val==0)) * jnp.pi / H
     layers_uv = init_layers(key, n_layers)
     return {'layers': layers_uv, 'sigma': jnp.array([kx, ky])}
 
-# --- Network Initialization ---
-# Slowness parameter network (layers_m) — shared across all modes and frequencies
-key, subkey_m = jax.random.split(key)
-layers_m = init_layers(subkey_m, n_layers_m)
-layers_m[-1]["b"] = -jnp.log(27.0 / 5.0)
-layers_m[-1]["W"] /= 10.0
-
-# Wavefield networks: one per (frequency, mode)
-# params_uv[(freq, mode_idx)] = {'layers': ..., 'sigma': ...}
-params_uv = {}
-for (f, mode_idx) in all_fm_pairs:
-    key, subkey_f = jax.random.split(key)
-    params_uv[(f, mode_idx)] = init_layers_uv(subkey_f, n_layers_uv, f, mode_idx)
-
 # ==============================================================================
-# SECTION 5: MODEL FORWARD PASSES & INITIAL PLOT
+# SECTION 5: MODEL FORWARD PASSES
 # ==============================================================================
 
 def forward_func(layers, X):
@@ -298,43 +162,55 @@ def forward_params(layers, X):
     Z = X
     for i in range(n-1):
         Z = jax.nn.tanh(Z @ layers[i]["W"] + layers[i]["b"])
-    Z = msq_min + (msq_max - msq_min) * jax.nn.sigmoid(Z @ layers[-1]["W"] + layers[-1]["b"])
+    Z = m_min + (m_max - m_min) * jax.nn.sigmoid(Z @ layers[-1]["W"] + layers[-1]["b"])
     return Z.squeeze()
 
-def c(x, y):
+def compute_features(x, y, sigma):
+    """Compute Fourier features from normalized coordinates.
+    Replaces the former `gamma` function — single source of truth."""
+    x_phys = x * L 
+    y_phys = (y + 1.0) * H / 2.0
+    B_scaled = B_base * sigma
+    proj = B_scaled[:, 0] * x_phys + B_scaled[:, 1] * y_phys
+    return jnp.concatenate([jnp.cos(proj), jnp.sin(proj)])
+
+def c(x, y, layers_m):
+    """Compute sound speed at (x, y) using the slowness network.
+    layers_m must be passed explicitly to avoid stale closure issues."""
     return 1 / jnp.sqrt(forward_params(layers_m, jnp.array([x, y])))
 
-# Plot initial sound speed field
-print("Plotting initial sound speed profile...")
-x_plot = np.linspace(-1, 1, 100)
-y_plot = np.linspace(0, 0.6, 50)
-c_grid = jax.vmap(jax.vmap(c, in_axes=(0, None)), in_axes=(None, 0))(x_plot, 2 * y_plot / H - 1)
+# ==============================================================================
+# SECTION 6: COLLOCATION POINTS & SWITCH CRITERION
+# ==============================================================================
 
-os.makedirs(os.path.join(script_dir, 'fig'), exist_ok=True)
-plt.figure(figsize=(7, 3.5))
-plt.pcolormesh(x_plot, y_plot, c_grid)
-plt.colorbar(label="Sound speed c(x, y)")
-plt.title("Initial Sound Speed Field")
-plt.tight_layout()
-plt.savefig(os.path.join(script_dir, 'fig', f'initial_sound_speed.png'), dpi=150)
-if SHOW_PLOTS:
-    plt.show()
-plt.close()
+def sample_collocation_points(key, N):
+    """Generate random collocation points in [-1, 1]^2."""
+    if key is None:
+        key = jax.random.PRNGKey(0)
+    subkey1, subkey2 = jax.random.split(key, 2)
+    x = jax.random.uniform(subkey1, (N,), minval=-1.0, maxval=1.0)
+    y = jax.random.uniform(subkey2, (N,), minval=-1.0, maxval=1.0)
+    return x, y
+
+def check_switch_criterion(loss_history, window=10, threshold=1e-3):
+    """Returns True if the relative slope of the loss is below threshold."""
+    if len(loss_history) < window:
+        return False
+    old_loss = loss_history[-window]
+    new_loss = loss_history[-1]
+    relative_slope = abs(new_loss - old_loss) / max(abs(old_loss), 1e-12)
+    return relative_slope < threshold and old_loss < 1e-2
 
 # ==============================================================================
-# SECTION 6: LOSS FUNCTION DEFINITIONS
+# SECTION 7: LOSS FUNCTION DEFINITIONS
 # ==============================================================================
 
 def loss_fn(params_uv, layers_m, x, y, f, mode_index, target_u_left, target_u_right,
             y_bnd_left, y_bnd_right, u_norm_val, weights, k0, beta_n, C_y_left, C_y_right,
             is_warmup=False, use_healthy_guide=False):
-    B_scaled = B_base * params_uv['sigma']
     
     def uv(x, y):
-        x_phys = x * L 
-        y_phys = (y + 1.0) * H / 2.0
-        proj = B_scaled[:, 0] * x_phys + B_scaled[:, 1] * y_phys
-        features = jnp.concatenate([jnp.cos(proj), jnp.sin(proj)])
+        features = compute_features(x, y, params_uv['sigma'])
         return forward_func(params_uv['layers'], features)
     
     def m(x, y):
@@ -401,7 +277,7 @@ def loss_fn(params_uv, layers_m, x, y, f, mode_index, target_u_left, target_u_ri
     return total_loss, (pde_loss, bc_loss, data_loss)
 
 # ==============================================================================
-# SECTION 7: OPTIMIZATION SCHEMES & TRAIN STEPS (JIT COMPILED)
+# SECTION 8: OPTIMIZATION SCHEMES & TRAIN STEPS (JIT COMPILED)
 # ==============================================================================
 
 def make_train_step_forward(adam_opt, lbfgs_opt):
@@ -412,15 +288,7 @@ def make_train_step_forward(adam_opt, lbfgs_opt):
                            target_left, target_right, y_bnd_left, y_bnd_right, u_norm,
                            current_weights, k0, beta_n, C_y_left, C_y_right,
                            N, use_lbfgs=False, use_healthy_guide=True):
-        if use_lbfgs:
-            subkey1, subkey2 = jax.random.split(key, 2)
-            x = jax.random.uniform(subkey1, (N,), minval=-1.0, maxval=1.0)
-            y = jax.random.uniform(subkey2, (N,), minval=-1.0, maxval=1.0)
-            new_key = key
-        else:
-            new_key, subkey1, subkey2 = jax.random.split(key, 3)
-            x = jax.random.uniform(subkey1, (N,), minval=-1.0, maxval=1.0)
-            y = jax.random.uniform(subkey2, (N,), minval=-1.0, maxval=1.0)
+        x, y = sample_collocation_points(key, N)
 
         def loss_uv(p_uv):
             return loss_fn(p_uv, layers_m, x, y, f_val, mode_index,
@@ -442,12 +310,13 @@ def make_train_step_forward(adam_opt, lbfgs_opt):
             updates_uv, opt_state_uv = adam_opt.update(grads_uv, opt_state_uv, params_uv)
 
         params_uv = optax.apply_updates(params_uv, updates_uv)
-        return params_uv, opt_state_uv, loss, aux, new_key
+        return params_uv, opt_state_uv, loss, aux
 
     return train_step_forward
 
 
 def make_train_step_inverse_multimode(adam_opt_uv, adam_opt_m, lbfgs_opt_packed):
+    """Train step for Phase 2: update all u-networks + shared m jointly."""
 
     @functools.partial(jax.jit, static_argnames=('N', 'use_lbfgs'))
     def train_step_inverse(params_uv_stacked, layers_m, opt_state_uv, opt_state_m,
@@ -457,15 +326,7 @@ def make_train_step_inverse_multimode(adam_opt_uv, adam_opt_m, lbfgs_opt_packed)
                            current_weights, k0, beta_n, C_y_left_stacked, C_y_right_stacked,
                            N, use_lbfgs=False):
 
-        if use_lbfgs:
-            subkey1, subkey2 = jax.random.split(key, 2)
-            x = jax.random.uniform(subkey1, (N,), minval=-1.0, maxval=1.0)
-            y = jax.random.uniform(subkey2, (N,), minval=-1.0, maxval=1.0)
-            new_key = key
-        else:
-            new_key, subkey1, subkey2 = jax.random.split(key, 3)
-            x = jax.random.uniform(subkey1, (N,), minval=-1.0, maxval=1.0)
-            y = jax.random.uniform(subkey2, (N,), minval=-1.0, maxval=1.0)
+        x, y = sample_collocation_points(key, N)
         
         def loss_all_modes(p_uv_stacked, l_m):
             def _loss_single(p_uv, mi, tl, tr, yl, yr, un, Cyl, Cyr):
@@ -506,22 +367,12 @@ def make_train_step_inverse_multimode(adam_opt_uv, adam_opt_m, lbfgs_opt_packed)
             updates_m, opt_state_m = adam_opt_m.update(grads_m, opt_state_m, layers_m)
             layers_m = optax.apply_updates(layers_m, updates_m)
 
-        return params_uv_stacked, layers_m, opt_state_uv, opt_state_m, opt_state_lbfgs, loss, aux, new_key
+        return params_uv_stacked, layers_m, opt_state_uv, opt_state_m, opt_state_lbfgs, loss, aux
 
     return train_step_inverse
 
-
-def check_switch_criterion(loss_history, window=10, threshold=1e-3):
-    """Returns True if the relative slope of the loss is below threshold."""
-    if len(loss_history) < window:
-        return False
-    old_loss = loss_history[-window]
-    new_loss = loss_history[-1]
-    relative_slope = abs(new_loss - old_loss) / max(abs(old_loss), 1e-12)
-    return relative_slope < threshold and jnp.mean(old_loss) < 1e-2
-
 # ==============================================================================
-# SECTION 8: MAIN TRAINING LOOP
+# SECTION 9: MAIN TRAINING LOOP
 # ==============================================================================
 
 def train(params_uv, layers_m, N_adam, N_lbfgs,
@@ -548,9 +399,85 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
     loss_forward = {mi: [] for mi in all_used_modes}
     loss_inverse = []
 
-    weights_phase1 = weights_phase1_
-
     best_params_uv = dict(params_uv)  # shallow copy of the dict
+    best_params_each_m = []
+
+    # ------------------------------------------------------------------
+    # Create optimizers and JIT-compiled step functions ONCE to avoid
+    # recompilation at each mode/frequency.
+    # Only the optimizer STATE is re-initialized inside the loop.
+    # ------------------------------------------------------------------
+
+    # Phase 1 optimizer (u-network only, m frozen)
+    template_param_uv = next(iter(params_uv.values()))
+    param_labels_p1 = jax.tree_util.tree_map(lambda _: 'base', template_param_uv)
+    if "sigma" in param_labels_p1:
+        param_labels_p1["sigma"] = jax.tree_util.tree_map(lambda _: 'sigma', template_param_uv["sigma"])
+
+    cosine_p1 = optax.schedules.cosine_decay_schedule(
+        init_value=lr_uv, decay_steps=max_steps_adam_phase1, alpha=0.1)
+    cosine_sigma_p1 = optax.schedules.cosine_decay_schedule(
+        init_value=lr_sigma, decay_steps=max_steps_adam_phase1, alpha=0.1)
+
+    adam_base_p1 = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.scale_by_adam(),
+        optax.scale_by_schedule(cosine_p1),
+        optax.scale(-1.0))
+    adam_sigma_p1 = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.scale_by_adam(),
+        optax.scale_by_schedule(cosine_sigma_p1),
+        optax.scale(-1.0))
+
+    adam_uv_p1 = optax.multi_transform(
+        transforms={'base': adam_base_p1, 'sigma': adam_sigma_p1},
+        param_labels=param_labels_p1)
+    lbfgs_uv_p1 = optax.lbfgs()
+
+    step_forward = make_train_step_forward(adam_uv_p1, lbfgs_uv_p1)
+
+    # Phase 2 optimizers (u-networks + m jointly)
+    cosine_uv_p2 = optax.schedules.cosine_decay_schedule(
+        init_value=lr_uv, decay_steps=max_steps_adam_phase2, alpha=0.1)
+    cosine_sigma_p2 = optax.schedules.cosine_decay_schedule(
+        init_value=lr_sigma, decay_steps=0.2*max_steps_adam_phase2, alpha=0.001)
+    cosine_m_p2 = optax.schedules.cosine_decay_schedule(
+        init_value=lr_m, decay_steps=max_steps_adam_phase2, alpha=0.1)
+
+    adam_base_p2 = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.scale_by_adam(),
+        optax.scale_by_schedule(cosine_uv_p2),
+        optax.scale(-1.0))
+    adam_sigma_p2 = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.scale_by_adam(),
+        optax.scale_by_schedule(cosine_sigma_p2),
+        optax.scale(-1.0))
+
+    param_labels_p2 = jax.tree_util.tree_map(lambda _: 'base', template_param_uv)
+    if "sigma" in param_labels_p2:
+        param_labels_p2["sigma"] = jax.tree_util.tree_map(lambda _: 'sigma', template_param_uv["sigma"])
+
+    adam_uv_p2 = optax.multi_transform(
+        transforms={'base': adam_base_p2, 'sigma': adam_sigma_p2},
+        param_labels=param_labels_p2)
+
+    adam_m_p2 = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.scale_by_adam(),
+        optax.scale_by_schedule(cosine_m_p2),
+        optax.scale(-1.0))
+    
+    lbfgs_packed_p2 = optax.lbfgs()
+
+    step_inverse = make_train_step_inverse_multimode(
+        adam_uv_p2, adam_m_p2, lbfgs_packed_p2)
+
+    # ------------------------------------------------------------------
+    # Curriculum training loop over frequencies
+    # ------------------------------------------------------------------
 
     for i, freq in enumerate(freqs):
         freq = float(freq)
@@ -588,33 +515,7 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
 
             print(f"\n--- Phase 1: Mode {mode_idx} | Adam (max {max_steps_adam_phase1} steps) ---")
 
-            # Build optimizer with separate lr for sigma
-            cosine_p1 = optax.schedules.cosine_decay_schedule(
-                init_value=lr_uv, decay_steps=max_steps_adam_phase1, alpha=0.1)
-            cosine_sigma_p1 = optax.schedules.cosine_decay_schedule(
-                init_value=lr_sigma, decay_steps=max_steps_adam_phase1, alpha=0.1)
-
-            adam_base_p1 = optax.chain(
-                optax.clip_by_global_norm(1.0),
-                optax.scale_by_adam(),
-                optax.scale_by_schedule(cosine_p1),
-                optax.scale(-1.0))
-            adam_sigma_p1 = optax.chain(
-                optax.clip_by_global_norm(1.0),
-                optax.scale_by_adam(),
-                optax.scale_by_schedule(cosine_sigma_p1),
-                optax.scale(-1.0))
-
-            param_labels_p1 = jax.tree_util.tree_map(lambda _: 'base', param_uv)
-            if "sigma" in param_labels_p1:
-                param_labels_p1["sigma"] = jax.tree_util.tree_map(lambda _: 'sigma', param_uv["sigma"])
-
-            adam_uv_p1 = optax.multi_transform(
-                transforms={'base': adam_base_p1, 'sigma': adam_sigma_p1},
-                param_labels=param_labels_p1)
-            lbfgs_uv_p1 = optax.lbfgs()
-
-            step_forward = make_train_step_forward(adam_uv_p1, lbfgs_uv_p1)
+            # Re-initialize optimizer state (resets cosine schedule counter)
             opt_state_uv = adam_uv_p1.init(param_uv)
 
             md = mode_data[mode_idx]
@@ -622,8 +523,9 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
             switched_to_lbfgs = False
 
             for step in range(max_steps_adam_phase1):
-                param_uv, opt_state_uv, loss, aux, key = step_forward(
-                    param_uv, layers_m, opt_state_uv, key, freq, mode_idx,
+                key, subkey = jax.random.split(key)
+                param_uv, opt_state_uv, _, aux = step_forward(
+                    param_uv, layers_m, opt_state_uv, subkey, freq, mode_idx,
                     md['U_left_norm'][freq], md['U_right_norm'][freq],
                     md['Y_left'], md['Y_right'], md['U_norm'][freq], weights_phase1,
                     k0, beta_n, md['C_y_left'], md['C_y_right'],
@@ -631,6 +533,7 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
 
                 if step % eval_interval == 0:
                     pde_loss, bc_loss, _ = aux
+                    loss = pde_loss + bc_loss
                     loss_forward[mode_idx].append((pde_loss, bc_loss))
                     print(f"[Adam M{mode_idx}] Step {step} | pde {pde_loss:.2e} | bc {bc_loss:.2e} | total {loss:.2e} | scales {param_uv['sigma']}")
                     
@@ -650,11 +553,10 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
             if switched_to_lbfgs or max_steps_lbfgs_phase1 > 0:
                 print(f"\n--- Phase 1: Mode {mode_idx} | L-BFGS (max {max_steps_lbfgs_phase1} steps) ---")
                 opt_state_uv = lbfgs_uv_p1.init(param_uv)
-                key, lbfgs_key = jax.random.split(key)
 
                 for step in range(max_steps_lbfgs_phase1):
-                    param_uv, opt_state_uv, loss, aux, _ = step_forward(
-                        param_uv, layers_m, opt_state_uv, lbfgs_key, freq, mode_idx,
+                    param_uv, opt_state_uv, _, aux = step_forward(
+                        param_uv, layers_m, opt_state_uv, None, freq, mode_idx,
                         md['U_left_norm'][freq], md['U_right_norm'][freq],
                         md['Y_left'], md['Y_right'], md['U_norm'][freq], weights_phase1,
                         k0, beta_n, md['C_y_left'], md['C_y_right'],
@@ -662,6 +564,7 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
 
                     if step % eval_interval == 0:
                         pde_loss, bc_loss, _ = aux
+                        loss = pde_loss + bc_loss
                         loss_forward[mode_idx].append((pde_loss, bc_loss))
                         print(f"[LBFGS M{mode_idx}] Step {step} | pde {pde_loss:.2e} | bc {bc_loss:.2e} | total {loss:.2e} | scales {param_uv['sigma']}")
                         if loss < best_loss:
@@ -686,46 +589,10 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
             param_uv_list = [params_uv[(freq, mi)] for mi in freq_modes]
             params_uv_stacked = jax.tree_util.tree_map(lambda *args: jnp.stack(args, axis=0), *param_uv_list)
 
-            # Build optimizer for u-networks
-            cosine_uv_p2 = optax.schedules.cosine_decay_schedule(
-                init_value=lr_uv, decay_steps=100000, alpha=0.1)
-            cosine_sigma_p2 = optax.schedules.cosine_decay_schedule(
-                init_value=lr_sigma, decay_steps=60000, alpha=0.001)
-            cosine_m_p2 = optax.schedules.cosine_decay_schedule(
-                init_value=lr_m, decay_steps=100000, alpha=0.1)
+            # Initialize best to current values (avoids NameError if first loss is NaN)
+            best_params_uv_stacked = jax.tree_util.tree_map(jnp.copy, params_uv_stacked)
 
-            adam_base_p2 = optax.chain(
-                optax.clip_by_global_norm(1.0),
-                optax.scale_by_adam(),
-                optax.scale_by_schedule(cosine_uv_p2),
-                optax.scale(-1.0))
-            adam_sigma_p2 = optax.chain(
-                optax.clip_by_global_norm(1.0),
-                optax.scale_by_adam(),
-                optax.scale_by_schedule(cosine_sigma_p2),
-                optax.scale(-1.0))
-
-            # Use the first mode's param structure for label template
-            param_labels_p2 = jax.tree_util.tree_map(lambda _: 'base', param_uv_list[0])
-            if "sigma" in param_labels_p2:
-                param_labels_p2["sigma"] = jax.tree_util.tree_map(lambda _: 'sigma', param_uv_list[0]["sigma"])
-
-            adam_uv_p2 = optax.multi_transform(
-                transforms={'base': adam_base_p2, 'sigma': adam_sigma_p2},
-                param_labels=param_labels_p2)
-
-            adam_m_p2 = optax.chain(
-                optax.clip_by_global_norm(1.0),
-                optax.scale_by_adam(),
-                optax.scale_by_schedule(cosine_m_p2),
-                optax.scale(-1.0))
-            
-            lbfgs_packed_p2 = optax.lbfgs()
-
-            step_inverse = make_train_step_inverse_multimode(
-                adam_uv_p2, adam_m_p2, lbfgs_packed_p2)
-
-            # Initialize optimizer states
+            # Re-initialize optimizer states (resets schedule counters)
             opt_state_uv = adam_uv_p2.init(params_uv_stacked)
             opt_state_m = adam_m_p2.init(layers_m)
             opt_state_lbfgs = None
@@ -742,7 +609,7 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
 
             data_weight_schedule = optax.linear_schedule(
                 init_value=0.1, end_value=10.0,
-                transition_steps=max(10000, 1))
+                transition_steps=max(0.2*max_steps_adam_phase2, 1))
 
             loss_history_p2 = []
             switched_to_lbfgs_p2 = False
@@ -750,15 +617,17 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
             for step in range(max_steps_adam_phase2):
                 weights_phase2 = jnp.array([1.0, 1.0, data_weight_schedule(step)])
 
-                params_uv_stacked, layers_m, opt_state_uv, opt_state_m, opt_state_lbfgs, loss, aux, key = step_inverse(
+                key, subkey = jax.random.split(key)
+                params_uv_stacked, layers_m, opt_state_uv, opt_state_m, opt_state_lbfgs, _, aux = step_inverse(
                     params_uv_stacked, layers_m, opt_state_uv, opt_state_m, opt_state_lbfgs,
-                    key, freq, mode_indices_arr,
+                    subkey, freq, mode_indices_arr,
                     targets_left, targets_right, y_bnds_left, y_bnds_right, u_norms,
                     weights_phase2, k0, beta_n, C_y_left_stacked, C_y_right_stacked,
                     N=N_adam, use_lbfgs=False)
 
                 if step % eval_interval == 0:
                     pde_loss, bc_loss, data_loss = aux
+                    loss = pde_loss + bc_loss + data_loss
                     loss_inverse.append((pde_loss, bc_loss, data_loss))
                     # Quick unstack of sigma for printing
                     sigmas = []
@@ -786,20 +655,19 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
             if switched_to_lbfgs_p2 or max_steps_lbfgs_phase2 > 0:
                 print(f"\n--- Phase 2: Multi-mode inverse | L-BFGS (max {max_steps_lbfgs_phase2} steps) ---")
                 opt_state_lbfgs = lbfgs_packed_p2.init({'uv_list': params_uv_stacked, 'm': layers_m})
-                weights_phase2_lbfgs = jnp.array([1.0, 1.0, 1.0])
-
-                key, lbfgs_key = jax.random.split(key)
+                weights_phase2_lbfgs = jnp.array([1.0, 1.0, 10.0])
 
                 for step in range(max_steps_lbfgs_phase2):
-                    params_uv_stacked, layers_m, opt_state_uv, opt_state_m, opt_state_lbfgs, loss, aux, _ = step_inverse(
+                    params_uv_stacked, layers_m, opt_state_uv, opt_state_m, opt_state_lbfgs, _, aux = step_inverse(
                         params_uv_stacked, layers_m, opt_state_uv, opt_state_m, opt_state_lbfgs,
-                        lbfgs_key, freq, mode_indices_arr,
+                        None, freq, mode_indices_arr,
                         targets_left, targets_right, y_bnds_left, y_bnds_right, u_norms,
                         weights_phase2_lbfgs, k0, beta_n, C_y_left_stacked, C_y_right_stacked,
                         N=N_lbfgs, use_lbfgs=True)
 
                     if step % eval_interval == 0:
                         pde_loss, bc_loss, data_loss = aux
+                        loss = pde_loss + bc_loss + data_loss
                         loss_inverse.append((pde_loss, bc_loss, data_loss))
                         print(f"[LBFGS] Step {step} | pde {pde_loss:.2e} | bc {bc_loss:.2e} | data {data_loss:.2e} | total {loss:.2e}")
                         if loss < best_loss:
@@ -812,136 +680,253 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
                 param_uv_i = jax.tree_util.tree_map(lambda x: x[idx], best_params_uv_stacked)
                 params_uv[(freq, mi)] = param_uv_i
             layers_m = best_params_m
+            best_params_each_m.append(jax.tree_util.tree_map(jnp.copy, layers_m))
 
-    return best_params_uv, layers_m, key, loss_forward, loss_inverse, active_modes_per_freq
+    return params_uv, layers_m, best_params_each_m, key, loss_forward, loss_inverse
 
 # ==============================================================================
-# SECTION 9: MODEL TRAINING & POST-PROCESSING
+# SECTION 10: MAIN ENTRY POINT
 # ==============================================================================
 
-# --- Run training ---
-key, subkey = jax.random.split(key)
-params_uv, layers_m, key, loss_forward, loss_inverse, active_modes_per_freq = train(
-    params_uv, layers_m, N_adam, N_lbfgs,
-    max_steps_adam_phase1, max_steps_lbfgs_phase1,
-    max_steps_adam_phase2, max_steps_lbfgs_phase2,
-    training_frequencies, active_modes_per_freq, mode_data,
-    eval_interval, switch_threshold, switch_window, key
-)
+def main():
+    global key
 
-# Create figures directory if it doesn't exist
-os.makedirs(os.path.join(script_dir, 'fig'), exist_ok=True)
+    # Print JAX devices to verify setup
+    print("JAX Devices:", jax.devices())
+    print("Default JAX dtype:", jnp.ones(1).dtype)
 
-# --- Plot wavefield predictions (Re(u) PINN) for each (freq, mode) ---
-for f in training_frequencies:
-    f = float(f)
-    freq_modes = active_modes_per_freq[f]
-    for mode_idx in freq_modes:
-        fm_key = (f, mode_idx)
-        p_uv = params_uv[fm_key]
-        u_norm_val = mode_data[mode_idx]['U_norm'][f]
+    # ==================================================================
+    # Data Loading & Preprocessing
+    # ==================================================================
+    data_paths = discover_mode_files(script_dir, defect_name, contrast_label, max_mode_index)
+    available_modes = sorted(data_paths.keys())
 
-        def u_real(x, y, _p=p_uv, _u_norm=u_norm_val):
-            features = gamma(x, y, _p['sigma'])
-            return forward_func(_p['layers'], features)[0] * _u_norm
+    mode_data = {}
 
-        x_val = np.linspace(-1, 1, 500)
-        y_val = np.linspace(0, 0.6, 150)
+    for mode_idx in available_modes:
+        left_path, right_path = data_paths[mode_idx]
+        loader_left = WaveguideBoundaryData(left_path)
+        loader_right = WaveguideBoundaryData(right_path)
 
-        u_grid = jax.vmap(jax.vmap(u_real, in_axes=(0, None)), in_axes=(None, 0))(x_val, 2 * y_val / H - 1)
+        X_left, Y_left_raw, U_re_left, U_im_left, mode_freq = loader_left.get_training_data()
+        X_right, Y_right_raw, U_re_right, U_im_right, _ = loader_right.get_training_data()
 
-        fig, ax = plt.subplots(figsize=(8, 4))
-        pcm = ax.pcolormesh(x_val, y_val, u_grid, cmap='RdBu_r', rasterized=True)
-        ax.set_title(f'Re(u) PINN at {f} Hz — Mode {mode_idx}')
-        fig.colorbar(pcm, ax=ax, shrink=0.8, location='left')
+        # Process Y coordinates (normalize to [-1, 1])
+        Y_left = jnp.array(Y_left_raw[mode_freq[0]], dtype=jnp.float32)
+        Y_right = jnp.array(Y_right_raw[mode_freq[0]], dtype=jnp.float32)
+
+        Y_norm_val = jnp.max(Y_left)
+        Y_left = 2 * Y_left / Y_norm_val - 1
+        Y_right = 2 * Y_right / Y_norm_val - 1
+
+        # Normalize complex wave fields per frequency
+        U_norm = {}
+        U_left_norm = {}
+        U_right_norm = {}
+
+        for f in mode_freq:
+            re_l = jnp.array(U_re_left[f], dtype=jnp.float32)
+            im_l = jnp.array(U_im_left[f], dtype=jnp.float32)
+            re_r = jnp.array(U_re_right[f], dtype=jnp.float32)
+            im_r = jnp.array(U_im_right[f], dtype=jnp.float32)
+
+            norm = jnp.sqrt(jnp.max(jnp.concatenate((
+                re_l**2 + im_l**2,
+                re_r**2 + im_r**2
+            ))))
+            
+            U_norm[f] = norm
+            re_l /= norm
+            im_l /= norm
+            re_r /= norm
+            im_r /= norm
+            
+            U_left_norm[f] = jnp.stack([re_l, im_l], axis=1)
+            U_right_norm[f] = jnp.stack([re_r, im_r], axis=1)
+
+        mode_data[mode_idx] = {
+            'Y_left': Y_left,
+            'Y_right': Y_right,
+            'U_left_norm': U_left_norm,
+            'U_right_norm': U_right_norm,
+            'U_norm': U_norm,
+        }
+        print(f"  Mode {mode_idx}: {len(mode_freq)} frequencies loaded ({float(mode_freq[0]):.0f}–{float(mode_freq[-1]):.0f} Hz)")
+
+    # Add precomputed C_y_left and C_y_right to mode_data
+    for mi in mode_data:
+        mode_data[mi]['C_y_left'] = precompute_C_y(mode_data[mi]['Y_left'], n_modes, a_n)
+        mode_data[mi]['C_y_right'] = precompute_C_y(mode_data[mi]['Y_right'], n_modes, a_n)
+
+    # ==================================================================
+    # Network Initialization
+    # ==================================================================
+
+    # Slowness parameter network (layers_m) — shared across all modes and frequencies
+    key, subkey_m = jax.random.split(key)
+    layers_m = init_layers(subkey_m, n_layers_m)
+    layers_m[-1]["b"] = -jnp.log((m_max-m_min)/(m0-m_min) - 1)
+    layers_m[-1]["W"] /= 10.0
+
+    # Wavefield networks: one per (frequency, mode)
+    params_uv = {}
+    for freq, modes in active_modes_per_freq.items():
+        for mode_idx in modes:
+            key, subkey_f = jax.random.split(key)
+            params_uv[(freq, mode_idx)] = init_layers_uv(subkey_f, n_layers_uv, freq, mode_idx)
+
+    # ==================================================================
+    # Initial Sound Speed Plot
+    # ==================================================================
+    print("Plotting initial sound speed profile...")
+    x_plot = np.linspace(-1, 1, 100)
+    y_plot = np.linspace(0, 0.6, 50)
+    c_grid = jax.vmap(
+        jax.vmap(lambda x, y: c(x, y, layers_m), in_axes=(0, None)),
+        in_axes=(None, 0)
+    )(x_plot, 2 * y_plot / H - 1)
+
+    os.makedirs(os.path.join(script_dir, 'fig'), exist_ok=True)
+    plt.figure(figsize=(7, 3.5))
+    plt.pcolormesh(x_plot, y_plot, c_grid)
+    plt.colorbar(label="Sound speed c(x, y)")
+    plt.title("Initial Sound Speed Field")
+    plt.tight_layout()
+    plt.savefig(os.path.join(script_dir, 'fig', 'initial_sound_speed.pdf'))
+    if SHOW_PLOTS:
+        plt.show()
+    plt.close()
+
+    # ==================================================================
+    # Training
+    # ==================================================================
+    key, subkey = jax.random.split(key)
+    params_uv, layers_m, best_params_each_m, key, loss_forward, loss_inverse = train(
+        params_uv, layers_m, N_adam, N_lbfgs,
+        max_steps_adam_phase1, max_steps_lbfgs_phase1,
+        max_steps_adam_phase2, max_steps_lbfgs_phase2,
+        training_frequencies, active_modes_per_freq, mode_data,
+        eval_interval, switch_threshold, switch_window, subkey
+    )
+
+    # ==================================================================
+    # Post-processing Plots
+    # ==================================================================
+
+    # Precompute common strings for filenames (computed once)
+    all_used_modes = sorted(set(mi for modes in active_modes_per_freq.values() for mi in modes))
+    modes_str = '_'.join(str(mi) for mi in all_used_modes)
+    freqs_str = '_'.join(str(int(f)) for f in training_frequencies)
+
+    # --- Plot wavefield predictions (Re(u) PINN) for each (freq, mode) ---
+    for f in training_frequencies:
+        f = float(f)
+        freq_modes = active_modes_per_freq[f]
+        for mode_idx in freq_modes:
+            fm_key = (f, mode_idx)
+            p_uv = params_uv[fm_key]
+            u_norm_val = mode_data[mode_idx]['U_norm'][f]
+
+            def u_real(x, y, _p=p_uv, _u_norm=u_norm_val):
+                features = compute_features(x, y, _p['sigma'])
+                return forward_func(_p['layers'], features)[0] * _u_norm
+
+            x_val = np.linspace(-1, 1, 500)
+            y_val = np.linspace(0, 0.6, 150)
+
+            u_grid = jax.vmap(jax.vmap(u_real, in_axes=(0, None)), in_axes=(None, 0))(x_val, 2 * y_val / H - 1)
+
+            fig, ax = plt.subplots(figsize=(8, 4))
+            pcm = ax.pcolormesh(x_val, y_val, u_grid, cmap='RdBu_r', rasterized=True)
+            ax.set_title(f'Re(u) PINN at {f} Hz — Mode {mode_idx}')
+            fig.colorbar(pcm, ax=ax, shrink=0.8, location='left')
+            plt.tight_layout()
+            if SHOW_PLOTS:
+                plt.show()
+            plt.close()
+
+    # --- Plot Phase 1 (Forward) Training Losses per mode ---
+    for mode_idx in sorted(loss_forward.keys()):
+        if len(loss_forward[mode_idx]) == 0:
+            continue
+        loss_fwd_arr = np.array(loss_forward[mode_idx])
+        pde_losses = loss_fwd_arr[:, 0]
+        bc_losses = loss_fwd_arr[:, 1]
+        total_losses = pde_losses + bc_losses
+
+        x_axis = eval_interval * np.arange(len(loss_fwd_arr))
+
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+        ax1.semilogy(x_axis, pde_losses, label="PDE Loss")
+        ax1.semilogy(x_axis, bc_losses, label="BC Loss")
+        ax1.set_title(f"Phase 1 Mode {mode_idx}: Partial Loss")
+        ax1.set_xlabel("Steps")
+        ax1.set_ylabel("Loss")
+        ax1.legend(loc="upper right")
+        ax1.grid(True)
+
+        ax2.semilogy(x_axis, total_losses, label="Total Loss", color='black')
+        ax2.set_title(f"Phase 1 Mode {mode_idx}: Total Loss")
+        ax2.set_xlabel("Steps")
+        ax2.legend(loc="upper right")
+        ax2.grid(True)
         plt.tight_layout()
         if SHOW_PLOTS:
             plt.show()
         plt.close()
 
-# --- Plot Phase 1 (Forward) Training Losses per mode ---
-for mode_idx in sorted(loss_forward.keys()):
-    if len(loss_forward[mode_idx]) == 0:
-        continue
-    loss_fwd_arr = np.array(loss_forward[mode_idx])
-    pde_losses = loss_fwd_arr[:, 0]
-    bc_losses = loss_fwd_arr[:, 1]
-    total_losses = pde_losses + bc_losses
+    # --- Plot Phase 2 (Inverse) Training Losses ---
+    if len(loss_inverse) > 0:
+        loss_inverse_arr = np.array(loss_inverse)
+        pde_losses_inv = loss_inverse_arr[:, 0]
+        bc_losses_inv = loss_inverse_arr[:, 1]
+        data_losses_inv = loss_inverse_arr[:, 2]
+        total_losses_inv = pde_losses_inv + bc_losses_inv + data_losses_inv
 
-    x_axis = eval_interval * np.arange(len(loss_fwd_arr))
+        x_axis_inv = eval_interval * np.arange(len(loss_inverse_arr))
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-    ax1.semilogy(x_axis, pde_losses, label="PDE Loss")
-    ax1.semilogy(x_axis, bc_losses, label="BC Loss")
-    ax1.set_title(f"Phase 1 Mode {mode_idx}: Partial Loss")
-    ax1.set_xlabel("Steps")
-    ax1.set_ylabel("Loss")
-    ax1.legend(loc="upper right")
-    ax1.grid(True)
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+        ax1.semilogy(x_axis_inv, pde_losses_inv, label="PDE Loss")
+        ax1.semilogy(x_axis_inv, bc_losses_inv, label="BC Loss")
+        ax1.semilogy(x_axis_inv, data_losses_inv, label="Data Loss")
+        ax1.set_title("Phase 2 (Multi-mode): Partial Loss")
+        ax1.set_xlabel("Steps")
+        ax1.set_ylabel("Loss")
+        ax1.legend(loc="upper right")
+        ax1.grid(True)
 
-    ax2.semilogy(x_axis, total_losses, label="Total Loss", color='black')
-    ax2.set_title(f"Phase 1 Mode {mode_idx}: Total Loss")
-    ax2.set_xlabel("Steps")
-    ax2.legend(loc="upper right")
-    ax2.grid(True)
-    plt.tight_layout()
-    if SHOW_PLOTS:
-        plt.show()
-    plt.close()
+        ax2.semilogy(x_axis_inv, total_losses_inv, label="Total Loss", color='black')
+        ax2.set_title("Phase 2 (Multi-mode): Total Loss")
+        ax2.set_xlabel("Steps")
+        ax2.legend(loc="upper right")
+        ax2.grid(True)
+        plt.tight_layout()
+        plt.savefig(os.path.join(script_dir, 'fig', f'2D_WG_losses_modes{modes_str}_freqs{freqs_str}.pdf'))
+        if SHOW_PLOTS:
+            plt.show()
+        plt.close()
 
-# --- Plot Phase 2 (Inverse) Training Losses ---
-if len(loss_inverse) > 0:
-    loss_inverse_arr = np.array(loss_inverse)
-    pde_losses_inv = loss_inverse_arr[:, 0]
-    bc_losses_inv = loss_inverse_arr[:, 1]
-    data_losses_inv = loss_inverse_arr[:, 2]
-    total_losses_inv = pde_losses_inv + bc_losses_inv + data_losses_inv
+    # --- Plot final reconstructed sound speed field c(x, y) ---
+    for i, layers_m_each in enumerate(best_params_each_m):
+        def c_final(x, y, _lm=layers_m_each):
+            return c(x, y, _lm)
 
-    x_axis_inv = eval_interval * np.arange(len(loss_inverse_arr))
+        x_c = np.linspace(-1, 1, 100)
+        y_c = np.linspace(0, 0.6, 50)
+        c_grid_final = jax.vmap(jax.vmap(c_final, in_axes=(0, None)), in_axes=(None, 0))(x_c, 2 * y_c / H - 1)
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-    ax1.semilogy(x_axis_inv, pde_losses_inv, label="PDE Loss")
-    ax1.semilogy(x_axis_inv, bc_losses_inv, label="BC Loss")
-    ax1.semilogy(x_axis_inv, data_losses_inv, label="Data Loss")
-    ax1.set_title("Phase 2 (Multi-mode): Partial Loss")
-    ax1.set_xlabel("Steps")
-    ax1.set_ylabel("Loss")
-    ax1.legend(loc="upper right")
-    ax1.grid(True)
+        plt.figure(figsize=(7, 3.5))
+        plt.pcolormesh(x_c, y_c, c_grid_final, rasterized=True)
+        plt.colorbar(label="Sound speed c(x, y)")
+        modes_per_freq_str = ' | '.join([f"{int(f)}Hz:M{active_modes_per_freq[float(f)]}" for f in training_frequencies[:i+1]])
+        plt.title(f"Reconstructed c(x,y) — {modes_per_freq_str}")
+        plt.tight_layout()
+        plt.savefig(os.path.join(script_dir, 'fig',
+            f'2D_WG_c_map_freq{int(training_frequencies[i])}_modes{modes_str}_freqs{freqs_str}.pdf'))
+        if SHOW_PLOTS:
+            plt.show()
+        plt.close()
 
-    ax2.semilogy(x_axis_inv, total_losses_inv, label="Total Loss", color='black')
-    ax2.set_title("Phase 2 (Multi-mode): Total Loss")
-    ax2.set_xlabel("Steps")
-    ax2.legend(loc="upper right")
-    ax2.grid(True)
-    plt.tight_layout()
-    all_used = sorted(set(mi for modes in active_modes_per_freq.values() for mi in modes))
-    modes_str = '_'.join([str(mi) for mi in all_used])
-    freqs_str = '_'.join([str(int(f)) for f in training_frequencies])
-    plt.savefig(os.path.join(script_dir, 'fig', f'2D_WG_losses_modes{modes_str}_freqs{freqs_str}.pdf'))
-    if SHOW_PLOTS:
-        plt.show()
-    plt.close()
 
-# --- Plot final reconstructed sound speed field c(x, y) ---
-def c_final(x, y):
-    return 1 / jnp.sqrt(forward_params(layers_m, jnp.array([x, y])))
-
-x_c = np.linspace(-1, 1, 100)
-y_c = np.linspace(0, 0.6, 50)
-c_grid_final = jax.vmap(jax.vmap(c_final, in_axes=(0, None)), in_axes=(None, 0))(x_c, 2 * y_c / H - 1)
-
-plt.figure(figsize=(7, 3.5))
-plt.pcolormesh(x_c, y_c, c_grid_final, rasterized=True)
-plt.colorbar(label="Sound speed c(x, y)")
-all_used_modes_final = sorted(set(mi for modes in active_modes_per_freq.values() for mi in modes))
-modes_str = ', '.join([str(mi) for mi in all_used_modes_final])
-freqs_str = ', '.join([str(int(f)) for f in training_frequencies])
-modes_per_freq_str = ' | '.join([f"{int(f)}Hz:M{active_modes_per_freq[float(f)]}" for f in training_frequencies])
-plt.title(f"Reconstructed c(x,y) — {modes_per_freq_str}")
-plt.tight_layout()
-plt.savefig(os.path.join(script_dir, 'fig',
-    f'2D_WG_c_map_modes{"_".join([str(mi) for mi in all_used_modes_final])}_freqs{"_".join([str(int(f)) for f in training_frequencies])}.pdf'))
-if SHOW_PLOTS:
-    plt.show()
-plt.close()
+if __name__ == "__main__":
+    main()
