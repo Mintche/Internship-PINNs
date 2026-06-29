@@ -206,7 +206,7 @@ def check_switch_criterion(loss_history, window=10, threshold=1e-3):
 # ==============================================================================
 
 def loss_fn(params_uv, layers_m, x, y, f, mode_index, target_u_left, target_u_right,
-            y_bnd_left, y_bnd_right, u_norm_val, weights, k0, beta_n, C_y_left, C_y_right,
+            y_bnd_left, y_bnd_right, u_norm_val, weights, k0, beta_n,
             is_warmup=False, use_healthy_guide=False):
     
     def uv(x, y):
@@ -233,7 +233,7 @@ def loss_fn(params_uv, layers_m, x, y, f, mode_index, target_u_left, target_u_ri
         uv_yy = jax.jacfwd(jax.jacfwd(uv, argnums=1), argnums=1)(x, y) * (2 / H)**2
         return (uv_xx + uv_yy) + k2(x,y)*uv(x, y)
     
-    def compute_dtn_loss(x_bnd, y_data, C_y_data, sign, A_inc=None):
+    def compute_dtn_loss(x_bnd, y_eval, sign, A_inc=None):
         uv_quad = jax.vmap(uv, in_axes=(None, 0))(x_bnd, y_gauss_legendre)
         U_quad_complex = uv_quad[:, 0] + 1j * uv_quad[:, 1]
         
@@ -243,14 +243,18 @@ def loss_fn(params_uv, layers_m, x, y, f, mode_index, target_u_left, target_u_ri
         if A_inc is not None:
             dtn_n = dtn_n + 2j * beta_n * A_inc
         
-        dtn_pred_complex = C_y_data @ dtn_n
+        def DtN_eval(y_val):
+            C_y = a_n * jnp.cos(n_modes * jnp.pi * (y_val + 1.0) / 2.0)
+            return jnp.dot(C_y, dtn_n)
+            
+        dtn_pred_complex = jax.vmap(DtN_eval)(y_eval)
         
-        dtn_actual = jax.vmap(uv_x, in_axes=(None, 0))(x_bnd, y_data)
+        dtn_actual = jax.vmap(uv_x, in_axes=(None, 0))(x_bnd, y_eval)
         dtn_actual_complex = dtn_actual[:, 0] + 1j * dtn_actual[:, 1]
         
-        return jnp.mean(jnp.abs(dtn_pred_complex - dtn_actual_complex)**2)
+        return jnp.mean(jnp.abs(dtn_actual_complex - dtn_pred_complex)**2)
 
-    # Incident field: mode `mode_index` propagating from the left
+    # Incident field: mode `mode_index` propagating from the left to the right
     A_inc_left = jnp.zeros(N_modes, dtype=jnp.complex64)
     amplitude_incidente = jnp.exp(-1j * beta_n[mode_index] * L) / u_norm_val
     A_inc_left = A_inc_left.at[mode_index].set(amplitude_incidente)
@@ -260,8 +264,8 @@ def loss_fn(params_uv, layers_m, x, y, f, mode_index, target_u_left, target_u_ri
     pde_loss = jnp.mean(vmap_pde_residual(x, y)**2)
     
     # Boundary Conditions Loss
-    dtn_loss_left = compute_dtn_loss(-1.0, y_bnd_left, C_y_left, sign=-1, A_inc=A_inc_left)
-    dtn_loss_right = compute_dtn_loss(1.0, y_bnd_right, C_y_right, sign=1, A_inc=None)
+    dtn_loss_left = compute_dtn_loss(-1.0, y, sign=-1, A_inc=A_inc_left)
+    dtn_loss_right = compute_dtn_loss(1.0, y, sign=1, A_inc=None)
     neum_loss = jnp.mean(jax.vmap(uv_y, in_axes=(0, None))(x, 1.0)**2 + jax.vmap(uv_y, in_axes=(0, None))(x, -1.0)**2)
     bc_loss = neum_loss + dtn_loss_left + dtn_loss_right
     
@@ -286,7 +290,7 @@ def make_train_step_forward(adam_opt, lbfgs_opt):
     @functools.partial(jax.jit, static_argnames=('N', 'use_lbfgs', 'use_healthy_guide'))
     def train_step_forward(params_uv, layers_m, opt_state_uv, key, f_val, mode_index,
                            target_left, target_right, y_bnd_left, y_bnd_right, u_norm,
-                           current_weights, k0, beta_n, C_y_left, C_y_right,
+                           current_weights, k0, beta_n,
                            N, use_lbfgs=False, use_healthy_guide=True):
         x, y = sample_collocation_points(key, N)
 
@@ -294,7 +298,7 @@ def make_train_step_forward(adam_opt, lbfgs_opt):
             return loss_fn(p_uv, layers_m, x, y, f_val, mode_index,
                            target_left, target_right,
                            y_bnd_left, y_bnd_right, u_norm, current_weights,
-                           k0, beta_n, C_y_left, C_y_right,
+                           k0, beta_n,
                            is_warmup=True, use_healthy_guide=use_healthy_guide)
 
         (loss, aux), grads_uv = jax.value_and_grad(loss_uv, has_aux=True)(params_uv)
@@ -323,23 +327,23 @@ def make_train_step_inverse_multimode(adam_opt_uv, adam_opt_m, lbfgs_opt_packed)
                            opt_state_lbfgs, key, f_val, mode_indices,
                            targets_left, targets_right,
                            y_bnds_left, y_bnds_right, u_norms,
-                           current_weights, k0, beta_n, C_y_left_stacked, C_y_right_stacked,
+                           current_weights, k0, beta_n,
                            N, use_lbfgs=False):
 
         x, y = sample_collocation_points(key, N)
         
         def loss_all_modes(p_uv_stacked, l_m):
-            def _loss_single(p_uv, mi, tl, tr, yl, yr, un, Cyl, Cyr):
+            def _loss_single(p_uv, mi, tl, tr, yl, yr, un):
                 return loss_fn(p_uv, l_m, x, y, f_val, mi,
-                               tl, tr, yl, yr, un, current_weights, k0, beta_n, Cyl, Cyr,
+                               tl, tr, yl, yr, un, current_weights, k0, beta_n,
                                is_warmup=False, use_healthy_guide=False)
 
-            vmapped = jax.vmap(_loss_single, in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0))
+            vmapped = jax.vmap(_loss_single, in_axes=(0, 0, 0, 0, 0, 0, 0))
             losses, (pdes, bcs, datas) = vmapped(
                 p_uv_stacked, mode_indices,
                 targets_left, targets_right,
                 y_bnds_left, y_bnds_right,
-                u_norms, C_y_left_stacked, C_y_right_stacked)
+                u_norms)
             return jnp.mean(losses), (jnp.mean(pdes), jnp.mean(bcs), jnp.mean(datas))
 
         (loss, aux), (grads_uv, grads_m) = jax.value_and_grad(
@@ -528,7 +532,7 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
                     param_uv, layers_m, opt_state_uv, subkey, freq, mode_idx,
                     md['U_left_norm'][freq], md['U_right_norm'][freq],
                     md['Y_left'], md['Y_right'], md['U_norm'][freq], weights_phase1,
-                    k0, beta_n, md['C_y_left'], md['C_y_right'],
+                    k0, beta_n,
                     N=N_adam, use_lbfgs=False, use_healthy_guide=use_healthy_guide_flag)
 
                 if step % eval_interval == 0:
@@ -559,7 +563,7 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
                         param_uv, layers_m, opt_state_uv, None, freq, mode_idx,
                         md['U_left_norm'][freq], md['U_right_norm'][freq],
                         md['Y_left'], md['Y_right'], md['U_norm'][freq], weights_phase1,
-                        k0, beta_n, md['C_y_left'], md['C_y_right'],
+                        k0, beta_n,
                         N=N_lbfgs, use_lbfgs=True, use_healthy_guide=use_healthy_guide_flag)
 
                     if step % eval_interval == 0:
@@ -604,8 +608,6 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
             y_bnds_left = jnp.stack([mode_data[mi]['Y_left'] for mi in freq_modes])
             y_bnds_right = jnp.stack([mode_data[mi]['Y_right'] for mi in freq_modes])
             u_norms = jnp.array([mode_data[mi]['U_norm'][freq] for mi in freq_modes])
-            C_y_left_stacked = jnp.stack([mode_data[mi]['C_y_left'] for mi in freq_modes])
-            C_y_right_stacked = jnp.stack([mode_data[mi]['C_y_right'] for mi in freq_modes])
 
             data_weight_schedule = optax.linear_schedule(
                 init_value=0.1, end_value=10.0,
@@ -622,7 +624,7 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
                     params_uv_stacked, layers_m, opt_state_uv, opt_state_m, opt_state_lbfgs,
                     subkey, freq, mode_indices_arr,
                     targets_left, targets_right, y_bnds_left, y_bnds_right, u_norms,
-                    weights_phase2, k0, beta_n, C_y_left_stacked, C_y_right_stacked,
+                    weights_phase2, k0, beta_n,
                     N=N_adam, use_lbfgs=False)
 
                 if step % eval_interval == 0:
@@ -662,7 +664,7 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
                         params_uv_stacked, layers_m, opt_state_uv, opt_state_m, opt_state_lbfgs,
                         None, freq, mode_indices_arr,
                         targets_left, targets_right, y_bnds_left, y_bnds_right, u_norms,
-                        weights_phase2_lbfgs, k0, beta_n, C_y_left_stacked, C_y_right_stacked,
+                        weights_phase2_lbfgs, k0, beta_n,
                         N=N_lbfgs, use_lbfgs=True)
 
                     if step % eval_interval == 0:
@@ -715,9 +717,8 @@ def main():
         Y_left = jnp.array(Y_left_raw[mode_freq[0]], dtype=jnp.float32)
         Y_right = jnp.array(Y_right_raw[mode_freq[0]], dtype=jnp.float32)
 
-        Y_norm_val = jnp.max(Y_left)
-        Y_left = 2 * Y_left / Y_norm_val - 1
-        Y_right = 2 * Y_right / Y_norm_val - 1
+        Y_left = 2 * Y_left / H - 1
+        Y_right = 2 * Y_right / H - 1
 
         # Normalize complex wave fields per frequency
         U_norm = {}
@@ -753,10 +754,6 @@ def main():
         }
         print(f"  Mode {mode_idx}: {len(mode_freq)} frequencies loaded ({float(mode_freq[0]):.0f}–{float(mode_freq[-1]):.0f} Hz)")
 
-    # Add precomputed C_y_left and C_y_right to mode_data
-    for mi in mode_data:
-        mode_data[mi]['C_y_left'] = precompute_C_y(mode_data[mi]['Y_left'], n_modes, a_n)
-        mode_data[mi]['C_y_right'] = precompute_C_y(mode_data[mi]['Y_right'], n_modes, a_n)
 
     # ==================================================================
     # Network Initialization

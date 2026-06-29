@@ -81,9 +81,8 @@ X_right, Y_right, U_re_right, U_im_right, _ = data_loader_right.get_training_dat
 Y_left = Y_left[dataset_freq[0]]
 Y_right = Y_right[dataset_freq[0]]
 
-Y_norm = jnp.max(Y_left)
-Y_left = 2 * Y_left / Y_norm - 1
-Y_right = 2 * Y_right / Y_norm - 1
+Y_left = 2 * Y_left / H - 1
+Y_right = 2 * Y_right / H - 1
 
 # Normalize complex wave fields
 U_norm = {}
