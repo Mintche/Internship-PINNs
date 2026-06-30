@@ -42,7 +42,7 @@ training_frequencies = np.array([600.0])
 
 # Active modes per frequency — edit these to select which modes to use
 active_modes_per_freq = {
-    600.0: [0,1,2]
+    600.0: [0, 1, 2]
 }
 
 # --- Random Seed ---
@@ -73,7 +73,7 @@ switch_window = 10       # Window size for switch criterion
 max_steps_adam_phase1 = 40001
 max_steps_lbfgs_phase1 = 3001
 max_steps_adam_phase2 = 100001
-max_steps_lbfgs_phase2 = 1201
+max_steps_lbfgs_phase2 = 12001
 
 SHOW_PLOTS = True
 
@@ -120,11 +120,7 @@ N_modes = int(np.round(2 * H * fmax / c0)) + 5
 n_modes = jnp.arange(N_modes, dtype=jnp.float32)
 a_n = jnp.sqrt(2.0 / H) * jnp.ones(N_modes, dtype=jnp.float32)
 a_n = a_n.at[0].set(jnp.sqrt(1.0 / H))
-# Modal basis at the Gauss-Legendre points, used only for the L2 projection.
-# phi_quad[n, q] = phi_n(y_q).
-phi_quad = a_n[:, None] * jnp.cos(
-    n_modes[:, None] * jnp.pi * y_quad[None, :] / H
-)
+C_quad = a_n[:, None] * jnp.cos(n_modes[:, None] * jnp.pi * y_quad[None, :] / H)
 
 # ==============================================================================
 # SECTION 4: NEURAL NETWORK UTILITIES
@@ -238,8 +234,7 @@ def loss_fn(params_uv, layers_m, x, y, f, mode_index, target_u_left, target_u_ri
         uv_quad = jax.vmap(uv, in_axes=(None, 0))(x_bnd, y_gauss_legendre)
         U_quad_complex = uv_quad[:, 0] + 1j * uv_quad[:, 1]
         
-        # u_n = integral_0^H u(x_bnd, y) phi_n(y) dy
-        u_n = phi_quad @ (w_quad * U_quad_complex)
+        u_n = C_quad @ (w_quad * U_quad_complex)
         
         dtn_n = sign * 1j * beta_n * u_n
         if A_inc is not None:
@@ -755,6 +750,7 @@ def main():
             'U_norm': U_norm,
         }
         print(f"  Mode {mode_idx}: {len(mode_freq)} frequencies loaded ({float(mode_freq[0]):.0f}–{float(mode_freq[-1]):.0f} Hz)")
+
 
     # ==================================================================
     # Network Initialization
