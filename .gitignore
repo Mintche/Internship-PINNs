@@ -7,3 +7,11 @@ __pycache__/
 *.pyo
 *.pyd
 .pytest_cache/
+
+# Trained network checkpoints and generated full-field predictions
+/pinn_waveguide_2d/checkpoints/
+/pinn_waveguide_2d/predictions/
+
+#Temp files
+
+/pinn_waveguide_2d/data/

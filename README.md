@@ -1,74 +1,87 @@
-# Internship PINNs - Acoustic Waveguide & FWI
+# Internship PINNs — 2D Acoustic Waveguide
 
-This repository contains implementations of **Physics-Informed Neural Networks (PINNs)** applied to acoustic waveguide analysis and **Full Waveform Inversion (FWI)** for reconstructing material properties (celerity/slowness fields).
+This repository brings together a P2 FEM solver and a JAX PINN for inverting
+the wave speed in a rectangular acoustic waveguide.
 
----
+## Project Structure
 
-## Directory Structure
-
-The repository is organized as follows:
-
-```
+```text
 Internship-PINNs/
-├── waveguide_2d/                  # 2D Waveguide PINN codes
-│   ├── data/                      # Boundary csv data files
-│   │   └── pinn_boundary_*.csv
-│   ├── fig/                       # Saved plots and figures
-│   ├── data_loader.py             # Data loading utility for CSV files
-│   ├── pinn_waveguide.py          # Field reconstruction PINN (standard formulation)
-│   └── pinn_alternating.py        # Alternating minimization/training FWI PINN
-├── notebooks/                     # Exploratory Jupyter notebooks
-│   ├── Heat_eq_1D_test_PINN_DG.ipynb
-│   ├── Heat_eq_1D_test_PINN_base.ipynb
-│   ├── WaveGuide_PINN_scd.ipynb
-│   ├── WaveGuide_PINN_simple.ipynb
-│   └── WaveGuide_PINN_trird.ipynb
-│   └── fig/                       # Figures for notebooks
-├── requirements.txt               # Project dependencies
-├── README.md                      # This documentation
-└── .gitignore                     # Git ignored patterns (.venv, pycache, etc.)
+├── FEM/                          # P2 solver and data generation
+├── pinn_waveguide_2d/            # PINN training and checkpoints
+│   ├── checkpoints/
+│   ├── data/
+│   └── pinn_waveguide_multi_mode.py
+├── tools/
+│   ├── data_loader.py            # Load boundaries, fields, and matrices
+│   ├── uv_checkpoint.py          # Save and evaluate UV networks
+│   └── compare_pinn_fem.py       # Nodal comparison and L2/H1 misfits
+├── notebooks/
+└── requirements.txt
 ```
 
----
+## Python Installation
 
-## Core Features
-
-- **Dynamic Path Resolution**: Scripts dynamically locate CSV datasets and save directories relative to their file locations, meaning you can execute them from any working directory without `FileNotFoundError` or relative path failures.
-- **Alternating Optimization (`pinn_alternating.py`)**: A multi-cycle scheme that alternately fits the pressure wavefield $u(x,y)$ to the boundaries and satisfies the Helmholz PDE, then optimizes the slowness field $m(x,y)$ with Total Variation (TV) regularization.
-- **Spectral Bias Control**: Fourier Features projection (`gamma`) is incorporated to resolve high-frequency fields more efficiently.
-
----
-
-## Installation & Setup
-
-1. **Virtual Environment**:
-   It is recommended to use a virtual environment:
-   ```bash
-   python -m venv .venv
-   source .venv/bin/activate
-   ```
-
-2. **Dependencies**:
-   Install the required python libraries using:
-   ```bash
-   pip install -r requirements.txt
-   ```
-   > [!NOTE]
-   > The default installation will set up JAX on CPU. If you wish to run with GPU/CUDA support, please refer to the [JAX installation guidelines](https://github.com/google/jax#installation) to install the correct CUDA-enabled `jaxlib` version.
-
----
-
-## Usage
-
-You can run the python scripts directly from the workspace root (or any directory):
-
-### 1. Standard 2D Waveguide PINN
 ```bash
-python waveguide_2d/pinn_waveguide.py
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-### 2. Alternating FWI PINN
+For a CUDA environment, install the `jaxlib` variant that matches the machine's
+CUDA version.
+
+## FEM Generation
+
+Compilation, physical tags, the CLI, and CSV formats are described in
+[`FEM/README.md`](FEM/README.md).
+
+The `Mass_matrix_*.csv` and `Stiff_matrix_*.csv` files contain the lower
+triangles of the matrices in COO format. The `fem_field_*.csv` file contains
+the complex field at all P2 degrees of freedom, in the same RCM ordering as
+the matrices.
+
+## Multi-Mode Training
+
+Configure the defect, ratio, frequencies, and modes at the beginning of
+`pinn_waveguide_2d/pinn_waveguide_multi_mode.py`, then run:
+
 ```bash
-python waveguide_2d/pinn_alternating.py
+python3 pinn_waveguide_2d/pinn_waveguide_multi_mode.py
 ```
-Output figures will be saved automatically in the `waveguide_2d/fig/` subdirectory.
+
+The script saves the UV networks in `pinn_waveguide_2d/checkpoints/`. The NPZ
+checkpoint contains the weights, Fourier basis, `sigma` parameters, `U_norm`,
+and the physical geometry. Its contents can be inspected with:
+
+```bash
+python3 tools/uv_checkpoint.py inspect \
+  --checkpoint pinn_waveguide_2d/checkpoints/uv_barhalfup_ratio0p8_modes0_1_2_freqs600.npz
+```
+
+## FEM–PINN Comparison
+
+```bash
+python3 tools/compare_pinn_fem.py \
+  --checkpoint pinn_waveguide_2d/checkpoints/uv_barhalfup_ratio0p8_modes0_1_2_freqs600.npz \
+  --mass-matrix FEM/pinn_data/Mass_matrix_barhalfup.csv \
+  --stiffness-matrix FEM/pinn_data/Stiff_matrix_barhalfup.csv \
+  --fem-field FEM/pinn_data/fem_field_barhalfup_ratio0p8.csv
+```
+
+The `--frequency` and `--mode` options can be used to filter the cases. If
+`--stiffness-matrix` is omitted, only the L2 misfit is computed.
+
+For the complex error `e = U_PINN - U_FEM`, the tool prints the absolute and
+relative norms:
+
+```text
+||e||L2 = sqrt(Re(e* M e))
+||e||H1 = sqrt(Re(e* (M + K) e))
+```
+
+Each relative value is divided by the corresponding FEM norm. For every
+`(frequency, mode)` pair, an interactive figure displays `Re(U FEM)`,
+`Re(U PINN)`, and the signed difference. The maps are rasterized, use physical
+coordinates, and are not saved automatically; they can be saved from the
+Matplotlib interface.
