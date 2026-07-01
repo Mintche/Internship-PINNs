@@ -80,7 +80,7 @@ switch_window = 10       # Window size for switch criterion
 max_steps_adam_phase1 = 40001
 max_steps_lbfgs_phase1 = 3001
 max_steps_adam_phase2 = 100001
-max_steps_lbfgs_phase2 = 12001
+max_steps_lbfgs_phase2 = 3001
 
 SHOW_PLOTS = True
 
