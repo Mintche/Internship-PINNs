@@ -45,8 +45,8 @@ class ComparisonResult:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Evaluer un checkpoint PINN sur les DDL P2 FEM, calculer les misfits "
-            "complexes L2/H1 et afficher les cartes reelles."
+            "Evaluate a PINN checkpoint at the FEM P2 degrees of freedom, compute "
+            "complex L2/H1 misfits, and display real-part field maps."
         )
     )
     parser.add_argument("--checkpoint", required=True, type=Path)
@@ -246,11 +246,11 @@ def create_comparison_figure(
     axes[0].set_ylabel("y")
 
     metrics = result.metrics
-    metric_title = f"L2 relatif={100.0 * metrics.l2_relative:.4g} %"
+    metric_title = f"relative L2={100.0 * metrics.l2_relative:.4g} %"
     if metrics.h1_relative is not None:
-        metric_title += f", H1 relatif={100.0 * metrics.h1_relative:.4g} %"
+        metric_title += f", relative H1={100.0 * metrics.h1_relative:.4g} %"
     figure.suptitle(
-        f"Comparaison FEM-PINN — f={result.frequency:.8g} Hz, mode={result.mode} — "
+        f"FEM-PINN comparison — f={result.frequency:.8g} Hz, mode={result.mode} — "
         + metric_title
     )
     figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.92))

@@ -31,7 +31,7 @@ L = 1.0  # Half-length of the waveguide
 c0 = 340.0
 contrast_max = 0.4
 cmin = c0 * (1-contrast_max)
-cmax = c0 * (1+contrast_max)
+cmax = c0 * (1+0.01)
 m0 = 1/c0**2
 m_min = 1 / cmax**2
 m_max = 1 / cmin**2
@@ -40,16 +40,16 @@ m_max = 1 / cmin**2
 # Data files follow the naming convention:
 #   pinn_boundary_{left/right}_{defect_name}_ratio{c_defect/c0}.csv
 script_dir = os.path.dirname(os.path.abspath(__file__))
-defect_name = 'barhalf'
+defect_name = 'circlebottomright'
 contrast_ratio = 0.8
 data_ratio_label = format_ratio_label(contrast_ratio)
 
 # Frequencies to run training on (curriculum learning: low to high)
-training_frequencies = np.array([600.0])
+training_frequencies = np.array([1200.0])
 
 # Active modes per frequency: edit these to select which modes to use
 active_modes_per_freq = {
-    600.0: [0, 1, 2]
+    1200.0: [0, 1, 2, 3, 4]
 }
 
 # --- Random Seed ---
@@ -963,7 +963,7 @@ def main():
         plt.title(f"Reconstructed c(x,y) — {modes_per_freq_str}")
         plt.tight_layout()
         plt.savefig(os.path.join(script_dir, 'fig',
-            f'2D_WG_c_map__{defect_name}_freq{int(training_frequencies[i])}_modes{modes_str}_freqs{freqs_str}.pdf'))
+            f'2D_WG_c_map_{defect_name}_freq{int(training_frequencies[i])}_modes{modes_str}_freqs{freqs_str}.pdf'))
         if SHOW_PLOTS:
             plt.show()
         plt.close()
