@@ -404,7 +404,7 @@ def create_comparison_figure(
         (values2, r"$\mathrm{Re}(U_2)$", field_limit),
         (difference, r"$\mathrm{Re}(U_2-U_1)$", difference_limit),
     )
-    for axis, (values, label, limit) in zip(axes, panels):
+    for axis, (values, title, limit) in zip(axes, panels):
         image = axis.tripcolor(
             triangulation,
             values,
@@ -414,13 +414,19 @@ def create_comparison_figure(
             vmax=limit,
             rasterized=True,
         )
+        axis.set_title(title)
         axis.set_xlabel("x")
         axis.set_aspect("equal", adjustable="box")
-        colorbar = figure.colorbar(image, ax=axis, shrink=0.85)
-        colorbar.set_label(label)
+        figure.colorbar(image, ax=axis, shrink=0.85)
     axes[0].set_ylabel("y")
+
+    metrics = result.metrics
+    metric_title = f"relative L2={100.0 * metrics.l2_relative:.4g} %"
+    if metrics.h1_relative is not None:
+        metric_title += f", relative H1={100.0 * metrics.h1_relative:.4g} %"
     figure.suptitle(
-        f"Defect: {defect_name} — f = {result.frequency:.8g} Hz — mode = {result.mode}"
+        f"Defect: {defect_name} — f={result.frequency:.8g} Hz, mode={result.mode} — "
+        + metric_title
     )
     figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.93))
     return figure
