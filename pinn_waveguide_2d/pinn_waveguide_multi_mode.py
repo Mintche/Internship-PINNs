@@ -31,7 +31,7 @@ L = 1.0  # Half-length of the waveguide
 c0 = 340.0
 contrast_max = 0.4
 cmin = c0 * (1-contrast_max)
-cmax = c0 * (1+0.01)
+cmax = c0 * (1+contrast_max)
 m0 = 1/c0**2
 m_min = 1 / cmax**2
 m_max = 1 / cmin**2
@@ -40,16 +40,16 @@ m_max = 1 / cmin**2
 # Data files follow the naming convention:
 #   pinn_boundary_{left/right}_{defect_name}_ratio{c_defect/c0}.csv
 script_dir = os.path.dirname(os.path.abspath(__file__))
-defect_name = 'circlebottomright'
+defect_name = 'barhalf'
 contrast_ratio = 0.8
 data_ratio_label = format_ratio_label(contrast_ratio)
 
 # Frequencies to run training on (curriculum learning: low to high)
-training_frequencies = np.array([1200.0])
+training_frequencies = np.array([600.0])
 
 # Active modes per frequency: edit these to select which modes to use
 active_modes_per_freq = {
-    1200.0: [0, 1, 2, 3, 4]
+    600.0: [0, 1, 2]
 }
 
 # --- Random Seed ---
@@ -506,16 +506,6 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
             best_params_uv[fm_key] = param_uv
             best_loss = float('inf')
 
-            # Rescale sigma from previous frequency if available
-            if i > 0:
-                prev_freq = float(freqs[i-1])
-                prev_modes = active_modes_per_freq[prev_freq]
-                if mode_idx in prev_modes:
-                    prev_key = (prev_freq, mode_idx)
-                    scale = jnp.abs(best_params_uv[prev_key]["sigma"][1] / best_params_uv[prev_key]["sigma"][0])
-                    sigma_x = param_uv["sigma"][0]
-                    param_uv["sigma"] = param_uv["sigma"].at[1].set(scale * sigma_x)
-
             print(f"\n--- Phase 1: Mode {mode_idx} | Adam (max {max_steps_adam_phase1} steps) ---")
 
             # Re-initialize optimizer state (resets cosine schedule counter)
@@ -963,7 +953,7 @@ def main():
         plt.title(f"Reconstructed c(x,y) — {modes_per_freq_str}")
         plt.tight_layout()
         plt.savefig(os.path.join(script_dir, 'fig',
-            f'2D_WG_c_map_{defect_name}_freq{int(training_frequencies[i])}_modes{modes_str}_freqs{freqs_str}.pdf'))
+            f'c_map_{defect_name}_freq{int(training_frequencies[i])}_m{modes_str}_f{freqs_str}.pdf'))
         if SHOW_PLOTS:
             plt.show()
         plt.close()
