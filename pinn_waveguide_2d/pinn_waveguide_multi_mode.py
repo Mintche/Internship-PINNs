@@ -31,7 +31,7 @@ L = 1.0  # Half-length of the waveguide
 c0 = 340.0
 contrast_max = 0.4
 cmin = c0 * (1-contrast_max)
-cmax = c0 * (1+contrast_max)
+cmax = c0 * (1+0.01)
 m0 = 1/c0**2
 m_min = 1 / cmax**2
 m_max = 1 / cmin**2
@@ -45,11 +45,12 @@ contrast_ratio = 0.8
 data_ratio_label = format_ratio_label(contrast_ratio)
 
 # Frequencies to run training on (curriculum learning: low to high)
-training_frequencies = np.array([600.0])
+training_frequencies = np.array([600.0, 1200.0])
 
 # Active modes per frequency: edit these to select which modes to use
 active_modes_per_freq = {
-    600.0: [0, 1, 2]
+    600.0: [0, 1, 2],
+    1200.0: [0, 1, 2, 3, 4]
 }
 
 # --- Random Seed ---
@@ -71,8 +72,11 @@ lr_m = 3e-4
 lr_sigma = 1e-2
 
 # --- Training Hyperparameters ---
-N_adam = 4000            # Number of collocation points for Adam
-N_lbfgs = 1000           # Number of collocation points for L-BFGS
+# Collocation sizes are ordered as (PDE interior, horizontal Neumann, vertical DtN).
+# Keeping these tuples fixed avoids recompilation while Adam still resamples the points.
+N_adam = (4096, 256, 64)
+N_lbfgs = (2048, 256, 64)
+N_validation = (4096, 256, 128)
 eval_interval = 200      # Interval for evaluating losses and printing progress
 switch_threshold = 0.0   # Threshold for L-BFGS switch criterion
 switch_window = 10       # Window size for switch criterion
@@ -85,6 +89,7 @@ max_steps_lbfgs_phase2 = 3001
 SHOW_PLOTS = True
 
 weights_phase1 = jnp.array([1.0, 10.0, 0.0])
+weights_phase2_final = jnp.array([1.0, 1.0, 10.0])
 
 # ==============================================================================
 # SECTION 2: DATA DISCOVERY
@@ -182,14 +187,64 @@ def c(x, y, layers_m):
 # SECTION 6: COLLOCATION POINTS & SWITCH CRITERION
 # ==============================================================================
 
-def sample_collocation_points(key, N):
-    """Generate random collocation points in [-1, 1]^2."""
+def sample_collocation_points(key, sizes):
+    """Generate independent PDE and boundary points for one optimization step."""
+    N_pde, N_neumann, N_dtn = sizes
     if key is None:
-        key = jax.random.PRNGKey(0)
-    subkey1, subkey2 = jax.random.split(key, 2)
-    x = jax.random.uniform(subkey1, (N,), minval=-1.0, maxval=1.0)
-    y = jax.random.uniform(subkey2, (N,), minval=-1.0, maxval=1.0)
-    return x, y
+        return regular_collocation_points(sizes)
+
+    key_x_pde, key_y_pde, key_neumann, key_dtn = jax.random.split(key, 4)
+    x_pde = jax.random.uniform(
+        key_x_pde, (N_pde,), minval=-1.0, maxval=1.0)
+    y_pde = jax.random.uniform(
+        key_y_pde, (N_pde,), minval=-1.0, maxval=1.0)
+    x_neumann = jax.random.uniform(
+        key_neumann, (N_neumann,), minval=-1.0, maxval=1.0)
+    y_dtn = jax.random.uniform(
+        key_dtn, (N_dtn,), minval=-1.0, maxval=1.0)
+    return x_pde, y_pde, x_neumann, y_dtn
+
+
+def regular_collocation_grid(N):
+    """Return an approximately isotropic physical tensor grid with exactly N points."""
+    if N <= 0:
+        raise ValueError("The number of collocation points must be positive")
+
+    # Pick an exact factorization whose axis ratio is closest to the physical
+    # aspect ratio (2L)/H. For N=1000 this gives a 50 x 20 grid.
+    physical_aspect_ratio = (2.0 * L) / H
+    factor_pairs = [
+        (N // ny, ny)
+        for ny in range(1, int(np.sqrt(N)) + 1)
+        if N % ny == 0
+    ]
+    nx, ny = min(
+        factor_pairs,
+        key=lambda shape: abs(np.log((shape[0] / shape[1]) / physical_aspect_ratio)),
+    )
+
+    # Cell-centred linspaces keep PDE collocation points off the boundary.
+    x_axis = jnp.linspace(-1.0 + 1.0 / nx, 1.0 - 1.0 / nx, nx)
+    y_axis = jnp.linspace(-1.0 + 1.0 / ny, 1.0 - 1.0 / ny, ny)
+    x_grid, y_grid = jnp.meshgrid(x_axis, y_axis, indexing='xy')
+    return x_grid.reshape(-1), y_grid.reshape(-1)
+
+
+def regular_boundary_grid(N):
+    """Return N cell-centred coordinates on a normalized one-dimensional edge."""
+    if N <= 0:
+        raise ValueError("The number of boundary points must be positive")
+    return jnp.linspace(-1.0 + 1.0 / N, 1.0 - 1.0 / N, N)
+
+
+def regular_collocation_points(sizes):
+    """Return fixed, non-redundant PDE, Neumann and DtN collocation grids."""
+    N_pde, N_neumann, N_dtn = sizes
+    x_pde, y_pde = regular_collocation_grid(N_pde)
+    x_neumann = regular_boundary_grid(N_neumann)
+    y_dtn = regular_boundary_grid(N_dtn)
+    return x_pde, y_pde, x_neumann, y_dtn
+
 
 def check_switch_criterion(loss_history, window=10, threshold=1e-3):
     """Returns True if the relative slope of the loss is below threshold."""
@@ -204,8 +259,9 @@ def check_switch_criterion(loss_history, window=10, threshold=1e-3):
 # SECTION 7: LOSS FUNCTION DEFINITIONS
 # ==============================================================================
 
-def loss_fn(params_uv, layers_m, x, y, f, mode_index, target_u_left, target_u_right,
-            y_bnd_left, y_bnd_right, u_norm_val, weights, k0, beta_n,
+def loss_fn(params_uv, layers_m, x_pde, y_pde, x_neumann, y_dtn,
+            f, mode_index, target_u_left, target_u_right, y_bnd_left,
+            y_bnd_right, u_norm_val, weights, k0, beta_n,
             is_warmup=False, use_healthy_guide=False):
     
     def uv(x, y):
@@ -260,12 +316,17 @@ def loss_fn(params_uv, layers_m, x, y, f, mode_index, target_u_left, target_u_ri
     
     # PDE Residual Loss
     vmap_pde_residual = jax.vmap(pde_residual, in_axes=(0, 0))
-    pde_loss = jnp.mean(vmap_pde_residual(x, y)**2)
+    pde_loss = jnp.mean(vmap_pde_residual(x_pde, y_pde)**2)
     
     # Boundary Conditions Loss
-    dtn_loss_left = compute_dtn_loss(-1.0, y, sign=-1, A_inc=A_inc_left)
-    dtn_loss_right = compute_dtn_loss(1.0, y, sign=1, A_inc=None)
-    neum_loss = jnp.mean(jax.vmap(uv_y, in_axes=(0, None))(x, 1.0)**2 + jax.vmap(uv_y, in_axes=(0, None))(x, -1.0)**2)
+    dtn_loss_left = compute_dtn_loss(
+        -1.0, y_dtn, sign=-1, A_inc=A_inc_left)
+    dtn_loss_right = compute_dtn_loss(
+        1.0, y_dtn, sign=1, A_inc=None)
+    neum_loss = jnp.mean(
+        jax.vmap(uv_y, in_axes=(0, None))(x_neumann, 1.0)**2
+        + jax.vmap(uv_y, in_axes=(0, None))(x_neumann, -1.0)**2
+    )
     bc_loss = neum_loss + dtn_loss_left + dtn_loss_right
     
     # Data Loss
@@ -279,6 +340,57 @@ def loss_fn(params_uv, layers_m, x, y, f, mode_index, target_u_left, target_u_ri
     
     return total_loss, (pde_loss, bc_loss, data_loss)
 
+
+def multimode_loss_fn(params_uv_stacked, layers_m, x_pde, y_pde,
+                      x_neumann, y_dtn, f_val, mode_indices, targets_left,
+                      targets_right, y_bnds_left, y_bnds_right, u_norms,
+                      weights, k0, beta_n):
+    """Evaluate the mean weighted loss over all active incident modes."""
+    def _loss_single(p_uv, mi, tl, tr, yl, yr, un):
+        return loss_fn(
+            p_uv, layers_m, x_pde, y_pde, x_neumann, y_dtn, f_val, mi,
+            tl, tr, yl, yr, un, weights, k0, beta_n,
+            is_warmup=False, use_healthy_guide=False,
+        )
+
+    vmapped = jax.vmap(_loss_single, in_axes=(0, 0, 0, 0, 0, 0, 0))
+    losses, (pdes, bcs, datas) = vmapped(
+        params_uv_stacked, mode_indices,
+        targets_left, targets_right,
+        y_bnds_left, y_bnds_right,
+        u_norms,
+    )
+    return jnp.mean(losses), (jnp.mean(pdes), jnp.mean(bcs), jnp.mean(datas))
+
+
+@functools.partial(jax.jit, static_argnames=('use_healthy_guide',))
+def evaluate_forward_loss(params_uv, layers_m, x_pde, y_pde, x_neumann,
+                          y_dtn, f_val, mode_index, target_left, target_right,
+                          y_bnd_left, y_bnd_right, u_norm, weights, k0, beta_n,
+                          use_healthy_guide):
+    """Evaluate phase 1 parameters without applying an optimizer update."""
+    return loss_fn(
+        params_uv, layers_m, x_pde, y_pde, x_neumann, y_dtn,
+        f_val, mode_index,
+        target_left, target_right, y_bnd_left, y_bnd_right,
+        u_norm, weights, k0, beta_n,
+        is_warmup=True, use_healthy_guide=use_healthy_guide,
+    )
+
+
+@jax.jit
+def evaluate_inverse_loss(params_uv_stacked, layers_m, x_pde, y_pde,
+                          x_neumann, y_dtn, f_val, mode_indices, targets_left,
+                          targets_right, y_bnds_left, y_bnds_right, u_norms,
+                          weights, k0, beta_n):
+    """Evaluate phase 2 parameters without applying an optimizer update."""
+    return multimode_loss_fn(
+        params_uv_stacked, layers_m, x_pde, y_pde, x_neumann, y_dtn,
+        f_val, mode_indices,
+        targets_left, targets_right, y_bnds_left, y_bnds_right,
+        u_norms, weights, k0, beta_n,
+    )
+
 # ==============================================================================
 # SECTION 8: OPTIMIZATION SCHEMES & TRAIN STEPS (JIT COMPILED)
 # ==============================================================================
@@ -291,14 +403,18 @@ def make_train_step_forward(adam_opt, lbfgs_opt):
                            target_left, target_right, y_bnd_left, y_bnd_right, u_norm,
                            current_weights, k0, beta_n,
                            N, use_lbfgs=False, use_healthy_guide=True):
-        x, y = sample_collocation_points(key, N)
+        x_pde, y_pde, x_neumann, y_dtn = sample_collocation_points(key, N)
 
         def loss_uv(p_uv):
-            return loss_fn(p_uv, layers_m, x, y, f_val, mode_index,
-                           target_left, target_right,
-                           y_bnd_left, y_bnd_right, u_norm, current_weights,
-                           k0, beta_n,
-                           is_warmup=True, use_healthy_guide=use_healthy_guide)
+            return loss_fn(
+                p_uv, layers_m,
+                x_pde, y_pde, x_neumann, y_dtn,
+                f_val, mode_index,
+                target_left, target_right,
+                y_bnd_left, y_bnd_right, u_norm, current_weights,
+                k0, beta_n,
+                is_warmup=True, use_healthy_guide=use_healthy_guide,
+            )
 
         (loss, aux), grads_uv = jax.value_and_grad(loss_uv, has_aux=True)(params_uv)
 
@@ -329,21 +445,16 @@ def make_train_step_inverse_multimode(adam_opt_uv, adam_opt_m, lbfgs_opt_packed)
                            current_weights, k0, beta_n,
                            N, use_lbfgs=False):
 
-        x, y = sample_collocation_points(key, N)
+        x_pde, y_pde, x_neumann, y_dtn = sample_collocation_points(key, N)
         
         def loss_all_modes(p_uv_stacked, l_m):
-            def _loss_single(p_uv, mi, tl, tr, yl, yr, un):
-                return loss_fn(p_uv, l_m, x, y, f_val, mi,
-                               tl, tr, yl, yr, un, current_weights, k0, beta_n,
-                               is_warmup=False, use_healthy_guide=False)
-
-            vmapped = jax.vmap(_loss_single, in_axes=(0, 0, 0, 0, 0, 0, 0))
-            losses, (pdes, bcs, datas) = vmapped(
-                p_uv_stacked, mode_indices,
-                targets_left, targets_right,
-                y_bnds_left, y_bnds_right,
-                u_norms)
-            return jnp.mean(losses), (jnp.mean(pdes), jnp.mean(bcs), jnp.mean(datas))
+            return multimode_loss_fn(
+                p_uv_stacked, l_m,
+                x_pde, y_pde, x_neumann, y_dtn,
+                f_val, mode_indices,
+                targets_left, targets_right, y_bnds_left, y_bnds_right,
+                u_norms, current_weights, k0, beta_n,
+            )
 
         (loss, aux), (grads_uv, grads_m) = jax.value_and_grad(
             loss_all_modes, argnums=(0, 1), has_aux=True)(params_uv_stacked, layers_m)
@@ -401,6 +512,11 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
     
     loss_forward = {mi: [] for mi in all_used_modes}
     loss_inverse = []
+    best_validation_losses = {'forward': [], 'inverse': []}
+
+    # This deterministic grid is used only for convergence checks and best-model
+    # selection. It is denser than, and therefore distinct from, the L-BFGS grid.
+    validation_points = regular_collocation_points(N_validation)
 
     best_params_uv = dict(params_uv)  # shallow copy of the dict
     best_params_each_m = []
@@ -505,6 +621,7 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
             param_uv = params_uv[fm_key]
             best_params_uv[fm_key] = param_uv
             best_loss = float('inf')
+            best_forward_summary = None
 
             print(f"\n--- Phase 1: Mode {mode_idx} | Adam (max {max_steps_adam_phase1} steps) ---")
 
@@ -517,7 +634,7 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
 
             for step in range(max_steps_adam_phase1):
                 key, subkey = jax.random.split(key)
-                param_uv, opt_state_uv, _, aux = step_forward(
+                param_uv, opt_state_uv, _, _ = step_forward(
                     param_uv, layers_m, opt_state_uv, subkey, freq, mode_idx,
                     md['U_left_norm'][freq], md['U_right_norm'][freq],
                     md['Y_left'][freq], md['Y_right'][freq], md['U_norm'][freq], weights_phase1,
@@ -525,16 +642,34 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
                     N=N_adam, use_lbfgs=False, use_healthy_guide=use_healthy_guide_flag)
 
                 if step % eval_interval == 0:
-                    pde_loss, bc_loss, _ = aux
-                    loss = pde_loss + bc_loss
+                    loss, validation_aux = evaluate_forward_loss(
+                        param_uv, layers_m, *validation_points,
+                        freq, mode_idx,
+                        md['U_left_norm'][freq], md['U_right_norm'][freq],
+                        md['Y_left'][freq], md['Y_right'][freq], md['U_norm'][freq],
+                        weights_phase1, k0, beta_n, use_healthy_guide_flag,
+                    )
+                    pde_loss, bc_loss, _ = validation_aux
+                    loss_value = float(loss)
                     loss_forward[mode_idx].append((pde_loss, bc_loss))
-                    print(f"[Adam M{mode_idx}] Step {step} | pde {pde_loss:.2e} | bc {bc_loss:.2e} | total {loss:.2e} | scales {param_uv['sigma']}")
+                    print(f"[Adam M{mode_idx}] Step {step} | val pde {pde_loss:.2e} | val bc {bc_loss:.2e} | weighted val total {loss:.2e} | scales {param_uv['sigma']}")
                     
-                    loss_history_p1.append(float(loss))
+                    loss_history_p1.append(loss_value)
                     
-                    if loss < best_loss:
-                        best_loss = loss
+                    if loss_value < best_loss:
+                        best_loss = loss_value
                         best_params_uv[fm_key] = param_uv
+                        best_forward_summary = {
+                            'frequency': freq,
+                            'mode': int(mode_idx),
+                            'optimizer': 'adam',
+                            'step': int(step),
+                            'pde': float(pde_loss),
+                            'bc': float(bc_loss),
+                            'data': 0.0,
+                            'weighted_total': loss_value,
+                            'weights': [float(value) for value in weights_phase1],
+                        }
 
                     if check_switch_criterion(loss_history_p1, window=switch_window, threshold=switch_threshold):
                         print(f"[Adam M{mode_idx}] Convergence criterion met at step {step}. Switching to L-BFGS.")
@@ -548,7 +683,7 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
                 opt_state_uv = lbfgs_uv_p1.init(param_uv)
 
                 for step in range(max_steps_lbfgs_phase1):
-                    param_uv, opt_state_uv, _, aux = step_forward(
+                    param_uv, opt_state_uv, _, _ = step_forward(
                         param_uv, layers_m, opt_state_uv, None, freq, mode_idx,
                         md['U_left_norm'][freq], md['U_right_norm'][freq],
                         md['Y_left'][freq], md['Y_right'][freq], md['U_norm'][freq], weights_phase1,
@@ -556,16 +691,39 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
                         N=N_lbfgs, use_lbfgs=True, use_healthy_guide=use_healthy_guide_flag)
 
                     if step % eval_interval == 0:
-                        pde_loss, bc_loss, _ = aux
-                        loss = pde_loss + bc_loss
+                        loss, validation_aux = evaluate_forward_loss(
+                            param_uv, layers_m, *validation_points,
+                            freq, mode_idx,
+                            md['U_left_norm'][freq], md['U_right_norm'][freq],
+                            md['Y_left'][freq], md['Y_right'][freq], md['U_norm'][freq],
+                            weights_phase1, k0, beta_n, use_healthy_guide_flag,
+                        )
+                        pde_loss, bc_loss, _ = validation_aux
+                        loss_value = float(loss)
                         loss_forward[mode_idx].append((pde_loss, bc_loss))
-                        print(f"[LBFGS M{mode_idx}] Step {step} | pde {pde_loss:.2e} | bc {bc_loss:.2e} | total {loss:.2e} | scales {param_uv['sigma']}")
-                        if loss < best_loss:
-                            best_loss = loss
+                        print(f"[LBFGS M{mode_idx}] Step {step} | val pde {pde_loss:.2e} | val bc {bc_loss:.2e} | weighted val total {loss:.2e} | scales {param_uv['sigma']}")
+                        if loss_value < best_loss:
+                            best_loss = loss_value
                             best_params_uv[fm_key] = param_uv
+                            best_forward_summary = {
+                                'frequency': freq,
+                                'mode': int(mode_idx),
+                                'optimizer': 'lbfgs',
+                                'step': int(step),
+                                'pde': float(pde_loss),
+                                'bc': float(bc_loss),
+                                'data': 0.0,
+                                'weighted_total': loss_value,
+                                'weights': [float(value) for value in weights_phase1],
+                            }
 
             # Store the best u-params for this (freq, mode)
+            if best_forward_summary is None:
+                raise RuntimeError(
+                    f'No finite validation loss for forward f={freq}, mode={mode_idx}'
+                )
             params_uv[fm_key] = best_params_uv[fm_key]
+            best_validation_losses['forward'].append(best_forward_summary)
 
         # ============================================================
         # PHASE 2: Inverse (all modes' u-networks + shared m jointly)
@@ -573,6 +731,7 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
 
         best_loss = float('inf')
         best_params_m = layers_m
+        best_inverse_summary = None
         
         if max_steps_adam_phase2 > 0 or max_steps_lbfgs_phase2 > 0:
 
@@ -609,7 +768,7 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
                 weights_phase2 = jnp.array([1.0, 1.0, data_weight_schedule(step)])
 
                 key, subkey = jax.random.split(key)
-                params_uv_stacked, layers_m, opt_state_uv, opt_state_m, opt_state_lbfgs, _, aux = step_inverse(
+                params_uv_stacked, layers_m, opt_state_uv, opt_state_m, opt_state_lbfgs, _, _ = step_inverse(
                     params_uv_stacked, layers_m, opt_state_uv, opt_state_m, opt_state_lbfgs,
                     subkey, freq, mode_indices_arr,
                     targets_left, targets_right, y_bnds_left, y_bnds_right, u_norms,
@@ -617,8 +776,14 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
                     N=N_adam, use_lbfgs=False)
 
                 if step % eval_interval == 0:
-                    pde_loss, bc_loss, data_loss = aux
-                    loss = pde_loss + bc_loss + data_loss
+                    loss, validation_aux = evaluate_inverse_loss(
+                        params_uv_stacked, layers_m, *validation_points,
+                        freq, mode_indices_arr,
+                        targets_left, targets_right, y_bnds_left, y_bnds_right,
+                        u_norms, weights_phase2_final, k0, beta_n,
+                    )
+                    pde_loss, bc_loss, data_loss = validation_aux
+                    loss_value = float(loss)
                     loss_inverse.append((pde_loss, bc_loss, data_loss))
                     # Quick unstack of sigma for printing
                     sigmas = []
@@ -626,14 +791,25 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
                         sigma_val = params_uv_stacked['sigma'][idx]
                         sigmas.append(f"M{mi} σ={sigma_val}")
                     sigmas_str = " | ".join(sigmas)
-                    print(f"[Adam] Step {step} | pde {pde_loss:.2e} | bc {bc_loss:.2e} | data {data_loss:.2e} | total {loss:.2e} | {sigmas_str}")
+                    print(f"[Adam] Step {step} | val pde {pde_loss:.2e} | val bc {bc_loss:.2e} | val data {data_loss:.2e} | weighted val total {loss:.2e} | train data weight {weights_phase2[2]:.2e} | {sigmas_str}")
                     
-                    loss_history_p2.append(float(loss))
+                    loss_history_p2.append(loss_value)
                     
-                    if loss < best_loss:
-                        best_loss = loss
+                    if loss_value < best_loss:
+                        best_loss = loss_value
                         best_params_uv_stacked = jax.tree_util.tree_map(jnp.copy, params_uv_stacked)
                         best_params_m = layers_m
+                        best_inverse_summary = {
+                            'frequency': freq,
+                            'modes': [int(mode) for mode in freq_modes],
+                            'optimizer': 'adam',
+                            'step': int(step),
+                            'pde': float(pde_loss),
+                            'bc': float(bc_loss),
+                            'data': float(data_loss),
+                            'weighted_total': loss_value,
+                            'weights': [float(value) for value in weights_phase2_final],
+                        }
 
                     if check_switch_criterion(loss_history_p2, window=switch_window, threshold=switch_threshold):
                         print(f"[Adam] Convergence criterion met at step {step}. Switching to L-BFGS.")
@@ -646,34 +822,63 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
             if switched_to_lbfgs_p2 or max_steps_lbfgs_phase2 > 0:
                 print(f"\n--- Phase 2: Multi-mode inverse | L-BFGS (max {max_steps_lbfgs_phase2} steps) ---")
                 opt_state_lbfgs = lbfgs_packed_p2.init({'uv_list': params_uv_stacked, 'm': layers_m})
-                weights_phase2_lbfgs = jnp.array([1.0, 1.0, 10.0])
 
                 for step in range(max_steps_lbfgs_phase2):
-                    params_uv_stacked, layers_m, opt_state_uv, opt_state_m, opt_state_lbfgs, _, aux = step_inverse(
+                    params_uv_stacked, layers_m, opt_state_uv, opt_state_m, opt_state_lbfgs, _, _ = step_inverse(
                         params_uv_stacked, layers_m, opt_state_uv, opt_state_m, opt_state_lbfgs,
                         None, freq, mode_indices_arr,
                         targets_left, targets_right, y_bnds_left, y_bnds_right, u_norms,
-                        weights_phase2_lbfgs, k0, beta_n,
+                        weights_phase2_final, k0, beta_n,
                         N=N_lbfgs, use_lbfgs=True)
 
                     if step % eval_interval == 0:
-                        pde_loss, bc_loss, data_loss = aux
-                        loss = pde_loss + bc_loss + data_loss
+                        loss, validation_aux = evaluate_inverse_loss(
+                            params_uv_stacked, layers_m, *validation_points,
+                            freq, mode_indices_arr,
+                            targets_left, targets_right, y_bnds_left, y_bnds_right,
+                            u_norms, weights_phase2_final, k0, beta_n,
+                        )
+                        pde_loss, bc_loss, data_loss = validation_aux
+                        loss_value = float(loss)
                         loss_inverse.append((pde_loss, bc_loss, data_loss))
-                        print(f"[LBFGS] Step {step} | pde {pde_loss:.2e} | bc {bc_loss:.2e} | data {data_loss:.2e} | total {loss:.2e}")
-                        if loss < best_loss:
-                            best_loss = loss
+                        print(f"[LBFGS] Step {step} | val pde {pde_loss:.2e} | val bc {bc_loss:.2e} | val data {data_loss:.2e} | weighted val total {loss:.2e}")
+                        if loss_value < best_loss:
+                            best_loss = loss_value
                             best_params_uv_stacked = jax.tree_util.tree_map(jnp.copy, params_uv_stacked)
                             best_params_m = layers_m
+                            best_inverse_summary = {
+                                'frequency': freq,
+                                'modes': [int(mode) for mode in freq_modes],
+                                'optimizer': 'lbfgs',
+                                'step': int(step),
+                                'pde': float(pde_loss),
+                                'bc': float(bc_loss),
+                                'data': float(data_loss),
+                                'weighted_total': loss_value,
+                                'weights': [float(value) for value in weights_phase2_final],
+                            }
 
             # Unstack and store the best parameters back into params_uv
+            if best_inverse_summary is None:
+                raise RuntimeError(
+                    f'No finite validation loss for inverse f={freq}'
+                )
             for idx, mi in enumerate(freq_modes):
                 param_uv_i = jax.tree_util.tree_map(lambda x: x[idx], best_params_uv_stacked)
                 params_uv[(freq, mi)] = param_uv_i
             layers_m = best_params_m
             best_params_each_m.append(jax.tree_util.tree_map(jnp.copy, layers_m))
+            best_validation_losses['inverse'].append(best_inverse_summary)
 
-    return params_uv, layers_m, best_params_each_m, key, loss_forward, loss_inverse
+    return (
+        params_uv,
+        layers_m,
+        best_params_each_m,
+        key,
+        loss_forward,
+        loss_inverse,
+        best_validation_losses,
+    )
 
 # ==============================================================================
 # SECTION 10: MAIN ENTRY POINT
@@ -797,7 +1002,10 @@ def main():
     # Slowness parameter network (layers_m) — shared across all modes and frequencies
     key, subkey_m = jax.random.split(key)
     layers_m = init_layers(subkey_m, n_layers_m)
-    layers_m[-1]["b"] = -jnp.log((m_max-m_min)/(m0-m_min) - 1)
+    initial_output_bias = -jnp.log((m_max-m_min)/(m0-m_min) - 1)
+    layers_m[-1]["b"] = jnp.full_like(
+        layers_m[-1]["b"], initial_output_bias
+    )
     layers_m[-1]["W"] /= 10.0
 
     # Wavefield networks: one per (frequency, mode)
@@ -833,7 +1041,15 @@ def main():
     # Training
     # ==================================================================
     key, subkey = jax.random.split(key)
-    params_uv, layers_m, best_params_each_m, key, loss_forward, loss_inverse = train(
+    (
+        params_uv,
+        layers_m,
+        best_params_each_m,
+        key,
+        loss_forward,
+        loss_inverse,
+        best_validation_losses,
+    ) = train(
         params_uv, layers_m, N_adam, N_lbfgs,
         max_steps_adam_phase1, max_steps_lbfgs_phase1,
         max_steps_adam_phase2, max_steps_lbfgs_phase2,
@@ -864,6 +1080,19 @@ def main():
         length=L,
         height=H,
         c0=c0,
+        layers_m=layers_m,
+        c_min=cmin,
+        c_max=cmax,
+        network_config={
+            'uv_layers': list(n_layers_uv),
+            'm_layers': list(n_layers_m),
+            'fourier_features': int(m_fourier_features),
+            'hidden_activation': 'tanh',
+            'uv_feature_mapping': 'random_fourier_cos_sin',
+            'm_output_parameterization': 'bounded_slowness_sigmoid',
+        },
+        best_validation_losses=best_validation_losses,
+        random_seed=random_seed,
         metadata={
             'defect_name': defect_name,
             'contrast_ratio': contrast_ratio,
@@ -883,7 +1112,7 @@ def main():
         loss_fwd_arr = np.array(loss_forward[mode_idx])
         pde_losses = loss_fwd_arr[:, 0]
         bc_losses = loss_fwd_arr[:, 1]
-        total_losses = pde_losses + bc_losses
+        total_losses = weights_phase1[0] * pde_losses + weights_phase1[1] * bc_losses
 
         x_axis = eval_interval * np.arange(len(loss_fwd_arr))
 
@@ -896,8 +1125,8 @@ def main():
         ax1.legend(loc="upper right")
         ax1.grid(True)
 
-        ax2.semilogy(x_axis, total_losses, label="Total Loss", color='black')
-        ax2.set_title(f"Phase 1 Mode {mode_idx}: Total Loss")
+        ax2.semilogy(x_axis, total_losses, label="Weighted Validation Loss", color='black')
+        ax2.set_title(f"Phase 1 Mode {mode_idx}: Weighted Validation Loss")
         ax2.set_xlabel("Steps")
         ax2.legend(loc="upper right")
         ax2.grid(True)
@@ -912,7 +1141,11 @@ def main():
         pde_losses_inv = loss_inverse_arr[:, 0]
         bc_losses_inv = loss_inverse_arr[:, 1]
         data_losses_inv = loss_inverse_arr[:, 2]
-        total_losses_inv = pde_losses_inv + bc_losses_inv + data_losses_inv
+        total_losses_inv = (
+            weights_phase2_final[0] * pde_losses_inv
+            + weights_phase2_final[1] * bc_losses_inv
+            + weights_phase2_final[2] * data_losses_inv
+        )
 
         x_axis_inv = eval_interval * np.arange(len(loss_inverse_arr))
 
@@ -926,8 +1159,8 @@ def main():
         ax1.legend(loc="upper right")
         ax1.grid(True)
 
-        ax2.semilogy(x_axis_inv, total_losses_inv, label="Total Loss", color='black')
-        ax2.set_title("Phase 2 (Multi-mode): Total Loss")
+        ax2.semilogy(x_axis_inv, total_losses_inv, label="Weighted Validation Loss", color='black')
+        ax2.set_title("Phase 2 (Multi-mode): Weighted Validation Loss")
         ax2.set_xlabel("Steps")
         ax2.legend(loc="upper right")
         ax2.grid(True)
