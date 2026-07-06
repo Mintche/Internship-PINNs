@@ -40,16 +40,15 @@ m_max = 1 / cmin**2
 # Data files follow the naming convention:
 #   pinn_boundary_{left/right}_{defect_name}_ratio{c_defect/c0}.csv
 script_dir = os.path.dirname(os.path.abspath(__file__))
-defect_name = 'barthird'
+defect_name = '2circ'
 contrast_ratio = 0.8
 data_ratio_label = format_ratio_label(contrast_ratio)
 
 # Frequencies to run training on (curriculum learning: low to high)
-training_frequencies = np.array([900.0,1200.0])
+training_frequencies = np.array([1200.0])
 
 # Active modes per frequency: edit these to select which modes to use
 active_modes_per_freq = {
-    900.0: [0, 1, 2, 3],
     1200.0: [0, 1, 2, 3, 4]
 }
 
