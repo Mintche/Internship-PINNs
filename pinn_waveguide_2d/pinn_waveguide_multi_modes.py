@@ -40,16 +40,16 @@ m_max = 1 / cmin**2
 # Data files follow the naming convention:
 #   pinn_boundary_{left/right}_{defect_name}_ratio{c_defect/c0}.csv
 script_dir = os.path.dirname(os.path.abspath(__file__))
-defect_name = 'barhalf'
+defect_name = 'barthird'
 contrast_ratio = 0.8
 data_ratio_label = format_ratio_label(contrast_ratio)
 
 # Frequencies to run training on (curriculum learning: low to high)
-training_frequencies = np.array([600.0, 1200.0])
+training_frequencies = np.array([900.0,1200.0])
 
 # Active modes per frequency: edit these to select which modes to use
 active_modes_per_freq = {
-    600.0: [0, 1, 2],
+    900.0: [0, 1, 2, 3],
     1200.0: [0, 1, 2, 3, 4]
 }
 
@@ -261,7 +261,7 @@ def check_switch_criterion(loss_history, window=10, threshold=1e-3):
 
 def loss_fn(params_uv, layers_m, x_pde, y_pde, x_neumann, y_dtn,
             f, mode_index, target_u_left, target_u_right, y_bnd_left,
-            y_bnd_right, u_norm_val, weights, k0, beta_n,
+            y_bnd_right, u_norm_val, weights, beta_n,
             is_warmup=False, use_healthy_guide=False):
     
     def uv(x, y):
@@ -344,12 +344,12 @@ def loss_fn(params_uv, layers_m, x_pde, y_pde, x_neumann, y_dtn,
 def multimode_loss_fn(params_uv_stacked, layers_m, x_pde, y_pde,
                       x_neumann, y_dtn, f_val, mode_indices, targets_left,
                       targets_right, y_bnds_left, y_bnds_right, u_norms,
-                      weights, k0, beta_n):
+                      weights, beta_n):
     """Evaluate the mean weighted loss over all active incident modes."""
     def _loss_single(p_uv, mi, tl, tr, yl, yr, un):
         return loss_fn(
             p_uv, layers_m, x_pde, y_pde, x_neumann, y_dtn, f_val, mi,
-            tl, tr, yl, yr, un, weights, k0, beta_n,
+            tl, tr, yl, yr, un, weights, beta_n,
             is_warmup=False, use_healthy_guide=False,
         )
 
@@ -366,14 +366,14 @@ def multimode_loss_fn(params_uv_stacked, layers_m, x_pde, y_pde,
 @functools.partial(jax.jit, static_argnames=('use_healthy_guide',))
 def evaluate_forward_loss(params_uv, layers_m, x_pde, y_pde, x_neumann,
                           y_dtn, f_val, mode_index, target_left, target_right,
-                          y_bnd_left, y_bnd_right, u_norm, weights, k0, beta_n,
+                          y_bnd_left, y_bnd_right, u_norm, weights, beta_n,
                           use_healthy_guide):
     """Evaluate phase 1 parameters without applying an optimizer update."""
     return loss_fn(
         params_uv, layers_m, x_pde, y_pde, x_neumann, y_dtn,
         f_val, mode_index,
         target_left, target_right, y_bnd_left, y_bnd_right,
-        u_norm, weights, k0, beta_n,
+        u_norm, weights, beta_n,
         is_warmup=True, use_healthy_guide=use_healthy_guide,
     )
 
@@ -382,13 +382,13 @@ def evaluate_forward_loss(params_uv, layers_m, x_pde, y_pde, x_neumann,
 def evaluate_inverse_loss(params_uv_stacked, layers_m, x_pde, y_pde,
                           x_neumann, y_dtn, f_val, mode_indices, targets_left,
                           targets_right, y_bnds_left, y_bnds_right, u_norms,
-                          weights, k0, beta_n):
+                          weights, beta_n):
     """Evaluate phase 2 parameters without applying an optimizer update."""
     return multimode_loss_fn(
         params_uv_stacked, layers_m, x_pde, y_pde, x_neumann, y_dtn,
         f_val, mode_indices,
         targets_left, targets_right, y_bnds_left, y_bnds_right,
-        u_norms, weights, k0, beta_n,
+        u_norms, weights, beta_n,
     )
 
 # ==============================================================================
@@ -401,7 +401,7 @@ def make_train_step_forward(adam_opt, lbfgs_opt):
     @functools.partial(jax.jit, static_argnames=('N', 'use_lbfgs', 'use_healthy_guide'))
     def train_step_forward(params_uv, layers_m, opt_state_uv, key, f_val, mode_index,
                            target_left, target_right, y_bnd_left, y_bnd_right, u_norm,
-                           current_weights, k0, beta_n,
+                           current_weights, beta_n,
                            N, use_lbfgs=False, use_healthy_guide=True):
         x_pde, y_pde, x_neumann, y_dtn = sample_collocation_points(key, N)
 
@@ -412,7 +412,7 @@ def make_train_step_forward(adam_opt, lbfgs_opt):
                 f_val, mode_index,
                 target_left, target_right,
                 y_bnd_left, y_bnd_right, u_norm, current_weights,
-                k0, beta_n,
+                beta_n,
                 is_warmup=True, use_healthy_guide=use_healthy_guide,
             )
 
@@ -442,7 +442,7 @@ def make_train_step_inverse_multimode(adam_opt_uv, adam_opt_m, lbfgs_opt_packed)
                            opt_state_lbfgs, key, f_val, mode_indices,
                            targets_left, targets_right,
                            y_bnds_left, y_bnds_right, u_norms,
-                           current_weights, k0, beta_n,
+                           current_weights, beta_n,
                            N, use_lbfgs=False):
 
         x_pde, y_pde, x_neumann, y_dtn = sample_collocation_points(key, N)
@@ -453,7 +453,7 @@ def make_train_step_inverse_multimode(adam_opt_uv, adam_opt_m, lbfgs_opt_packed)
                 x_pde, y_pde, x_neumann, y_dtn,
                 f_val, mode_indices,
                 targets_left, targets_right, y_bnds_left, y_bnds_right,
-                u_norms, current_weights, k0, beta_n,
+                u_norms, current_weights, beta_n,
             )
 
         (loss, aux), (grads_uv, grads_m) = jax.value_and_grad(
@@ -638,7 +638,7 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
                     param_uv, layers_m, opt_state_uv, subkey, freq, mode_idx,
                     md['U_left_norm'][freq], md['U_right_norm'][freq],
                     md['Y_left'][freq], md['Y_right'][freq], md['U_norm'][freq], weights_phase1,
-                    k0, beta_n,
+                    beta_n,
                     N=N_adam, use_lbfgs=False, use_healthy_guide=use_healthy_guide_flag)
 
                 if step % eval_interval == 0:
@@ -647,7 +647,7 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
                         freq, mode_idx,
                         md['U_left_norm'][freq], md['U_right_norm'][freq],
                         md['Y_left'][freq], md['Y_right'][freq], md['U_norm'][freq],
-                        weights_phase1, k0, beta_n, use_healthy_guide_flag,
+                        weights_phase1, beta_n, use_healthy_guide_flag,
                     )
                     pde_loss, bc_loss, _ = validation_aux
                     loss_value = float(loss)
@@ -687,7 +687,7 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
                         param_uv, layers_m, opt_state_uv, None, freq, mode_idx,
                         md['U_left_norm'][freq], md['U_right_norm'][freq],
                         md['Y_left'][freq], md['Y_right'][freq], md['U_norm'][freq], weights_phase1,
-                        k0, beta_n,
+                        beta_n,
                         N=N_lbfgs, use_lbfgs=True, use_healthy_guide=use_healthy_guide_flag)
 
                     if step % eval_interval == 0:
@@ -696,7 +696,7 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
                             freq, mode_idx,
                             md['U_left_norm'][freq], md['U_right_norm'][freq],
                             md['Y_left'][freq], md['Y_right'][freq], md['U_norm'][freq],
-                            weights_phase1, k0, beta_n, use_healthy_guide_flag,
+                            weights_phase1, beta_n, use_healthy_guide_flag,
                         )
                         pde_loss, bc_loss, _ = validation_aux
                         loss_value = float(loss)
@@ -772,7 +772,7 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
                     params_uv_stacked, layers_m, opt_state_uv, opt_state_m, opt_state_lbfgs,
                     subkey, freq, mode_indices_arr,
                     targets_left, targets_right, y_bnds_left, y_bnds_right, u_norms,
-                    weights_phase2, k0, beta_n,
+                    weights_phase2, beta_n,
                     N=N_adam, use_lbfgs=False)
 
                 if step % eval_interval == 0:
@@ -780,7 +780,7 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
                         params_uv_stacked, layers_m, *validation_points,
                         freq, mode_indices_arr,
                         targets_left, targets_right, y_bnds_left, y_bnds_right,
-                        u_norms, weights_phase2_final, k0, beta_n,
+                        u_norms, weights_phase2_final, beta_n,
                     )
                     pde_loss, bc_loss, data_loss = validation_aux
                     loss_value = float(loss)
@@ -828,7 +828,7 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
                         params_uv_stacked, layers_m, opt_state_uv, opt_state_m, opt_state_lbfgs,
                         None, freq, mode_indices_arr,
                         targets_left, targets_right, y_bnds_left, y_bnds_right, u_norms,
-                        weights_phase2_final, k0, beta_n,
+                        weights_phase2_final, beta_n,
                         N=N_lbfgs, use_lbfgs=True)
 
                     if step % eval_interval == 0:
@@ -836,7 +836,7 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
                             params_uv_stacked, layers_m, *validation_points,
                             freq, mode_indices_arr,
                             targets_left, targets_right, y_bnds_left, y_bnds_right,
-                            u_norms, weights_phase2_final, k0, beta_n,
+                            u_norms, weights_phase2_final, beta_n,
                         )
                         pde_loss, bc_loss, data_loss = validation_aux
                         loss_value = float(loss)
@@ -1070,7 +1070,7 @@ def main():
     checkpoint_dir = os.path.join(script_dir, 'checkpoints')
     checkpoint_path = os.path.join(
         checkpoint_dir,
-        f'uv_{defect_name}_{data_ratio_label}_modes{modes_str}_freqs{freqs_str}.npz'
+        f'checkpoint_{defect_name}_{data_ratio_label}_modes{modes_str}_freqs{freqs_str}.npz'
     )
     save_uv_checkpoint(
         checkpoint_path,
@@ -1103,7 +1103,7 @@ def main():
             },
         },
     )
-    print(f'UV checkpoint saved to: {checkpoint_path}')
+    print(f'UV/M checkpoint saved to: {checkpoint_path}')
 
     # --- Plot Phase 1 (Forward) Training Losses per mode ---
     for mode_idx in sorted(loss_forward.keys()):

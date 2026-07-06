@@ -105,7 +105,7 @@ def build_ground_truth(
 ) -> np.ndarray:
     checkpoint_defect = checkpoint.metadata.get("defect_name")
     if checkpoint_defect is None:
-        raise ValueError("Le checkpoint ne contient pas defect_name")
+        raise ValueError("The checkpoint does not contain defect_name metadata")
     if GROUND_TRUTH_NAME is not None and str(checkpoint_defect) != GROUND_TRUTH_NAME:
         raise ValueError(
             "Ground truth/checkpoint mismatch: the hardcoded map is "
@@ -120,11 +120,11 @@ def build_ground_truth(
     )
     if ground_truth.shape != x_grid.shape:
         raise ValueError(
-            "ground_truth_sound_speed doit retourner une carte de la forme de la grille"
+            "ground_truth_sound_speed must return a map with the same shape as the grid"
         )
     if not np.isfinite(ground_truth).all() or (ground_truth <= 0.0).any():
         raise ValueError(
-            "ground_truth_sound_speed doit retourner des celerites finies et positives"
+            "ground_truth_sound_speed must return finite, strictly positive speeds"
         )
     return ground_truth
 
@@ -137,18 +137,24 @@ def compute_misfit(
     reconstructed = np.asarray(reconstructed, dtype=np.float64)
     ground_truth = np.asarray(ground_truth, dtype=np.float64)
     if reconstructed.shape != ground_truth.shape:
-        raise ValueError("La reconstruction et le ground truth ont des formes differentes")
+        raise ValueError(
+            "The reconstructed and ground-truth maps have different shapes"
+        )
     if not np.isfinite(reconstructed).all() or not np.isfinite(ground_truth).all():
-        raise ValueError("La reconstruction ou le ground truth contient NaN ou Inf")
+        raise ValueError(
+            "The reconstructed or ground-truth map contains NaN or infinite values"
+        )
     if not np.isfinite(background_speed) or background_speed <= 0.0:
-        raise ValueError("La celerite du milieu sain doit etre finie et positive")
+        raise ValueError(
+            "The background sound speed must be finite and strictly positive"
+        )
 
     error = reconstructed - ground_truth
     absolute_error = np.abs(error)
     reference_l1 = np.sum(np.abs(ground_truth))
     reference_l2 = np.linalg.norm(ground_truth.reshape(-1))
     if reference_l1 == 0.0 or reference_l2 == 0.0:
-        raise ValueError("La norme du ground truth est nulle")
+        raise ValueError("The ground-truth map has zero norm")
     anomaly_amplitude = np.abs(ground_truth - background_speed)
     tolerance = 1e-9 * max(1.0, abs(background_speed))
     anomaly_mask = anomaly_amplitude > tolerance

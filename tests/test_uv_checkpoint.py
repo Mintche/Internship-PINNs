@@ -174,7 +174,7 @@ class UVCheckpointTests(unittest.TestCase):
     def test_invalid_sound_speed_bounds_are_rejected(self):
         params_uv, layers_m = synthetic_parameters()
         with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaisesRegex(ValueError, "bornes"):
+            with self.assertRaisesRegex(ValueError, "bounds"):
                 save_uv_checkpoint(
                     Path(directory) / "invalid.npz",
                     params_uv,

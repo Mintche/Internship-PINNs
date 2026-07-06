@@ -11,7 +11,7 @@ Internship-PINNs/
 ├── pinn_waveguide_2d/            # PINN training and checkpoints
 │   ├── checkpoints/
 │   ├── data/
-│   └── pinn_waveguide_multi_mode.py
+│   └── pinn_waveguide_multi_modes.py
 ├── tools/
 │   ├── data_loader.py            # Load boundaries, fields, and matrices
 │   ├── uv_checkpoint.py          # Save and evaluate UV/M networks
@@ -46,10 +46,10 @@ the matrices.
 ## Multi-Mode Training
 
 Configure the defect, ratio, frequencies, and modes at the beginning of
-`pinn_waveguide_2d/pinn_waveguide_multi_mode.py`, then run:
+`pinn_waveguide_2d/pinn_waveguide_multi_modes.py`, then run:
 
 ```bash
-python3 pinn_waveguide_2d/pinn_waveguide_multi_mode.py
+python3 pinn_waveguide_2d/pinn_waveguide_multi_modes.py
 ```
 
 The script saves the networks in `pinn_waveguide_2d/checkpoints/`. Version 2 of
@@ -63,17 +63,17 @@ The manifest can be inspected with:
 
 ```bash
 python3 tools/uv_checkpoint.py inspect \
-  --checkpoint pinn_waveguide_2d/checkpoints/uv_barhalfup_ratio0p8_modes0_1_2_freqs600.npz
+  --checkpoint pinn_waveguide_2d/checkpoints/checkpoint_barhalf_ratio0p8_modes0_1_2_3_4_freqs600_1200.npz
 ```
 
 ## FEM–PINN Comparison
 
 ```bash
 python3 tools/compare_pinn_fem.py \
-  --checkpoint pinn_waveguide_2d/checkpoints/uv_barhalfup_ratio0p8_modes0_1_2_freqs600.npz \
-  --mass-matrix FEM/pinn_data/Mass_matrix_barhalfup.csv \
-  --stiffness-matrix FEM/pinn_data/Stiff_matrix_barhalfup.csv \
-  --fem-field FEM/pinn_data/fem_field_barhalfup_ratio0p8.csv
+  --checkpoint pinn_waveguide_2d/checkpoints/checkpoint_barhalf_ratio0p8_modes0_1_2_3_4_freqs600_1200.npz \
+  --mass-matrix FEM/pinn_data/Mass_matrix_barhalf.csv \
+  --stiffness-matrix FEM/pinn_data/Stiff_matrix_barhalf.csv \
+  --fem-field FEM/pinn_data/fem_field_barhalf_ratio0p8.csv
 ```
 
 The `--frequency` and `--mode` options can be used to filter the cases. If
@@ -118,7 +118,7 @@ from the checkpoint for `barhalf`.
 
 ```bash
 python3 tools/compare_sound_speed.py \
-  --checkpoint pinn_waveguide_2d/checkpoints/uv_barhalf_ratio0p8_modes0_1_2_freqs600.npz \
+  --checkpoint pinn_waveguide_2d/checkpoints/checkpoint_barhalf_ratio0p8_modes0_1_2_3_4_freqs600_1200.npz \
   --nx 201 --ny 121
 ```
 

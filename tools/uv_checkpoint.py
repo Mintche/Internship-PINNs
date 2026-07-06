@@ -51,11 +51,11 @@ class SoundSpeedModel:
         x_values = np.asarray(x_norm, dtype=np.float32)
         y_values = np.asarray(y_norm, dtype=np.float32)
         if x_values.shape != y_values.shape:
-            raise ValueError("x_norm et y_norm doivent avoir la meme forme")
+            raise ValueError("x_norm and y_norm must have the same shape")
         if not np.isfinite(x_values).all() or not np.isfinite(y_values).all():
-            raise ValueError("Les coordonnees normalisees contiennent NaN ou Inf")
+            raise ValueError("Normalized coordinates contain NaN or infinite values")
         if batch_size <= 0:
-            raise ValueError("batch_size doit etre strictement positif")
+            raise ValueError("batch_size must be strictly positive")
 
         original_shape = x_values.shape
         coordinates = np.column_stack((x_values.reshape(-1), y_values.reshape(-1)))
@@ -91,11 +91,11 @@ class SoundSpeedModel:
         x_values = np.asarray(x, dtype=np.float64)
         y_values = np.asarray(y, dtype=np.float64)
         if x_values.shape != y_values.shape:
-            raise ValueError("x et y doivent avoir la meme forme")
+            raise ValueError("x and y must have the same shape")
         if not np.isfinite(x_values).all() or not np.isfinite(y_values).all():
-            raise ValueError("Les coordonnees physiques contiennent NaN ou Inf")
+            raise ValueError("Physical coordinates contain NaN or infinite values")
         if not (length > 0.0 and height > 0.0):
-            raise ValueError("La geometrie du checkpoint doit avoir L > 0 et H > 0")
+            raise ValueError("Checkpoint geometry must satisfy L > 0 and H > 0")
 
         tolerance = 1e-7 * max(1.0, length, height)
         if (
@@ -105,7 +105,7 @@ class SoundSpeedModel:
             or (y_values > height + tolerance).any()
         ):
             raise ValueError(
-                "Les coordonnees physiques sortent du domaine du checkpoint "
+                "Physical coordinates lie outside the checkpoint domain "
                 f"[-{length}, {length}] x [0, {height}]"
             )
         return self.predict(
@@ -140,8 +140,8 @@ class UVCheckpoint:
         ]
         if len(matches) != 1:
             raise KeyError(
-                f"Cas (f={frequency}, mode={mode}) absent. "
-                f"Cas disponibles: {self.available_cases()}"
+                f"Case (f={frequency}, mode={mode}) is unavailable. "
+                f"Available cases: {self.available_cases()}"
             )
         return matches[0]
 
@@ -159,7 +159,7 @@ class UVCheckpoint:
         x_values = np.asarray(x_norm, dtype=np.float32)
         y_values = np.asarray(y_norm, dtype=np.float32)
         if x_values.shape != y_values.shape:
-            raise ValueError("x_norm et y_norm doivent avoir la meme forme")
+            raise ValueError("x_norm and y_norm must have the same shape")
         original_shape = x_values.shape
         x_values = x_values.reshape(-1)
         y_values = y_values.reshape(-1)
@@ -199,11 +199,11 @@ class UVCheckpoint:
         x_values = np.asarray(x, dtype=np.float64)
         y_values = np.asarray(y, dtype=np.float64)
         if x_values.shape != y_values.shape:
-            raise ValueError("x et y doivent avoir la meme forme")
+            raise ValueError("x and y must have the same shape")
         if not np.isfinite(x_values).all() or not np.isfinite(y_values).all():
-            raise ValueError("Les coordonnees physiques contiennent NaN ou Inf")
+            raise ValueError("Physical coordinates contain NaN or infinite values")
         if not (self.length > 0.0 and self.height > 0.0):
-            raise ValueError("La geometrie du checkpoint doit avoir L > 0 et H > 0")
+            raise ValueError("Checkpoint geometry must satisfy L > 0 and H > 0")
 
         tolerance = 1e-7 * max(1.0, self.length, self.height)
         if (
@@ -213,7 +213,7 @@ class UVCheckpoint:
             or (y_values > self.height + tolerance).any()
         ):
             raise ValueError(
-                "Les coordonnees physiques sortent du domaine du checkpoint "
+                "Physical coordinates lie outside the checkpoint domain "
                 f"[-{self.length}, {self.length}] x [0, {self.height}]"
             )
 
@@ -237,8 +237,8 @@ class UVCheckpoint:
         """Evaluate the stored sound-speed network at physical coordinates."""
         if self.sound_speed is None:
             raise ValueError(
-                "Ce checkpoint ne contient pas de reseau de celerite; "
-                "un checkpoint de format v2 est requis"
+                "The checkpoint does not contain a sound-speed network; "
+                "a format-v2 checkpoint is required"
             )
         return self.sound_speed.predict_physical(
             x,
@@ -311,23 +311,23 @@ def collect_provenance(repository_root: Path | str | None = None) -> dict[str, A
 
 def _validate_layers(layers: Any, name: str) -> list[int]:
     if not isinstance(layers, (list, tuple)) or not layers:
-        raise ValueError(f"{name} doit contenir au moins une couche")
+        raise ValueError(f"{name} must contain at least one layer")
     architecture: list[int] = []
     previous_output: int | None = None
     for index, layer in enumerate(layers):
         if not isinstance(layer, Mapping) or "W" not in layer or "b" not in layer:
-            raise ValueError(f"{name}[{index}] doit contenir W et b")
+            raise ValueError(f"{name}[{index}] must contain W and b")
         weights = np.asarray(layer["W"])
         biases = np.asarray(layer["b"])
         if weights.ndim != 2 or biases.ndim != 1 or weights.shape[1] != biases.size:
             raise ValueError(
-                f"Forme invalide pour {name}[{index}]: "
+                f"Invalid shape for {name}[{index}]: "
                 f"W{weights.shape}, b{biases.shape}"
             )
         if previous_output is not None and weights.shape[0] != previous_output:
-            raise ValueError(f"Couches non raccordees dans {name} a l'indice {index}")
+            raise ValueError(f"Disconnected layers in {name} at index {index}")
         if not np.isfinite(weights).all() or not np.isfinite(biases).all():
-            raise ValueError(f"{name}[{index}] contient NaN ou Inf")
+            raise ValueError(f"{name}[{index}] contains NaN or infinite values")
         if index == 0:
             architecture.append(int(weights.shape[0]))
         architecture.append(int(weights.shape[1]))
@@ -339,7 +339,7 @@ def collect_u_norms(
     params_uv: Mapping[tuple[float, int], Any],
     mode_data: Mapping[int, Mapping[str, Any]],
 ) -> dict[tuple[float, int], float]:
-    """Extract the normalization used by pinn_waveguide_multi_mode.py."""
+    """Extract the normalization used by pinn_waveguide_multi_modes.py."""
     norms: dict[tuple[float, int], float] = {}
     for frequency, mode in params_uv:
         frequency = float(frequency)
@@ -347,13 +347,13 @@ def collect_u_norms(
         try:
             candidates = mode_data[mode]["U_norm"]
         except KeyError as error:
-            raise KeyError(f"U_norm absent pour le mode={mode}") from error
+            raise KeyError(f"U_norm is missing for mode={mode}") from error
         matches = [
             float(value) for stored_frequency, value in candidates.items()
             if np.isclose(float(stored_frequency), frequency)
         ]
         if len(matches) != 1:
-            raise KeyError(f"U_norm absent ou ambigu pour f={frequency}, mode={mode}")
+            raise KeyError(f"U_norm is missing or ambiguous for f={frequency}, mode={mode}")
         norms[(frequency, mode)] = matches[0]
     return norms
 
@@ -378,13 +378,13 @@ def save_uv_checkpoint(
 ) -> Path:
     """Save UV/M weights, inference configuration and provenance in NPZ format."""
     if not params_uv:
-        raise ValueError("params_uv est vide")
+        raise ValueError("params_uv is empty")
     if not (length > 0.0 and height > 0.0 and c0 > 0.0):
-        raise ValueError("length, height et c0 doivent etre strictement positifs")
+        raise ValueError("length, height, and c0 must be strictly positive")
     if not (0.0 < c_min <= c_max):
-        raise ValueError("Les bornes doivent verifier 0 < c_min <= c_max")
+        raise ValueError("Sound-speed bounds must satisfy 0 < c_min <= c_max")
     if not isinstance(random_seed, (int, np.integer)) or int(random_seed) < 0:
-        raise ValueError("random_seed doit etre un entier positif ou nul")
+        raise ValueError("random_seed must be a non-negative integer")
 
     metadata_dict = dict(metadata or {})
     missing_metadata = [
@@ -392,12 +392,12 @@ def save_uv_checkpoint(
         if name not in metadata_dict
     ]
     if missing_metadata:
-        raise ValueError(f"Metadonnees obligatoires absentes: {missing_metadata}")
+        raise ValueError(f"Missing required metadata: {missing_metadata}")
     if not str(metadata_dict["defect_name"]).strip():
-        raise ValueError("defect_name ne peut pas etre vide")
+        raise ValueError("defect_name cannot be empty")
     contrast_ratio = float(metadata_dict["contrast_ratio"])
     if not np.isfinite(contrast_ratio) or contrast_ratio <= 0.0:
-        raise ValueError("contrast_ratio doit etre strictement positif")
+        raise ValueError("contrast_ratio must be strictly positive")
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -407,7 +407,7 @@ def save_uv_checkpoint(
         or b_base_array.shape[1] != 2
         or not np.isfinite(b_base_array).all()
     ):
-        raise ValueError("b_base doit avoir la forme (n_fourier_features, 2)")
+        raise ValueError("b_base must have shape (n_fourier_features, 2)")
     arrays: dict[str, np.ndarray] = {"b_base": b_base_array}
     manifest_cases = []
     uv_architecture: list[int] | None = None
@@ -422,19 +422,19 @@ def save_uv_checkpoint(
             if int(norm_mode) == mode and np.isclose(float(norm_frequency), frequency)
         ]
         if len(norm_matches) != 1:
-            raise KeyError(f"U_norm absent ou ambigu pour f={frequency}, mode={mode}")
+            raise KeyError(f"U_norm is missing or ambiguous for f={frequency}, mode={mode}")
 
         prefix = f"case_{case_index}"
         sigma = np.asarray(parameters["sigma"])
         if sigma.shape != (2,) or not np.isfinite(sigma).all():
-            raise ValueError(f"sigma invalide pour f={frequency}, mode={mode}")
+            raise ValueError(f"Invalid sigma for f={frequency}, mode={mode}")
         arrays[f"{prefix}_sigma"] = sigma
         layers = parameters["layers"]
         case_architecture = _validate_layers(layers, f"layers_uv[{frequency}, {mode}]")
         if uv_architecture is None:
             uv_architecture = case_architecture
         elif case_architecture != uv_architecture:
-            raise ValueError("Tous les reseaux UV doivent partager la meme architecture")
+            raise ValueError("All UV networks must share the same architecture")
         for layer_index, layer in enumerate(layers):
             arrays[f"{prefix}_layer_{layer_index}_W"] = np.asarray(layer["W"])
             arrays[f"{prefix}_layer_{layer_index}_b"] = np.asarray(layer["b"])
@@ -448,16 +448,16 @@ def save_uv_checkpoint(
 
     m_architecture = _validate_layers(layers_m, "layers_m")
     if m_architecture[0] != 2 or m_architecture[-1] != 1:
-        raise ValueError("layers_m doit avoir deux entrees et une sortie")
+        raise ValueError("layers_m must have two inputs and one output")
     for layer_index, layer in enumerate(layers_m):
         arrays[f"m_layer_{layer_index}_W"] = np.asarray(layer["W"])
         arrays[f"m_layer_{layer_index}_b"] = np.asarray(layer["b"])
 
     config = _json_compatible(dict(network_config))
     if config.get("uv_layers") != uv_architecture:
-        raise ValueError("network_config.uv_layers ne correspond pas aux poids UV")
+        raise ValueError("network_config.uv_layers does not match the UV weights")
     if config.get("m_layers") != m_architecture:
-        raise ValueError("network_config.m_layers ne correspond pas aux poids M")
+        raise ValueError("network_config.m_layers does not match the M weights")
 
     manifest = {
         "format": "uv_checkpoint_npz",
@@ -507,12 +507,12 @@ def load_uv_checkpoint(path: Path | str) -> UVCheckpoint:
     with np.load(path, allow_pickle=False) as archive:
         manifest = json.loads(str(archive["manifest_json"].item()))
         if manifest.get("format") != "uv_checkpoint_npz":
-            raise ValueError(f"Format de checkpoint inconnu dans {path}")
+            raise ValueError(f"Unknown checkpoint format in {path}")
         format_version = int(manifest.get("format_version", -1))
         if format_version not in SUPPORTED_FORMAT_VERSIONS:
             raise ValueError(
-                f"Version {manifest.get('format_version')} non supportee; "
-                f"versions acceptees: {sorted(SUPPORTED_FORMAT_VERSIONS)}"
+                f"Unsupported checkpoint version {manifest.get('format_version')}; "
+                f"supported versions: {sorted(SUPPORTED_FORMAT_VERSIONS)}"
             )
 
         cases: dict[tuple[float, int], UVCase] = {}
@@ -550,7 +550,7 @@ def load_uv_checkpoint(path: Path | str) -> UVCheckpoint:
             c_min = float(description["c_min"])
             c_max = float(description["c_max"])
             if not (0.0 < c_min <= c_max):
-                raise ValueError("Bornes de celerite invalides dans le checkpoint")
+                raise ValueError("Invalid sound-speed bounds in the checkpoint")
             sound_speed = SoundSpeedModel(
                 layers=layers_m,
                 c_min=c_min,
@@ -584,7 +584,7 @@ def load_evaluation_grid(path: Path | str) -> dict[str, np.ndarray]:
     names = {name.lower(): name for name in (data.dtype.names or ())}
     required = ("grid_i", "x", "y", "x_norm", "y_norm")
     if any(name not in names for name in required):
-        raise ValueError(f"{path}: colonnes requises {required}")
+        raise ValueError(f"{path}: required columns are {required}")
     order = np.argsort(np.asarray(data[names["grid_i"]], dtype=int))
     return {
         name: np.asarray(data[names[name]], dtype=int if name == "grid_i" else float)[order]
@@ -629,13 +629,15 @@ def export_predictions_csv(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Charge et evalue les checkpoints UV du PINN.")
+    parser = argparse.ArgumentParser(description="Load and evaluate PINN UV checkpoints.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    inspect_parser = subparsers.add_parser("inspect", help="Afficher le contenu d'un checkpoint")
+    inspect_parser = subparsers.add_parser("inspect", help="Display checkpoint contents")
     inspect_parser.add_argument("--checkpoint", required=True, type=Path)
 
-    export_parser = subparsers.add_parser("export", help="Evaluer le PINN sur la grille FEM fixe")
+    export_parser = subparsers.add_parser(
+        "export", help="Evaluate the PINN on the fixed FEM grid"
+    )
     export_parser.add_argument("--checkpoint", required=True, type=Path)
     export_parser.add_argument("--grid-map", required=True, type=Path)
     export_parser.add_argument("--output", required=True, type=Path)
@@ -643,7 +645,7 @@ def parse_args() -> argparse.Namespace:
     export_parser.add_argument("--mode", type=int)
     export_parser.add_argument(
         "--normalized-output", action="store_true",
-        help="Ne pas multiplier les sorties par U_norm",
+        help="Do not multiply outputs by U_norm",
     )
     return parser.parse_args()
 
@@ -680,13 +682,13 @@ def main() -> None:
     if args.mode is not None:
         selected_cases = [case for case in selected_cases if case[1] == args.mode]
     if not selected_cases:
-        raise ValueError("Aucun cas du checkpoint ne correspond aux filtres demandes")
+        raise ValueError("No checkpoint case matches the requested filters")
     grid = load_evaluation_grid(args.grid_map)
     export_predictions_csv(
         args.output, checkpoint, grid, selected_cases,
         physical_units=not args.normalized_output,
     )
-    print(f"Predictions de {selected_cases} exportees dans {args.output}")
+    print(f"Predictions for {selected_cases} exported to {args.output}")
 
 
 if __name__ == "__main__":
