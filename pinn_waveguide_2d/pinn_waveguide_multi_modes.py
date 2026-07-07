@@ -40,7 +40,7 @@ m_max = 1 / cmin**2
 # Data files follow the naming convention:
 #   pinn_boundary_{left/right}_{defect_name}_ratio{c_defect/c0}.csv
 script_dir = os.path.dirname(os.path.abspath(__file__))
-defect_name = '2circ'
+defect_name = 'circlebottomright'
 contrast_ratio = 0.8
 data_ratio_label = format_ratio_label(contrast_ratio)
 

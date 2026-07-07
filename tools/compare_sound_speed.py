@@ -46,6 +46,9 @@ def ground_truth_sound_speed(
         & (y >= 0.0)
         & (y <= 0.3)
     )
+    circlebottomright = (
+        (x-0.2)**2 + (y-0.2)**2 <= 0.1**2
+    )
     sound_speed[barhalf] = checkpoint.c0 * contrast_ratio
 
     # Example for an additional defect with an independent speed:
