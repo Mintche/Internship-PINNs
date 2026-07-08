@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Display a PINN sound-speed map, its ground truth and their misfit."""
+"""Display a scattered PINN sound-speed map, ground truth and misfit."""
 
 from __future__ import annotations
 
@@ -16,47 +16,27 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from tools.uv_checkpoint import UVCheckpoint, load_uv_checkpoint  # noqa: E402
+from tools.us_checkpoint import USCheckpoint, load_us_checkpoint  # noqa: E402
 
 
 # ==============================================================================
 # USER-EDITABLE GROUND TRUTH
 # ==============================================================================
-# Keep this label synchronized with the map implemented by
-# ground_truth_sound_speed. Set it to None to disable the metadata safeguard.
-GROUND_TRUTH_NAME: str | None = "circlebottomleft"
+# Keep this synchronized with ground_truth_sound_speed. Set it to None to disable
+# the metadata safeguard while experimenting with new defects.
+GROUND_TRUTH_NAME: str | None = None
 
 
 def ground_truth_sound_speed(
     x: np.ndarray,
     y: np.ndarray,
-    checkpoint: UVCheckpoint,
+    checkpoint: USCheckpoint,
 ) -> np.ndarray:
-    """Return the user-defined sound-speed map at physical coordinates.
-
-    The default is the current ``barhalf`` geometry. Assigning different values
-    on additional masks is enough to describe several defects with independent
-    sound speeds.
-    """
+    """Return the user-defined sound-speed map at physical coordinates."""
     contrast_ratio = float(checkpoint.metadata["contrast_ratio"])
     sound_speed = np.full(x.shape, checkpoint.c0, dtype=np.float64)
-    barhalf = (
-        (x >= -0.2)
-        & (x <= 0.2)
-        & (y >= 0.0)
-        & (y <= 0.3)
-    )
-    circlebottomright = (
-        (x-0.2)**2 + (y-0.2)**2 <= 0.1**2
-    )
-    circlebottomleft = (
-        (x+0.2)**2 + (y-0.2)**2 <= 0.1**2
-    )
+    circlebottomleft = (x + 0.2) ** 2 + (y - 0.2) ** 2 <= 0.1**2
     sound_speed[circlebottomleft] = checkpoint.c0 * contrast_ratio
-
-    # Example for an additional defect with an independent speed:
-    # second_defect = (x - 0.5) ** 2 + (y - 0.3) ** 2 <= 0.1 ** 2
-    # sound_speed[second_defect] = 300.0
     return sound_speed
 
 
@@ -84,8 +64,8 @@ def _grid_size(value: str) -> int:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Display the reconstructed sound speed, compare it with a "
-            "user-defined ground truth, and display the absolute error."
+            "Display the reconstructed scattered-checkpoint sound speed, compare "
+            "it with a user-defined ground truth, and display the absolute error."
         )
     )
     parser.add_argument("--checkpoint", required=True, type=Path)
@@ -95,7 +75,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_grid(
-    checkpoint: UVCheckpoint,
+    checkpoint: USCheckpoint,
     nx: int,
     ny: int,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -105,7 +85,7 @@ def build_grid(
 
 
 def build_ground_truth(
-    checkpoint: UVCheckpoint,
+    checkpoint: USCheckpoint,
     x_grid: np.ndarray,
     y_grid: np.ndarray,
 ) -> np.ndarray:
@@ -143,17 +123,11 @@ def compute_misfit(
     reconstructed = np.asarray(reconstructed, dtype=np.float64)
     ground_truth = np.asarray(ground_truth, dtype=np.float64)
     if reconstructed.shape != ground_truth.shape:
-        raise ValueError(
-            "The reconstructed and ground-truth maps have different shapes"
-        )
+        raise ValueError("The reconstructed and ground-truth maps have different shapes")
     if not np.isfinite(reconstructed).all() or not np.isfinite(ground_truth).all():
-        raise ValueError(
-            "The reconstructed or ground-truth map contains NaN or infinite values"
-        )
+        raise ValueError("The reconstructed or ground-truth map contains NaN or infinite values")
     if not np.isfinite(background_speed) or background_speed <= 0.0:
-        raise ValueError(
-            "The background sound speed must be finite and strictly positive"
-        )
+        raise ValueError("The background sound speed must be finite and strictly positive")
 
     error = reconstructed - ground_truth
     absolute_error = np.abs(error)
@@ -161,6 +135,7 @@ def compute_misfit(
     reference_l2 = np.linalg.norm(ground_truth.reshape(-1))
     if reference_l1 == 0.0 or reference_l2 == 0.0:
         raise ValueError("The ground-truth map has zero norm")
+
     anomaly_amplitude = np.abs(ground_truth - background_speed)
     tolerance = 1e-9 * max(1.0, abs(background_speed))
     anomaly_mask = anomaly_amplitude > tolerance
@@ -229,13 +204,7 @@ def create_comparison_figure(
 ) -> plt.Figure:
     speed_min = float(min(np.min(reconstructed), np.min(ground_truth)))
     speed_max = float(max(np.max(reconstructed), np.max(ground_truth)))
-    figure, axes = plt.subplots(
-        1,
-        2,
-        figsize=(13.0, 3.8),
-        sharex=True,
-        sharey=True,
-    )
+    figure, axes = plt.subplots(1, 2, figsize=(13.0, 3.8), sharex=True, sharey=True)
     for axis, values, title in (
         (axes[0], ground_truth, "Ground-truth sound speed"),
         (axes[1], reconstructed, "Reconstructed sound speed"),
@@ -307,10 +276,7 @@ def print_metrics(metrics: SoundSpeedMisfit) -> None:
         print("Anomaly-relative metrics: n/a (homogeneous ground truth)")
     if metrics.background_mean_absolute is not None:
         print(f"Background MAE: {metrics.background_mean_absolute:.8e} m/s")
-    print(
-        "Homogeneous c0 baseline MAE: "
-        f"{metrics.homogeneous_mean_absolute:.8e} m/s"
-    )
+    print(f"Homogeneous c0 baseline MAE: {metrics.homogeneous_mean_absolute:.8e} m/s")
     print(f"Global mean absolute error: {metrics.mean_absolute:.8e} m/s")
     print(
         f"Global relative discrete L1: {metrics.relative_l1:.8e} "
@@ -326,11 +292,7 @@ def print_metrics(metrics: SoundSpeedMisfit) -> None:
 
 def main() -> None:
     args = parse_args()
-    checkpoint = load_uv_checkpoint(args.checkpoint)
-    if checkpoint.sound_speed is None:
-        raise ValueError(
-            "The checkpoint does not contain layers_m; a format-v2 checkpoint is required"
-        )
+    checkpoint = load_us_checkpoint(args.checkpoint)
 
     x_grid, y_grid = build_grid(checkpoint, args.nx, args.ny)
     reconstructed = checkpoint.predict_sound_speed_physical(x_grid, y_grid)

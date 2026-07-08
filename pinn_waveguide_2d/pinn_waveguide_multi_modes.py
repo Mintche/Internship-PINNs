@@ -25,7 +25,7 @@ from tools.uv_checkpoint import collect_u_norms, save_uv_checkpoint
 
 # --- Domain Geometry ---
 H = 0.6  # Height of the waveguide
-L = 1.0  # Half-length of the waveguide
+L = 2.0  # Half-length of the waveguide
 
 # --- Physics Parameters ---
 c0 = 340.0
@@ -40,7 +40,7 @@ m_max = 1 / cmin**2
 # Data files follow the naming convention:
 #   pinn_boundary_{left/right}_{defect_name}_ratio{c_defect/c0}.csv
 script_dir = os.path.dirname(os.path.abspath(__file__))
-defect_name = 'circlebottomright'
+defect_name = 'circlebottomleftlarge'
 contrast_ratio = 0.8
 data_ratio_label = format_ratio_label(contrast_ratio)
 
@@ -61,9 +61,6 @@ m_fourier_features = 64  # Dimensionality of Fourier feature mapping
 n_input = 2
 n_layers_uv = [2 * m_fourier_features, 128, 128, 64, 2]
 n_layers_m = [n_input, 128, 64, 1]
-
-# --- Gauss-Legendre Quadrature ---
-n_gauss_legendre = 40
 
 # --- Optimizer Learning Rates ---
 lr_uv = 1e-3
@@ -114,14 +111,15 @@ def boundary_data_paths(script_dir, defect_name, contrast_ratio):
 key, subkey = jax.random.split(key)
 B_base = jax.random.normal(subkey, (m_fourier_features, 2))
 
-# --- Gauss-Legendre Quadrature Setup ---
-y_gauss_legendre, w_gauss_legendre = np.polynomial.legendre.leggauss(n_gauss_legendre)
-y_quad = (y_gauss_legendre + 1.0) * H / 2.0
-w_quad = w_gauss_legendre * H / 2.0
-
 # Calculate dynamic boundary modes configuration using max training frequency
 fmax = float(max(training_frequencies))
 N_modes = int(np.round(2 * H * fmax / c0)) + 5
+
+# --- Gauss-Legendre Quadrature Setup ---
+n_gauss_legendre = 3*N_modes
+y_gauss_legendre, w_gauss_legendre = np.polynomial.legendre.leggauss(n_gauss_legendre)
+y_quad = (y_gauss_legendre + 1.0) * H / 2.0
+w_quad = w_gauss_legendre * H / 2.0
 
 n_modes = jnp.arange(N_modes, dtype=jnp.float32)
 a_n = jnp.sqrt(2.0 / H) * jnp.ones(N_modes, dtype=jnp.float32)
@@ -1018,12 +1016,12 @@ def main():
     # Initial Sound Speed Plot
     # ==================================================================
     print("Plotting initial sound speed profile...")
-    x_plot = np.linspace(-1, 1, 100)
-    y_plot = np.linspace(0, 0.6, 50)
+    x_plot = np.linspace(-L, L, 100)
+    y_plot = np.linspace(0, H, 50)
     c_grid = jax.vmap(
         jax.vmap(lambda x, y: c(x, y, layers_m), in_axes=(0, None)),
         in_axes=(None, 0)
-    )(x_plot, 2 * y_plot / H - 1)
+    )(x_plot / L, 2 * y_plot / H - 1)
 
     os.makedirs(os.path.join(script_dir, 'fig'), exist_ok=True)
     plt.figure(figsize=(7, 3.5))
@@ -1174,9 +1172,9 @@ def main():
         def c_final(x, y, _lm=layers_m_each):
             return c(x, y, _lm)
 
-        x_c = np.linspace(-1, 1, 100)
-        y_c = np.linspace(0, 0.6, 50)
-        c_grid_final = jax.vmap(jax.vmap(c_final, in_axes=(0, None)), in_axes=(None, 0))(x_c, 2 * y_c / H - 1)
+        x_c = np.linspace(-L, L, 100)
+        y_c = np.linspace(0, H, 50)
+        c_grid_final = jax.vmap(jax.vmap(c_final, in_axes=(0, None)), in_axes=(None, 0))(x_c / L, 2 * y_c / H - 1)
 
         plt.figure(figsize=(7, 3.5))
         plt.pcolormesh(x_c, y_c, c_grid_final, rasterized=True)
