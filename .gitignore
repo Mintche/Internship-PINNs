@@ -8,6 +8,12 @@ __pycache__/
 *.pyd
 .pytest_cache/
 
+#Notebooks
+
+/notebooks
+
 #Temp files
 /pinn_waveguide_2d/predictions/
 /pinn_waveguide_2d/data/
+
+/pinn_waveguide_2d/cache/

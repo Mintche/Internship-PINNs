@@ -40,6 +40,7 @@ ms_max = 1 / cmin**2 - m0
 # Data files follow the naming convention:
 #   pinn_boundary_{left/right}_{defect_name}_ratio{c_defect/c0}.csv
 script_dir = os.path.dirname(os.path.abspath(__file__))
+data_dir = os.path.join(REPOSITORY_ROOT, "FEM")
 defect_name = "barhalf"
 contrast_ratio = 0.8
 data_ratio_label = format_ratio_label(contrast_ratio)
@@ -47,12 +48,14 @@ data_ratio_label = format_ratio_label(contrast_ratio)
 # Each package is trained as one packed selection of frequencies and modes.
 # Example: [{600.0: [0, 1], 1200.0: [0, 1, 2]}]
 training_packages = [
-    {600.0: [0, 1, 2]},
-    {600.0: [0, 2], 1200.0: [0, 4]}
+    {400.0: [0, 1]},
+    {400.0: [0, 1], 600.0: [1, 2]},
+    {400.0: [0, 1], 1000.0: [0, 3]},
+    {400.0: [0, 1], 1600.0: [0, 5]}
 ]
 
 # Fractions of the Adam phase-2 budget where the slowness output is plotted.
-m_snapshot = [0.3, 0.5]
+m_snapshot = [0.3, 0.5, 0.8]
 
 # --- Random Seed ---
 random_seed = 0
@@ -78,24 +81,26 @@ eval_interval = 200
 switch_threshold = 0.0
 switch_window = 10
 
+max_steps_adam_warmup = 30001
 max_steps_adam_inverse = 100001
-max_steps_lbfgs_inverse = 3001
+max_steps_lbfgs_inverse = 201
 
 SHOW_PLOTS = True
 
 # Loss weights are ordered as (PDE, BC, data). Physics is active immediately
 # and the data weight is ramped up, as in the full-field multimode inverse step.
-weights_inverse_final = jnp.array([1.0, 1.0, 10.0])
+weights_warmup = jnp.array([10.0, 1.0])
+weights_inverse_final = jnp.array([1.0, 3.0, 10.0])
 
 # ==============================================================================
 # SECTION 2: DATA DISCOVERY
 # ==============================================================================
 
-def boundary_data_paths(script_dir, defect_name, contrast_ratio):
+def boundary_data_paths(data_dir, defect_name, contrast_ratio):
     ratio_label = format_ratio_label(contrast_ratio)
     suffix = f"{defect_name}_{ratio_label}.csv"
-    left_path = os.path.join(script_dir, "data", f"pinn_boundary_left_{suffix}")
-    right_path = os.path.join(script_dir, "data", f"pinn_boundary_right_{suffix}")
+    left_path = os.path.join(data_dir, "pinn_data", f"pinn_boundary_left_{suffix}")
+    right_path = os.path.join(data_dir, "pinn_data", f"pinn_boundary_right_{suffix}")
     missing = [path for path in (left_path, right_path) if not os.path.isfile(path)]
     if missing:
         raise FileNotFoundError(
@@ -118,6 +123,17 @@ def flatten_packages(packages):
     for package in packages:
         cases.extend(flatten_package(package))
     return cases
+
+
+def select_warmup_cases(package_index, cases, previously_trained_cases):
+    """Warm up only new cases from packages after the first one."""
+    if package_index == 0:
+        return []
+    return [
+        (float(frequency), int(mode_index))
+        for frequency, mode_index in cases
+        if (float(frequency), int(mode_index)) not in previously_trained_cases
+    ]
 
 
 def frequency_label(frequency):
@@ -170,8 +186,8 @@ def beta_for_frequency(frequency):
     return jnp.sqrt(k0**2 - (n_modes * jnp.pi / H) ** 2 + 0j)
 
 
-def create_incident_wave_mode(x, y, frequency, mode_index, u_norm_val):
-    """Evaluate the normalized incident mode u0 as [real, imag]."""
+def incident_wave_complex(x, y, frequency, mode_index):
+    """Evaluate the physical incident mode u0 at normalized coordinates."""
     mode_index = jnp.asarray(mode_index, dtype=jnp.int32)
     beta_n = beta_for_frequency(frequency)
     beta_mode = jnp.take(beta_n, mode_index)
@@ -179,7 +195,12 @@ def create_incident_wave_mode(x, y, frequency, mode_index, u_norm_val):
     x_phys = x * L
     y_phys = (y + 1.0) * H / 2.0
     mode_shape = jnp.take(a_n, mode_index) * jnp.cos(mode_float * jnp.pi * y_phys / H)
-    value = mode_shape * jnp.exp(1j * beta_mode * x_phys) / u_norm_val
+    return mode_shape * jnp.exp(1j * beta_mode * x_phys)
+
+
+def create_incident_wave_mode(x, y, frequency, mode_index, us_norm_val):
+    """Evaluate the incident mode u0 scaled by the scattered-field norm."""
+    value = incident_wave_complex(x, y, frequency, mode_index) / us_norm_val
     return jnp.stack([jnp.real(value), jnp.imag(value)])
 
 # ==============================================================================
@@ -295,23 +316,15 @@ def us_apply(params_us, x, y):
     return forward_func(params_us["layers"], features)
 
 
-def boundary_data_loss_single(
-    params_us,
-    frequency,
-    mode_index,
-    target_left,
-    target_right,
-    y_bnd_left,
-    y_bnd_right,
-    u_norm_val,
+def scattered_data_loss_single(
+    params_us, target_left, target_right, y_bnd_left, y_bnd_right,
 ):
-    def total_field(x_val, y_val):
-        return us_apply(params_us, x_val, y_val) + create_incident_wave_mode(
-            x_val, y_val, frequency, mode_index, u_norm_val
-        )
-
-    left_prediction = jax.vmap(total_field, in_axes=(None, 0))(-1.0, y_bnd_left)
-    right_prediction = jax.vmap(total_field, in_axes=(None, 0))(1.0, y_bnd_right)
+    left_prediction = jax.vmap(us_apply, in_axes=(None, None, 0))(
+        params_us, -1.0, y_bnd_left
+    )
+    right_prediction = jax.vmap(us_apply, in_axes=(None, None, 0))(
+        params_us, 1.0, y_bnd_right
+    )
     return (
         jnp.mean((left_prediction - target_left) ** 2)
         + jnp.mean((right_prediction - target_right) ** 2)
@@ -319,20 +332,9 @@ def boundary_data_loss_single(
 
 
 def scattered_loss_single(
-    params_us,
-    layers_ms,
-    x_pde,
-    y_pde,
-    x_neumann,
-    y_dtn,
-    frequency,
-    mode_index,
-    target_left,
-    target_right,
-    y_bnd_left,
-    y_bnd_right,
-    u_norm_val,
-    weights,
+    params_us, layers_ms, x_pde, y_pde, x_neumann,
+    y_dtn, frequency, mode_index, target_left, target_right,
+    y_bnd_left, y_bnd_right, u_norm_val, weights,
 ):
     def us(x, y):
         return us_apply(params_us, x, y)
@@ -352,9 +354,8 @@ def scattered_loss_single(
     def pde_residual(x, y):
         us_xx = jax.jacfwd(jax.jacfwd(us, argnums=0), argnums=0)(x, y) / L**2
         us_yy = jax.jacfwd(jax.jacfwd(us, argnums=1), argnums=1)(x, y) * (2.0 / H) ** 2
-        ms_value = ms(x, y)
         omega = 2.0 * jnp.pi * frequency
-        return us_xx + us_yy + omega**2 * ((m0 + ms_value) * us(x, y) + ms_value * u0(x, y))
+        return (us_xx + us_yy + omega**2 * ((m0 + ms(x, y)) * us(x, y) + ms(x, y) * u0(x, y)))
 
     def compute_dtn_loss(x_bnd, y_eval, sign):
         us_quad = jax.vmap(us, in_axes=(None, 0))(x_bnd, y_gauss_legendre)
@@ -384,15 +385,8 @@ def scattered_loss_single(
     )
     bc_loss = neumann_loss + dtn_loss_left + dtn_loss_right
 
-    data_loss = boundary_data_loss_single(
-        params_us,
-        frequency,
-        mode_index,
-        target_left,
-        target_right,
-        y_bnd_left,
-        y_bnd_right,
-        u_norm_val,
+    data_loss = scattered_data_loss_single(
+        params_us, target_left, target_right, y_bnd_left, y_bnd_right,
     )
 
     total_loss = weights[0] * pde_loss + weights[1] * bc_loss + weights[2] * data_loss
@@ -400,133 +394,90 @@ def scattered_loss_single(
 
 
 def package_scattered_loss_fn(
-    params_us_stacked,
-    layers_ms,
-    x_pde,
-    y_pde,
-    x_neumann,
-    y_dtn,
-    frequencies,
-    mode_indices,
-    targets_left,
-    targets_right,
-    y_bnds_left,
-    y_bnds_right,
-    u_norms,
-    weights,
+    params_us_stacked, layers_ms, x_pde, y_pde, x_neumann,
+    y_dtn, frequencies, mode_indices, targets_left, targets_right,
+    y_bnds_left, y_bnds_right, u_norms, weights,
 ):
     """Evaluate the mean weighted scattered-field loss for one package."""
     def _loss_single(p_us, frequency, mode_index, target_left, target_right, y_left, y_right, u_norm_val):
         return scattered_loss_single(
-            p_us,
-            layers_ms,
-            x_pde,
-            y_pde,
-            x_neumann,
-            y_dtn,
-            frequency,
-            mode_index,
-            target_left,
-            target_right,
-            y_left,
-            y_right,
-            u_norm_val,
-            weights,
+            p_us, layers_ms, x_pde, y_pde, x_neumann, y_dtn,
+            frequency, mode_index, target_left, target_right,
+            y_left, y_right, u_norm_val, weights,
         )
 
     losses, (pdes, bcs, datas) = jax.vmap(
         _loss_single, in_axes=(0, 0, 0, 0, 0, 0, 0, 0)
     )(
-        params_us_stacked,
-        frequencies,
-        mode_indices,
-        targets_left,
-        targets_right,
-        y_bnds_left,
-        y_bnds_right,
-        u_norms,
+        params_us_stacked, frequencies, mode_indices, targets_left,
+        targets_right, y_bnds_left, y_bnds_right, u_norms,
     )
     return jnp.mean(losses), (jnp.mean(pdes), jnp.mean(bcs), jnp.mean(datas), datas)
 
 
 @jax.jit
 def evaluate_inverse_loss(
-    params_us_stacked,
-    layers_ms,
-    x_pde,
-    y_pde,
-    x_neumann,
-    y_dtn,
-    frequencies,
-    mode_indices,
-    targets_left,
-    targets_right,
-    y_bnds_left,
-    y_bnds_right,
-    u_norms,
-    weights,
+    params_us_stacked, layers_ms, x_pde, y_pde, x_neumann,
+    y_dtn, frequencies, mode_indices, targets_left, targets_right,
+    y_bnds_left, y_bnds_right, u_norms, weights,
 ):
     return package_scattered_loss_fn(
-        params_us_stacked,
-        layers_ms,
-        x_pde,
-        y_pde,
-        x_neumann,
-        y_dtn,
-        frequencies,
-        mode_indices,
-        targets_left,
-        targets_right,
-        y_bnds_left,
-        y_bnds_right,
-        u_norms,
-        weights,
+        params_us_stacked, layers_ms, x_pde, y_pde, x_neumann,
+        y_dtn, frequencies, mode_indices, targets_left, targets_right,
+        y_bnds_left, y_bnds_right, u_norms, weights,
     )
 
 # ==============================================================================
 # SECTION 8: OPTIMIZATION SCHEMES & TRAIN STEPS (JIT COMPILED)
 # ==============================================================================
 
+def make_train_step_warmup(adam_opt_us):
+    """Update packed us networks against a frozen ms network."""
+
+    @functools.partial(jax.jit, static_argnames=("N",))
+    def train_step_warmup(
+        params_us_stacked, layers_ms, opt_state_us, key,
+        frequencies, mode_indices, targets_left, targets_right,
+        y_bnds_left, y_bnds_right, u_norms, current_weights, N,
+    ):
+        x_pde, y_pde, x_neumann, y_dtn = sample_collocation_points(key, N)
+
+        def loss_all_cases(p_us_stacked):
+            return package_scattered_loss_fn(
+                p_us_stacked, layers_ms, x_pde, y_pde, x_neumann, y_dtn,
+                frequencies, mode_indices, targets_left, targets_right,
+                y_bnds_left, y_bnds_right, u_norms, current_weights,
+            )
+
+        (loss, aux), grads_us = jax.value_and_grad(
+            loss_all_cases, has_aux=True
+        )(params_us_stacked)
+        updates_us, opt_state_us = adam_opt_us.update(
+            grads_us, opt_state_us, params_us_stacked
+        )
+        params_us_stacked = optax.apply_updates(params_us_stacked, updates_us)
+        return params_us_stacked, opt_state_us, loss, aux
+
+    return train_step_warmup
+
+
 def make_train_step_inverse_package(adam_opt_us, adam_opt_ms, lbfgs_opt_packed):
     """Update packed us networks and the shared ms network jointly."""
 
     @functools.partial(jax.jit, static_argnames=("N", "use_lbfgs"))
     def train_step_inverse(
-        params_us_stacked,
-        layers_ms,
-        opt_state_us,
-        opt_state_ms,
-        opt_state_lbfgs,
-        key,
-        frequencies,
-        mode_indices,
-        targets_left,
-        targets_right,
-        y_bnds_left,
-        y_bnds_right,
-        u_norms,
-        current_weights,
-        N,
-        use_lbfgs=False,
+        params_us_stacked, layers_ms, opt_state_us, opt_state_ms,
+        opt_state_lbfgs, key, frequencies, mode_indices,
+        targets_left, targets_right, y_bnds_left, y_bnds_right,
+        u_norms, current_weights, N, use_lbfgs=False,
     ):
         x_pde, y_pde, x_neumann, y_dtn = sample_collocation_points(key, N)
 
         def loss_all_cases(p_us_stacked, l_ms):
             return package_scattered_loss_fn(
-                p_us_stacked,
-                l_ms,
-                x_pde,
-                y_pde,
-                x_neumann,
-                y_dtn,
-                frequencies,
-                mode_indices,
-                targets_left,
-                targets_right,
-                y_bnds_left,
-                y_bnds_right,
-                u_norms,
-                current_weights,
+                p_us_stacked, l_ms, x_pde, y_pde, x_neumann, y_dtn,
+                frequencies, mode_indices, targets_left, targets_right,
+                y_bnds_left, y_bnds_right, u_norms, current_weights,
             )
 
         (loss, aux), (grads_us, grads_ms) = jax.value_and_grad(
@@ -562,13 +513,8 @@ def make_train_step_inverse_package(adam_opt_us, adam_opt_ms, lbfgs_opt_packed):
             layers_ms = optax.apply_updates(layers_ms, updates_ms)
 
         return (
-            params_us_stacked,
-            layers_ms,
-            opt_state_us,
-            opt_state_ms,
-            opt_state_lbfgs,
-            loss,
-            aux,
+            params_us_stacked, layers_ms, opt_state_us, opt_state_ms,
+            opt_state_lbfgs, loss, aux,
         )
 
     return train_step_inverse
@@ -644,24 +590,15 @@ def format_sigma_scales(params_us_stacked, cases):
 
 
 def train(
-    params_us,
-    layers_ms,
-    N_adam,
-    N_lbfgs,
-    max_steps_adam_inverse,
-    max_steps_lbfgs_inverse,
-    packages,
-    mode_data,
-    eval_interval,
-    switch_threshold,
-    switch_window,
-    key,
+    params_us, layers_ms, N_adam, N_lbfgs, max_steps_adam_warmup,
+    max_steps_adam_inverse, max_steps_lbfgs_inverse, packages,
+    mode_data, eval_interval, switch_threshold, switch_window, key,
 ):
     validation_points = regular_collocation_points(N_validation)
-    cache_dir = Path(script_dir) / "cache"
+    cache_dir = Path(os.path.join(script_dir,"cache"))
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    best_validation_losses = {"inverse": []}
+    best_validation_losses = {"warmup": [], "inverse": []}
     loss_inverse_by_package = []
     best_params_each_ms = []
 
@@ -672,11 +609,51 @@ def train(
             lambda _: "sigma", template_param_us["sigma"]
         )
 
+    cosine_us_warmup = optax.schedules.cosine_decay_schedule(
+        init_value=lr_us, decay_steps=max(max_steps_adam_warmup, 1), alpha=0.1
+    )
+    cosine_sigma_warmup = optax.schedules.cosine_decay_schedule(
+        init_value=lr_sigma,
+        decay_steps=max(int(0.5 * max_steps_adam_warmup), 1),
+        alpha=0.001,
+    )
+    adam_us_warmup = optax.multi_transform(
+        transforms={
+            "base": optax.chain(
+                optax.clip_by_global_norm(1.0),
+                optax.scale_by_adam(),
+                optax.scale_by_schedule(cosine_us_warmup),
+                optax.scale(-1.0),
+            ),
+            "sigma": optax.chain(
+                optax.clip_by_global_norm(1.0),
+                optax.scale_by_adam(),
+                optax.scale_by_schedule(cosine_sigma_warmup),
+                optax.scale(-1.0),
+            ),
+        },
+        param_labels=param_labels,
+    )
+
+    data_weight_schedule = optax.linear_schedule(
+        init_value=0.1,
+        end_value=float(weights_inverse_final[2]),
+        transition_steps=max(round(0.2 * max_steps_adam_inverse), 1),
+    )
+    # Adam is nearly invariant to a uniform scaling of its input gradients.
+    # Apply the same normalized data ramp to its *updates* so ms stays nearly
+    # frozen until the scattered-field data term is fully introduced.
+    ms_update_scale_schedule = optax.linear_schedule(
+        init_value=0.1 / float(weights_inverse_final[2]),
+        end_value=1.0,
+        transition_steps=max(round(0.2 * max_steps_adam_inverse), 1),
+    )
+
     cosine_us_inverse = optax.schedules.cosine_decay_schedule(
         init_value=lr_us, decay_steps=max(max_steps_adam_inverse, 1), alpha=0.1
     )
     cosine_sigma_inverse = optax.schedules.cosine_decay_schedule(
-        init_value=lr_sigma, decay_steps=max(int(0.2 * max_steps_adam_inverse), 1), alpha=0.001
+        init_value=lr_sigma, decay_steps=max(int(0.3 * max_steps_adam_inverse), 1), alpha=0.0001
     )
     cosine_ms_inverse = optax.schedules.cosine_decay_schedule(
         init_value=lr_ms, decay_steps=max(max_steps_adam_inverse, 1), alpha=0.1
@@ -702,17 +679,18 @@ def train(
         optax.clip_by_global_norm(1.0),
         optax.scale_by_adam(),
         optax.scale_by_schedule(cosine_ms_inverse),
+        optax.scale_by_schedule(ms_update_scale_schedule),
         optax.scale(-1.0),
     )
     lbfgs_packed_inverse = optax.lbfgs()
+    step_warmup = make_train_step_warmup(adam_us_warmup)
     step_inverse = make_train_step_inverse_package(
         adam_us_inverse, adam_ms_inverse, lbfgs_packed_inverse
     )
 
-    data_weight_schedule = optax.linear_schedule(
-        init_value=0.1,
-        end_value=float(weights_inverse_final[2]),
-        transition_steps=max(round(0.2 * max_steps_adam_inverse), 1),
+    previously_trained_cases = set()
+    warmup_full_weights = jnp.concatenate(
+        [weights_warmup, jnp.array([0.0], dtype=weights_warmup.dtype)]
     )
 
     for package_index, package in enumerate(packages):
@@ -724,6 +702,104 @@ def train(
         print(f"\n{'=' * 70}")
         print(f"--- Package {package_index + 1}: {cases} ---")
         print(f"{'=' * 70}")
+
+        warmup_cases = select_warmup_cases(
+            package_index, cases, previously_trained_cases
+        )
+        if warmup_cases and max_steps_adam_warmup <= 0:
+            print(
+                f"Warmup cases {warmup_cases} selected, but "
+                "max_steps_adam_warmup <= 0; skipping warmup."
+            )
+        elif warmup_cases:
+            warmup_label = package_label(package_index, warmup_cases)
+            warmup_param_us_list = [
+                params_us[(frequency, mode_index)]
+                for frequency, mode_index in warmup_cases
+            ]
+            warmup_params_us_stacked = jax.tree_util.tree_map(
+                lambda *values: jnp.stack(values, axis=0), *warmup_param_us_list
+            )
+            warmup_arrays = make_package_arrays(warmup_cases, mode_data)
+            warmup_loss_history = []
+            best_warmup_loss = float("inf")
+            best_warmup_params_us_stacked = jax.tree_util.tree_map(
+                jnp.copy, warmup_params_us_stacked
+            )
+            best_warmup_summary = None
+
+            print(
+                f"\n--- Scattered warmup | Adam (max {max_steps_adam_warmup} steps) "
+                f"| frozen ms from previous package | cases {warmup_cases} ---"
+            )
+            opt_state_us_warmup = adam_us_warmup.init(warmup_params_us_stacked)
+
+            for step in range(max_steps_adam_warmup):
+                key, subkey = jax.random.split(key)
+                warmup_params_us_stacked, opt_state_us_warmup, _, _ = step_warmup(
+                    warmup_params_us_stacked, layers_ms, opt_state_us_warmup,
+                    subkey, *warmup_arrays, warmup_full_weights, N=N_adam,
+                )
+
+                if step % eval_interval == 0:
+                    loss, validation_aux = evaluate_inverse_loss(
+                        warmup_params_us_stacked,
+                        layers_ms,
+                        *validation_points,
+                        *warmup_arrays,
+                        warmup_full_weights,
+                    )
+                    pde_loss, bc_loss, _, _ = validation_aux
+                    loss_value = float(loss)
+                    sigma_summary = format_sigma_scales(
+                        warmup_params_us_stacked, warmup_cases
+                    )
+                    print(
+                        f"[Adam warmup] Step {step} | val pde {pde_loss:.2e} | "
+                        f"val bc {bc_loss:.2e} | weighted total {loss:.2e} | "
+                        f"{sigma_summary}"
+                    )
+
+                    warmup_loss_history.append(loss_value)
+                    if loss_value < best_warmup_loss:
+                        best_warmup_loss = loss_value
+                        best_warmup_params_us_stacked = jax.tree_util.tree_map(
+                            jnp.copy, warmup_params_us_stacked
+                        )
+                        best_warmup_summary = {
+                            "package": package_index + 1,
+                            "cases": [(float(f), int(m)) for f, m in warmup_cases],
+                            "optimizer": "adam",
+                            "step": int(step),
+                            "pde": float(pde_loss),
+                            "bc": float(bc_loss),
+                            "weighted_total": loss_value,
+                            "weights": [float(value) for value in weights_warmup],
+                            "frozen_ms_from_previous_package": True,
+                        }
+
+                    if check_switch_criterion(
+                        warmup_loss_history,
+                        window=switch_window,
+                        threshold=switch_threshold,
+                    ):
+                        print(
+                            f"[Adam warmup] Convergence criterion met at step {step}. "
+                            "Stopping warmup."
+                        )
+                        break
+
+            if best_warmup_summary is None:
+                raise RuntimeError(
+                    f"No finite warmup validation loss for package {package_index + 1}"
+                )
+
+            warmup_params_us_stacked = best_warmup_params_us_stacked
+            for index, case in enumerate(warmup_cases):
+                params_us[case] = jax.tree_util.tree_map(
+                    lambda value, idx=index: value[idx], warmup_params_us_stacked
+                )
+            best_validation_losses["warmup"].append(best_warmup_summary)
 
         param_us_list = [params_us[(frequency, mode_index)] for frequency, mode_index in cases]
         params_us_stacked = jax.tree_util.tree_map(
@@ -760,24 +836,12 @@ def train(
 
                 key, subkey = jax.random.split(key)
                 (
-                    params_us_stacked,
-                    layers_ms,
-                    opt_state_us,
-                    opt_state_ms,
-                    opt_state_lbfgs,
-                    _,
-                    _,
+                    params_us_stacked, layers_ms, opt_state_us, opt_state_ms,
+                    opt_state_lbfgs, _, _,
                 ) = step_inverse(
-                    params_us_stacked,
-                    layers_ms,
-                    opt_state_us,
-                    opt_state_ms,
-                    opt_state_lbfgs,
-                    subkey,
-                    *package_arrays,
-                    current_weights,
-                    N=N_adam,
-                    use_lbfgs=False,
+                    params_us_stacked, layers_ms, opt_state_us, opt_state_ms,
+                    opt_state_lbfgs, subkey, *package_arrays, current_weights,
+                    N=N_adam, use_lbfgs=False,
                 )
 
                 if step in inverse_snapshot_steps:
@@ -806,7 +870,7 @@ def train(
                     print(
                         f"[Adam inverse] Step {step} | val pde {pde_loss:.2e} | "
                         f"val bc {bc_loss:.2e} | val data {data_loss:.2e} | "
-                        f"weighted total {loss:.2e} | data weight {current_weights[2]:.2e} | "
+                        f"weighted total {loss:.2e} | "
                         f"{sigma_summary}"
                     )
 
@@ -851,24 +915,12 @@ def train(
 
                 for step in range(max_steps_lbfgs_inverse):
                     (
-                        params_us_stacked,
-                        layers_ms,
-                        opt_state_us,
-                        opt_state_ms,
-                        opt_state_lbfgs,
-                        _,
-                        _,
+                        params_us_stacked, layers_ms, opt_state_us, opt_state_ms,
+                        opt_state_lbfgs, _, _,
                     ) = step_inverse(
-                        params_us_stacked,
-                        layers_ms,
-                        opt_state_us,
-                        opt_state_ms,
-                        opt_state_lbfgs,
-                        None,
-                        *package_arrays,
-                        weights_inverse_final,
-                        N=N_lbfgs,
-                        use_lbfgs=True,
+                        params_us_stacked, layers_ms, opt_state_us, opt_state_ms,
+                        opt_state_lbfgs, None, *package_arrays, weights_inverse_final,
+                        N=N_lbfgs, use_lbfgs=True,
                     )
 
                     if step % eval_interval == 0:
@@ -927,6 +979,7 @@ def train(
         best_params_each_ms.append((package_index, cases, jax.tree_util.tree_map(jnp.copy, layers_ms)))
         best_validation_losses["inverse"].append(best_inverse_summary)
         loss_inverse_by_package.append({"label": label, "cases": cases, "history": inverse_history})
+        previously_trained_cases.update((float(f), int(m)) for f, m in cases)
 
     return (
         params_us,
@@ -983,7 +1036,7 @@ def main():
     print("JAX Devices:", jax.devices())
     print("Default JAX dtype:", jnp.ones(1).dtype)
 
-    left_path, right_path = boundary_data_paths(script_dir, defect_name, contrast_ratio)
+    left_path, right_path = boundary_data_paths(data_dir, defect_name, contrast_ratio)
     boundary_data = WaveguideBoundaryData(left_path, right_path)
 
     requested_cases = flatten_packages(training_packages)
@@ -1020,25 +1073,48 @@ def main():
                     f"x_left={pair.x_left}, x_right={pair.x_right}; expected {-L} and {L}"
                 )
 
-            Y_left[frequency] = 2 * jnp.asarray(pair.y_left, dtype=jnp.float32) / H - 1
-            Y_right[frequency] = 2 * jnp.asarray(pair.y_right, dtype=jnp.float32) / H - 1
-            re_l = jnp.asarray(pair.u_re_left, dtype=jnp.float32)
-            im_l = jnp.asarray(pair.u_im_left, dtype=jnp.float32)
-            re_r = jnp.asarray(pair.u_re_right, dtype=jnp.float32)
-            im_r = jnp.asarray(pair.u_im_right, dtype=jnp.float32)
+            y_left = 2 * jnp.asarray(pair.y_left, dtype=jnp.float32) / H - 1
+            y_right = 2 * jnp.asarray(pair.y_right, dtype=jnp.float32) / H - 1
+            Y_left[frequency] = y_left
+            Y_right[frequency] = y_right
+
+            total_left = (
+                jnp.asarray(pair.u_re_left, dtype=jnp.float32)
+                + 1j * jnp.asarray(pair.u_im_left, dtype=jnp.float32)
+            )
+            total_right = (
+                jnp.asarray(pair.u_re_right, dtype=jnp.float32)
+                + 1j * jnp.asarray(pair.u_im_right, dtype=jnp.float32)
+            )
+            scattered_left = total_left - incident_wave_complex(
+                -1.0, y_left, frequency, mode_index
+            )
+            scattered_right = total_right - incident_wave_complex(
+                1.0, y_right, frequency, mode_index
+            )
 
             norm = jnp.sqrt(
-                jnp.max(jnp.concatenate((re_l**2 + im_l**2, re_r**2 + im_r**2)))
+                jnp.max(
+                    jnp.concatenate(
+                        (jnp.abs(scattered_left) ** 2, jnp.abs(scattered_right) ** 2)
+                    )
+                )
             )
             if not jnp.isfinite(float(norm)) or float(norm) <= 0.0:
                 raise ValueError(
-                    f"Invalid zero or non-finite field norm for mode {mode_index}, "
+                    f"Invalid zero or non-finite scattered-field norm for mode {mode_index}, "
                     f"frequency {frequency}"
                 )
 
             U_norm[frequency] = norm
-            U_left_norm[frequency] = jnp.stack([re_l / norm, im_l / norm], axis=1)
-            U_right_norm[frequency] = jnp.stack([re_r / norm, im_r / norm], axis=1)
+            U_left_norm[frequency] = jnp.stack(
+                [jnp.real(scattered_left) / norm, jnp.imag(scattered_left) / norm],
+                axis=1,
+            )
+            U_right_norm[frequency] = jnp.stack(
+                [jnp.real(scattered_right) / norm, jnp.imag(scattered_right) / norm],
+                axis=1,
+            )
 
         mode_data[mode_index] = {
             "Y_left": Y_left,
@@ -1096,25 +1172,13 @@ def main():
 
     key, subkey = jax.random.split(key)
     (
-        params_us,
-        layers_ms,
-        best_params_each_ms,
-        key,
-        loss_inverse_by_package,
-        best_validation_losses,
+        params_us, layers_ms, best_params_each_ms,
+        key, loss_inverse_by_package, best_validation_losses,
     ) = train(
-        params_us,
-        layers_ms,
-        N_adam,
-        N_lbfgs,
-        max_steps_adam_inverse,
-        max_steps_lbfgs_inverse,
-        training_packages,
-        mode_data,
-        eval_interval,
-        switch_threshold,
-        switch_window,
-        subkey,
+        params_us, layers_ms, N_adam, N_lbfgs,
+        max_steps_adam_warmup, max_steps_adam_inverse,
+        max_steps_lbfgs_inverse, training_packages, mode_data, eval_interval,
+        switch_threshold, switch_window, subkey,
     )
 
     all_used_modes = sorted({mode_index for _, mode_index in requested_cases})
@@ -1153,7 +1217,10 @@ def main():
             "ratio_label": data_ratio_label,
             "field_formulation": "u_total = u0 + us",
             "residual": "Delta us + omega^2*((m0+ms)*us + ms*u0)",
-            "training_strategy": "direct_scattered_inverse",
+            "us_normalization": "boundary scattered field max norm after subtracting incident",
+            "training_strategy": "new_cases_warmup_then_scattered_inverse",
+            "warmup_scope": "packages after the first; cases absent from earlier packages",
+            "warmup_weights": [float(value) for value in weights_warmup],
             "inverse_weight_schedule": "physics_fixed_data_ramp",
             "training_packages": [
                 {str(frequency): list(modes) for frequency, modes in package.items()}

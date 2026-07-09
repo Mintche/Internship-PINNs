@@ -11,13 +11,18 @@ Internship-PINNs/
 ├── pinn_waveguide_2d/            # PINN training and checkpoints
 │   ├── checkpoints/
 │   ├── data/
-│   └── pinn_waveguide_multi_modes.py
+│   ├── pinn_waveguide_multi_modes.py
+│   └── pinn_scattered_waveguide.py
 ├── tools/
 │   ├── data_loader.py            # Load boundaries, fields, and matrices
 │   ├── uv_checkpoint.py          # Save and evaluate UV/M networks
+│   ├── us_checkpoint.py          # Save and evaluate scattered US/MS networks
 │   ├── compare_pinn_fem.py       # Nodal FEM–PINN comparison
 │   ├── compare_pinn_pinn.py      # Nodal PINN–PINN comparison
-│   └── compare_sound_speed.py    # Sound-speed reconstruction and misfit
+│   ├── compare_sound_speed.py    # Sound-speed reconstruction and misfit
+│   ├── compare_scattered_pinn_fem.py
+│   ├── compare_scattered_pinn_pinn.py
+│   └── compare_scattered_sound_speed.py
 ├── notebooks/
 └── requirements.txt
 ```
@@ -64,6 +69,61 @@ The manifest can be inspected with:
 ```bash
 python3 tools/uv_checkpoint.py inspect \
   --checkpoint pinn_waveguide_2d/checkpoints/checkpoint_barhalf_ratio0p8_modes0_1_2_3_4_freqs600_1200.npz
+```
+
+## Scattered Training
+
+Configure the defect, ratio, training packages, and warmup/inverse budgets at the
+beginning of `pinn_waveguide_2d/pinn_scattered_waveguide.py`, then run:
+
+```bash
+python3 pinn_waveguide_2d/pinn_scattered_waveguide.py
+```
+
+This trains scattered fields `us` and the shared scattered-slowness map `ms`.
+For every package after the first, the script first warms only the new
+`(frequency, mode)` cases with Adam and the frozen best `ms` from the previous
+package, then runs the joint inverse phase. The checkpoint is written as
+`scattered_checkpoint_*.npz`. Boundary data are converted from total field to
+scattered field by subtracting the incident mode before normalization.
+
+Inspect or export a scattered checkpoint with:
+
+```bash
+python3 tools/us_checkpoint.py inspect \
+  --checkpoint pinn_waveguide_2d/checkpoints/scattered_checkpoint_barhalf_ratio0p8_modes0_1_2_3_freqs600_1200.npz
+
+python3 tools/us_checkpoint.py export \
+  --checkpoint pinn_waveguide_2d/checkpoints/scattered_checkpoint_barhalf_ratio0p8_modes0_1_2_3_freqs600_1200.npz \
+  --grid-map FEM/pinn_data/pinn_grid_barhalf.csv \
+  --output pinn_waveguide_2d/predictions/scattered_total.csv \
+  --field total
+```
+
+Compare scattered checkpoints with FEM or with another scattered checkpoint:
+
+```bash
+python3 tools/compare_scattered_pinn_fem.py \
+  --checkpoint pinn_waveguide_2d/checkpoints/scattered_checkpoint_barhalf_ratio0p8_modes0_1_2_3_freqs600_1200.npz \
+  --mass-matrix FEM/pinn_data/Mass_matrix_barhalf.csv \
+  --stiffness-matrix FEM/pinn_data/Stiff_matrix_barhalf.csv \
+  --fem-field FEM/pinn_data/fem_field_barhalf_ratio0p8.csv
+
+python3 tools/compare_scattered_pinn_pinn.py \
+  --checkpoint1 pinn_waveguide_2d/checkpoints/first_scattered.npz \
+  --checkpoint2 pinn_waveguide_2d/checkpoints/second_scattered.npz \
+  --mass-matrix FEM/pinn_data/Mass_matrix_barhalf.csv \
+  --stiffness-matrix FEM/pinn_data/Stiff_matrix_barhalf.csv \
+  --fem-field FEM/pinn_data/fem_field_barhalf_ratio0p8.csv
+```
+
+For scattered sound-speed diagnostics, edit the ground-truth helper at the top of
+`tools/compare_scattered_sound_speed.py`, then run:
+
+```bash
+python3 tools/compare_scattered_sound_speed.py \
+  --checkpoint pinn_waveguide_2d/checkpoints/scattered_checkpoint_barhalf_ratio0p8_modes0_1_2_3_freqs600_1200.npz \
+  --nx 201 --ny 121
 ```
 
 ## FEM–PINN Comparison
@@ -139,3 +199,8 @@ JAX and can be run with:
 ```bash
 python3 -m unittest discover -s tests -v
 ```
+
+The Python tooling expects the packages in `requirements.txt`: `jax`, `jaxlib`,
+`optax`, `numpy`, `pandas`, and `matplotlib`. If a test import fails with
+`ModuleNotFoundError` for one of those packages, install the requirements in the
+active environment first.

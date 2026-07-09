@@ -331,7 +331,8 @@ def loss_fn(params_uv, layers_m, x_pde, y_pde, x_neumann, y_dtn,
         data_loss = 0.0
     else:
         vmap_uv_y = jax.vmap(uv, (None, 0))
-        data_loss = jnp.mean((vmap_uv_y(-1.0, y_bnd_left) - target_u_left)**2) + jnp.mean((vmap_uv_y(1.0, y_bnd_right) - target_u_right)**2)
+        data_loss = jnp.mean((vmap_uv_y(-1.0, y_bnd_left) - target_u_left)**2) 
+        + jnp.mean((vmap_uv_y(1.0, y_bnd_right) - target_u_right)**2)
 
     total_loss = weights[0] * pde_loss + weights[1] * bc_loss + weights[2] * data_loss
     

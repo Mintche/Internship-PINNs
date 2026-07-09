@@ -79,7 +79,7 @@ def save_synthetic_checkpoint(directory: str | Path) -> USCheckpoint:
             "ms_output_parameterization": "bounded_scattered_slowness_tanh",
         },
         best_validation_losses={
-            "phase1_data": [{"package": 1, "data": 0.2}],
+            "warmup": [{"package": 2, "weighted_total": 0.3}],
             "inverse": [{"package": 1, "weighted_total": 0.1}],
         },
         random_seed=7,
@@ -134,6 +134,10 @@ class USCheckpointTests(unittest.TestCase):
             self.assertEqual(
                 checkpoint.best_validation_losses["inverse"][0]["weighted_total"],
                 0.1,
+            )
+            self.assertEqual(
+                checkpoint.best_validation_losses["warmup"][0]["weighted_total"],
+                0.3,
             )
 
             x = np.asarray([-0.5, 0.0, 0.5])

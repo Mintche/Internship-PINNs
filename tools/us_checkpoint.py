@@ -189,7 +189,7 @@ class USCheckpoint:
         physical_units: bool = True,
         batch_size: int = 65536,
     ) -> np.ndarray:
-        """Evaluate the incident wave u0 matching the training formulation."""
+        """Evaluate u0; normalized output uses the stored scattered-field norm."""
         case = self.case(frequency, mode)
         x_values, y_values, original_shape = _prepare_normalized_coordinates(
             x_norm, y_norm
@@ -453,7 +453,7 @@ def collect_us_norms(
     params_us: Mapping[tuple[float, int], Any],
     mode_data: Mapping[int, Mapping[str, Any]],
 ) -> dict[tuple[float, int], float]:
-    """Extract the normalization used by pinn_scattered_waveguide.py."""
+    """Extract the scattered-field normalization used by pinn_scattered_waveguide.py."""
     norms: dict[tuple[float, int], float] = {}
     for frequency, mode in params_us:
         frequency = float(frequency)
@@ -491,7 +491,7 @@ def save_us_checkpoint(
     metadata: Mapping[str, Any] | None = None,
     provenance: Mapping[str, Any] | None = None,
 ) -> Path:
-    """Save scattered US/MS weights, inference configuration and provenance."""
+    """Save scattered US/MS weights, training summaries, and provenance."""
     if not params_us:
         raise ValueError("params_us is empty")
     if not (length > 0.0 and height > 0.0 and c0 > 0.0):
