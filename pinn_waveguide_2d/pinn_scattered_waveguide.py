@@ -48,10 +48,7 @@ data_ratio_label = format_ratio_label(contrast_ratio)
 # Each package is trained as one packed selection of frequencies and modes.
 # Example: [{600.0: [0, 1], 1200.0: [0, 1, 2]}]
 training_packages = [
-    {400.0: [0, 1]},
-    {400.0: [0, 1], 600.0: [1, 2]},
-    {400.0: [0, 1], 1000.0: [0, 3]},
-    {400.0: [0, 1], 1600.0: [0, 5]}
+    {1000.0: [0, 1, 2, 3]}
 ]
 
 # Fractions of the Adam phase-2 budget where the slowness output is plotted.
@@ -81,7 +78,7 @@ eval_interval = 200
 switch_threshold = 0.0
 switch_window = 10
 
-max_steps_adam_warmup = 30001
+max_steps_adam_warmup = 10001
 max_steps_adam_inverse = 100001
 max_steps_lbfgs_inverse = 201
 
@@ -646,7 +643,7 @@ def train(
     ms_update_scale_schedule = optax.linear_schedule(
         init_value=0.1 / float(weights_inverse_final[2]),
         end_value=1.0,
-        transition_steps=max(round(0.2 * max_steps_adam_inverse), 1),
+        transition_steps=max(int(0.2 * max_steps_adam_inverse), 1),
     )
 
     cosine_us_inverse = optax.schedules.cosine_decay_schedule(
@@ -848,7 +845,7 @@ def train(
                     ratio = inverse_snapshot_steps[step]
                     save_celerity_plot(
                         layers_ms,
-                        cache_dir / f"{label}_inverse_adam_snapshot_{int(round(100 * ratio)):03d}pct.pdf",
+                        cache_dir / f"{label}_inverse_adam_snapshot_{defect_name}_{int(round(100 * ratio)):03d}pct.pdf",
                         f"Inverse Adam snapshot {100 * ratio:.0f}% - {label}",
                         show=False,
                     )
@@ -963,7 +960,7 @@ def train(
                 if max_steps_lbfgs_inverse > 0:
                     save_celerity_plot(
                         layers_ms,
-                        cache_dir / f"{label}_inverse_lbfgs_end.pdf",
+                        cache_dir / f"{label}_inverse_lbfgs_end_{defect_name}.pdf",
                         f"End of inverse L-BFGS - {label}",
                         show=False,
                     )

@@ -36,6 +36,7 @@ def ground_truth_sound_speed(
     contrast_ratio = float(checkpoint.metadata["contrast_ratio"])
     sound_speed = np.full(x.shape, checkpoint.c0, dtype=np.float64)
     circlebottomleft = (x + 0.2) ** 2 + (y - 0.2) ** 2 <= 0.1**2
+    circlebottomright = (x - 0.2) ** 2 + (y - 0.2) ** 2 <= 0.1**2
     sound_speed[circlebottomleft] = checkpoint.c0 * contrast_ratio
     return sound_speed
 
