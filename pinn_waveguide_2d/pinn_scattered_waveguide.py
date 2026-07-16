@@ -41,6 +41,11 @@ ms_max = 1 / cmin**2 - m0
 #   pinn_boundary_{left/right}_{defect_name}_ratio{c_defect/c0}.csv
 script_dir = os.path.dirname(os.path.abspath(__file__))
 data_dir = os.path.join(REPOSITORY_ROOT, "FEM")
+if jax.config.jax_compilation_cache_dir is None:
+    jax.config.update(
+        "jax_compilation_cache_dir",
+        os.path.join(script_dir, "cache", "jax_compilation"),
+    )
 defect_name = "barhalf"
 contrast_ratio = 0.8
 data_ratio_label = format_ratio_label(contrast_ratio)
@@ -48,7 +53,10 @@ data_ratio_label = format_ratio_label(contrast_ratio)
 # Each package is trained as one packed selection of frequencies and modes.
 # Example: [{600.0: [0, 1], 1200.0: [0, 1, 2]}]
 training_packages = [
-    {1000.0: [0, 1, 2, 3]}
+    {700.0: [0, 1, 2]},
+    {700.0: [0, 1, 2], 1000.0: [0, 1, 2, 3]},
+    #{600.0: [0, 2], 1000.0: [0, 3]},
+    #{600.0: [0, 2], 1200.0: [0, 3]}
 ]
 
 # Fractions of the Adam phase-2 budget where the slowness output is plotted.
@@ -313,6 +321,82 @@ def us_apply(params_us, x, y):
     return forward_func(params_us["layers"], features)
 
 
+def _fourier_feature_terms(params_us, x, y):
+    """Return Fourier feature trigonometric terms and physical wavevectors."""
+    wavevectors = B_base * params_us["sigma"]
+    projection = (
+        wavevectors[:, 0] * (x * L)
+        + wavevectors[:, 1] * ((y + 1.0) * H / 2.0)
+    )
+    return jnp.cos(projection), jnp.sin(projection), wavevectors
+
+
+def us_value_and_physical_derivative(params_us, x, y, axis):
+    """Evaluate ``us`` and one physical-coordinate derivative analytically."""
+    if axis not in (0, 1):
+        raise ValueError(f"axis must be 0 or 1, got {axis!r}")
+
+    cosine, sine, wavevectors = _fourier_feature_terms(params_us, x, y)
+    value = jnp.concatenate([cosine, sine])
+    feature_derivative = jnp.concatenate(
+        [-sine * wavevectors[:, axis], cosine * wavevectors[:, axis]]
+    )
+
+    for layer in params_us["layers"][:-1]:
+        preactivation = value @ layer["W"] + layer["b"]
+        preactivation_derivative = feature_derivative @ layer["W"]
+        value = jax.nn.tanh(preactivation)
+        feature_derivative = (1.0 - value**2) * preactivation_derivative
+
+    output_layer = params_us["layers"][-1]
+    return (
+        value @ output_layer["W"] + output_layer["b"],
+        feature_derivative @ output_layer["W"],
+    )
+
+
+def us_value_and_physical_laplacian(params_us, x, y):
+    """Evaluate ``us`` and its physical-coordinate Laplacian explicitly.
+
+    A nonlinear layer's Laplacian needs its two-component spatial gradient but
+    only one second-order accumulator.  This is narrower than propagating xx
+    and yy independently when the PDE immediately adds them.
+    """
+    cosine, sine, wavevectors = _fourier_feature_terms(params_us, x, y)
+    value = jnp.concatenate([cosine, sine])
+
+    projection_gradient = wavevectors.T
+    gradient = jnp.concatenate(
+        [
+            -sine[None, :] * projection_gradient,
+            cosine[None, :] * projection_gradient,
+        ],
+        axis=1,
+    )
+    frequency_squared = jnp.sum(projection_gradient**2, axis=0)
+    laplacian = jnp.concatenate(
+        [-cosine * frequency_squared, -sine * frequency_squared]
+    )
+
+    for layer in params_us["layers"][:-1]:
+        preactivation = value @ layer["W"] + layer["b"]
+        preactivation_gradient = gradient @ layer["W"]
+        preactivation_laplacian = laplacian @ layer["W"]
+        value = jax.nn.tanh(preactivation)
+        tanh_first = 1.0 - value**2
+        gradient = tanh_first[None, :] * preactivation_gradient
+        laplacian = tanh_first * (
+            preactivation_laplacian
+            - 2.0 * value * jnp.sum(preactivation_gradient**2, axis=0)
+        )
+
+    output_layer = params_us["layers"][-1]
+    return (
+        value @ output_layer["W"] + output_layer["b"],
+        laplacian @ output_layer["W"],
+    )
+
+
 def scattered_data_loss_single(
     params_us, target_left, target_right, y_bnd_left, y_bnd_right,
 ):
@@ -343,16 +427,25 @@ def scattered_loss_single(
         return create_incident_wave_mode(x, y, frequency, mode_index, u_norm_val)
 
     def us_x(x, y):
-        return jax.jacfwd(us, argnums=0)(x, y) / L
+        _, derivative = us_value_and_physical_derivative(
+            params_us, x, y, axis=0
+        )
+        return derivative
 
     def us_y(x, y):
-        return jax.jacfwd(us, argnums=1)(x, y) * (2.0 / H)
+        _, derivative = us_value_and_physical_derivative(
+            params_us, x, y, axis=1
+        )
+        return derivative
 
     def pde_residual(x, y):
-        us_xx = jax.jacfwd(jax.jacfwd(us, argnums=0), argnums=0)(x, y) / L**2
-        us_yy = jax.jacfwd(jax.jacfwd(us, argnums=1), argnums=1)(x, y) * (2.0 / H) ** 2
+        us_value, laplacian_us = us_value_and_physical_laplacian(
+            params_us, x, y
+        )
+        ms_value = ms(x, y)
         omega = 2.0 * jnp.pi * frequency
-        return (us_xx + us_yy + omega**2 * ((m0 + ms(x, y)) * us(x, y) + ms(x, y) * u0(x, y)))
+        scattering = m0 * us_value + ms_value * (us_value + u0(x, y))
+        return laplacian_us + omega**2 * scattering
 
     def compute_dtn_loss(x_bnd, y_eval, sign):
         us_quad = jax.vmap(us, in_axes=(None, 0))(x_bnd, y_gauss_legendre)
