@@ -25,7 +25,7 @@ from tools.us_checkpoint import collect_us_norms, save_us_checkpoint
 
 # --- Domain Geometry ---
 H = 0.6  # Height of the waveguide
-L = 1.0  # Half-length of the waveguide
+L = 2.0  # Half-length of the waveguide
 
 # --- Physics Parameters ---
 c0 = 340.0
@@ -46,17 +46,15 @@ if jax.config.jax_compilation_cache_dir is None:
         "jax_compilation_cache_dir",
         os.path.join(script_dir, "cache", "jax_compilation"),
     )
-defect_name = "barhalf"
+defect_name = "circlebottomleftlarge"
 contrast_ratio = 0.8
 data_ratio_label = format_ratio_label(contrast_ratio)
 
 # Each package is trained as one packed selection of frequencies and modes.
 # Example: [{600.0: [0, 1], 1200.0: [0, 1, 2]}]
 training_packages = [
-    {700.0: [0, 1, 2]},
-    {700.0: [0, 1, 2], 1000.0: [0, 1, 2, 3]},
-    #{600.0: [0, 2], 1000.0: [0, 3]},
-    #{600.0: [0, 2], 1200.0: [0, 3]}
+    {1000.0: [0, 1, 2, 3]},
+    {1000.0: [0, 1, 2, 3], 1200.0: [0]},
 ]
 
 # Fractions of the Adam phase-2 budget where the slowness output is plotted.
