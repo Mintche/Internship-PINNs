@@ -50,6 +50,41 @@ Make creates `./generate_pinn_data.x`; CMake creates
   --numberofdatapoints 31
 ```
 
+For a mesh whose defect zones use distinct physical surface tags, pass one
+contrast ratio per tag:
+
+```bash
+./generate_pinn_data.x \
+  --mesh data/test_us_2triangles_diffcontrast.msh \
+  --defectname triangles_diffcontrast \
+  --freqs 600,800 \
+  --modes 0,1,2 \
+  --outputdir ../pinn_waveguide_2d/data \
+  --c0 340 \
+  --tag-contrasts 2:0.8,3:0.9 \
+  --numberofdatapoints 31
+```
+
+For an independently reconstructed continuous material map, provide one physical
+sound speed per reordered P2 degree of freedom:
+
+```bash
+./generate_pinn_data.x \
+  --mesh data/test_us_barhalf_centree.msh \
+  --defectname reconstructed_map \
+  --freqs 600 \
+  --modes 0,1,2 \
+  --outputdir /tmp/reconstructed_forward \
+  --c0 340 \
+  --nodal-sound-speed /tmp/reconstructed_sound_speed.csv \
+  --numberofdatapoints 31
+```
+
+The nodal CSV header is `node_id,x,y,c`. It must contain every P2 degree of
+freedom after the solver's RCM reordering; coordinates are checked to prevent a
+silent permutation error. The squared slowness is interpolated with the P2 shape
+functions inside the mass term.
+
 Required arguments:
 
 - `--mesh`: path to the mesh;
@@ -58,13 +93,21 @@ Required arguments:
 - `--modes`: comma-separated mode indices;
 - `--outputdir`: output directory, created if necessary;
 - `--c0`: wave speed in the background medium;
-- `--contrast`: `c_defect/c0` ratio.
+- exactly one of:
+  - `--contrast`: legacy `c_defect/c0` ratio for physical surface tag `2`;
+  - `--tag-contrasts`: comma-separated `tag:ratio` entries, e.g. `2:0.8,3:0.9`;
+  - `--nodal-sound-speed`: continuous nodal material CSV described above.
+
+Surface tag `1` is reserved for the healthy background and uses `c0`. Any
+surface tag not listed in `--tag-contrasts` also uses `c0`.
 
 `--numberofdatapoints N` requests exactly `N` uniformly spaced points per port,
 including the endpoints. Values are interpolated using the P2 shape functions.
 If this option is omitted, all P2 degrees of freedom on the ports are exported.
 
-The ratio is encoded without a decimal point: `0.8` becomes `ratio0p8`.
+With legacy `--contrast`, the ratio is encoded without a decimal point:
+`0.8` becomes `ratio0p8`. With `--tag-contrasts`, the data files use the
+defect name only, so choose a descriptive `--defectname`.
 
 ## Generated Files
 
@@ -75,6 +118,14 @@ For `defectname=barhalfup` and `contrast=0.8`:
 - `Stiff_matrix_barhalfup.csv`;
 - `Mass_matrix_barhalfup.csv`;
 - `fem_field_barhalfup_ratio0p8.csv`.
+
+For `defectname=triangles_diffcontrast` and `--tag-contrasts 2:0.8,3:0.9`:
+
+- `pinn_boundary_left_triangles_diffcontrast.csv`;
+- `pinn_boundary_right_triangles_diffcontrast.csv`;
+- `Stiff_matrix_triangles_diffcontrast.csv`;
+- `Mass_matrix_triangles_diffcontrast.csv`;
+- `fem_field_triangles_diffcontrast.csv`.
 
 The boundary files contain all frequencies and modes:
 

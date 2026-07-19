@@ -171,6 +171,38 @@ class UVCheckpointTests(unittest.TestCase):
                 np.asarray([0.0]), np.asarray([0.3])
             )
 
+    def test_existing_checkpoint_is_not_overwritten(self):
+        params_uv, layers_m = synthetic_parameters()
+        arguments = dict(
+            length=1.0,
+            height=0.6,
+            c0=340.0,
+            layers_m=layers_m,
+            c_min=204.0,
+            c_max=343.4,
+            network_config={"uv_layers": [4, 2], "m_layers": [2, 3, 1]},
+            best_validation_losses={},
+            random_seed=0,
+            metadata={"defect_name": "barhalf", "contrast_ratio": 0.8},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "checkpoint.npz"
+            save_uv_checkpoint(
+                path,
+                params_uv,
+                np.ones((2, 2)),
+                {(600.0, 0): 1.0},
+                **arguments,
+            )
+            with self.assertRaisesRegex(FileExistsError, "Refusing to overwrite"):
+                save_uv_checkpoint(
+                    path,
+                    params_uv,
+                    np.ones((2, 2)),
+                    {(600.0, 0): 1.0},
+                    **arguments,
+                )
+
     def test_invalid_sound_speed_bounds_are_rejected(self):
         params_uv, layers_m = synthetic_parameters()
         with tempfile.TemporaryDirectory() as directory:

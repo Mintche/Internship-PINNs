@@ -17,3 +17,5 @@ __pycache__/
 /pinn_waveguide_2d/data/
 
 /pinn_waveguide_2d/cache/
+
+/*.md

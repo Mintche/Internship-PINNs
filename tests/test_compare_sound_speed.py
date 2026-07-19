@@ -18,6 +18,7 @@ from tools.compare_sound_speed import (
     create_reconstruction_figure,
 )
 from tools.uv_checkpoint import UVCheckpoint
+from tools.ground_truth import build_registered_sound_speed
 
 
 class SoundSpeedComparisonTests(unittest.TestCase):
@@ -116,6 +117,38 @@ class SoundSpeedComparisonTests(unittest.TestCase):
         self.assertIn(250.0, ground_truth)
         self.assertIn(300.0, ground_truth)
         self.assertIn(340.0, ground_truth)
+
+    def test_registry_uses_checkpoint_defect_name(self):
+        x = np.asarray([-0.2, 0.2, 0.0])
+        y = np.asarray([0.2, 0.2, 0.5])
+
+        left = build_registered_sound_speed(
+            x,
+            y,
+            defect_name="circlebottomleft",
+            c0=340.0,
+            contrast_ratio=0.8,
+        )
+        right = build_registered_sound_speed(
+            x,
+            y,
+            defect_name="circlebottomright",
+            c0=340.0,
+            contrast_ratio=0.8,
+        )
+
+        np.testing.assert_allclose(left, [272.0, 340.0, 340.0])
+        np.testing.assert_allclose(right, [340.0, 272.0, 340.0])
+
+    def test_registry_rejects_unknown_defect(self):
+        with self.assertRaisesRegex(ValueError, "Unknown ground-truth defect"):
+            build_registered_sound_speed(
+                np.asarray([0.0]),
+                np.asarray([0.0]),
+                defect_name="typo",
+                c0=340.0,
+                contrast_ratio=0.8,
+            )
 
 
 if __name__ == "__main__":

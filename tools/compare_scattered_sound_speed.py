@@ -17,28 +17,26 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from tools.us_checkpoint import USCheckpoint, load_us_checkpoint  # noqa: E402
+from tools.ground_truth import build_registered_sound_speed  # noqa: E402
 
 
 # ==============================================================================
-# USER-EDITABLE GROUND TRUTH
+# GROUND TRUTH
 # ==============================================================================
-# Keep this synchronized with ground_truth_sound_speed. Set it to None to disable
-# the metadata safeguard while experimenting with new defects.
-GROUND_TRUTH_NAME: str | None = None
-
 
 def ground_truth_sound_speed(
     x: np.ndarray,
     y: np.ndarray,
     checkpoint: USCheckpoint,
 ) -> np.ndarray:
-    """Return the user-defined sound-speed map at physical coordinates."""
-    contrast_ratio = float(checkpoint.metadata["contrast_ratio"])
-    sound_speed = np.full(x.shape, checkpoint.c0, dtype=np.float64)
-    circlebottomleft = (x + 0.2) ** 2 + (y - 0.2) ** 2 <= 0.1**2
-    circlebottomright = (x - 0.2) ** 2 + (y - 0.2) ** 2 <= 0.1**2
-    sound_speed[circlebottomleft] = checkpoint.c0 * contrast_ratio
-    return sound_speed
+    """Return the metadata-selected sound-speed map at physical coordinates."""
+    return build_registered_sound_speed(
+        x,
+        y,
+        defect_name=str(checkpoint.metadata["defect_name"]),
+        c0=checkpoint.c0,
+        contrast_ratio=float(checkpoint.metadata["contrast_ratio"]),
+    )
 
 
 @dataclass(frozen=True)
@@ -93,13 +91,8 @@ def build_ground_truth(
     checkpoint_defect = checkpoint.metadata.get("defect_name")
     if checkpoint_defect is None:
         raise ValueError("The checkpoint does not contain defect_name metadata")
-    if GROUND_TRUTH_NAME is not None and str(checkpoint_defect) != GROUND_TRUTH_NAME:
-        raise ValueError(
-            "Ground truth/checkpoint mismatch: the hardcoded map is "
-            f"{GROUND_TRUTH_NAME!r}, while the checkpoint declares "
-            f"{checkpoint_defect!r}. Edit GROUND_TRUTH_NAME and "
-            "ground_truth_sound_speed before comparing."
-        )
+    if checkpoint.metadata.get("contrast_ratio") is None:
+        raise ValueError("The checkpoint does not contain contrast_ratio metadata")
 
     ground_truth = np.asarray(
         ground_truth_sound_speed(x_grid, y_grid, checkpoint),

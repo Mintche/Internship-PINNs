@@ -17,21 +17,74 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from tools.data_loader import WaveguideBoundaryData, format_ratio_label
+from tools.training_run_config import load_training_run_config
 from tools.us_checkpoint import collect_us_norms, save_us_checkpoint
 
 # ==============================================================================
 # SECTION 1: CONFIGURATION & HYPERPARAMETERS
 # ==============================================================================
 
+_DEFAULT_RUN_CONFIG = {
+    "formulation": "scattered",
+    "height": 0.6,
+    "half_length": 2.0,
+    "c0": 340.0,
+    "contrast_max": 0.4,
+    "celerity_upper_factor": 1.01,
+    "data_dir": "FEM",
+    "defect_name": "circlebottomleftlarge",
+    "contrast_ratio": 0.8,
+    "training_packages": [{"1200": [0, 1, 2, 3, 4]}],
+    "material_snapshot_fractions": [0.3, 0.5, 0.8],
+    "random_seed": 0,
+    "fourier_features": 64,
+    "field_hidden_layers": [128, 128, 64],
+    "material_hidden_layers": [128, 64],
+    "lr_field": 1e-3,
+    "lr_material": 3e-4,
+    "lr_sigma": 1e-2,
+    "gradient_clip_norm": 1.0,
+    "schedule": {
+        "warmup_field_cosine_alpha": 0.1,
+        "warmup_sigma_decay_fraction": 0.5,
+        "warmup_sigma_cosine_alpha": 0.001,
+        "inverse_data_initial_weight": 0.1,
+        "inverse_data_transition_fraction": 0.2,
+        "inverse_field_cosine_alpha": 0.1,
+        "inverse_sigma_decay_fraction": 0.3,
+        "inverse_sigma_cosine_alpha": 0.0001,
+        "inverse_material_cosine_alpha": 0.1,
+    },
+    "n_adam": [4096, 256, 128],
+    "n_lbfgs": [2048, 256, 128],
+    "n_validation": [4096, 256, 128],
+    "eval_interval": 200,
+    "switch_threshold": 0.0,
+    "switch_window": 10,
+    "max_steps_adam_warmup": 10001,
+    "max_steps_adam_inverse": 100001,
+    "max_steps_lbfgs_inverse": 201,
+    "weights_warmup": [10.0, 1.0],
+    "weights_inverse": [1.0, 3.0, 10.0],
+    "show_plots": True,
+    "output_root": "pinn_waveguide_2d",
+}
+RUN_CONFIG = load_training_run_config(
+    _DEFAULT_RUN_CONFIG,
+    formulation="scattered",
+    argv=sys.argv[1:] if __name__ == "__main__" else (),
+)
+_config = RUN_CONFIG.values
+
 # --- Domain Geometry ---
-H = 0.6  # Height of the waveguide
-L = 2.0  # Half-length of the waveguide
+H = float(_config["height"])
+L = float(_config["half_length"])
 
 # --- Physics Parameters ---
-c0 = 340.0
-contrast_max = 0.4
+c0 = float(_config["c0"])
+contrast_max = float(_config["contrast_max"])
 cmin = c0 * (1 - contrast_max)
-cmax = c0 * (1 + 0.01)
+cmax = c0 * float(_config["celerity_upper_factor"])
 m0 = 1 / c0**2
 ms_min = 1 / cmax**2 - m0
 ms_max = 1 / cmin**2 - m0
@@ -40,60 +93,122 @@ ms_max = 1 / cmin**2 - m0
 # Data files follow the naming convention:
 #   pinn_boundary_{left/right}_{defect_name}_ratio{c_defect/c0}.csv
 script_dir = os.path.dirname(os.path.abspath(__file__))
-data_dir = os.path.join(REPOSITORY_ROOT, "FEM")
+data_dir = str(RUN_CONFIG.resolve_path(REPOSITORY_ROOT, "data_dir"))
+configured_output_root = RUN_CONFIG.resolve_path(REPOSITORY_ROOT, "output_root")
 if jax.config.jax_compilation_cache_dir is None:
     jax.config.update(
         "jax_compilation_cache_dir",
         os.path.join(script_dir, "cache", "jax_compilation"),
     )
-defect_name = "circlebottomleftlarge"
-contrast_ratio = 0.8
+defect_name = str(_config["defect_name"])
+contrast_ratio = float(_config["contrast_ratio"])
 data_ratio_label = format_ratio_label(contrast_ratio)
 
 # Each package is trained as one packed selection of frequencies and modes.
 # Example: [{600.0: [0, 1], 1200.0: [0, 1, 2]}]
 training_packages = [
-    {1000.0: [0, 1, 2, 3]},
-    {1000.0: [0, 1, 2, 3], 1200.0: [0]},
+    {
+        float(frequency): [int(mode) for mode in modes]
+        for frequency, modes in package.items()
+    }
+    for package in _config["training_packages"]
 ]
+if not training_packages or any(
+    not package or any(not modes for modes in package.values())
+    for package in training_packages
+):
+    raise ValueError("training_packages must define at least one frequency/mode case")
 
 # Fractions of the Adam phase-2 budget where the slowness output is plotted.
-m_snapshot = [0.3, 0.5, 0.8]
+m_snapshot = [float(value) for value in _config["material_snapshot_fractions"]]
+if any(not 0.0 < value < 1.0 for value in m_snapshot):
+    raise ValueError("material_snapshot_fractions must lie strictly between 0 and 1")
 
 # --- Random Seed ---
-random_seed = 0
+random_seed = int(_config["random_seed"])
 key = jax.random.key(random_seed)
 
 # --- Neural Network Architectures ---
-m_fourier_features = 64
+m_fourier_features = int(_config["fourier_features"])
 n_input = 2
-n_layers_us = [2 * m_fourier_features, 128, 128, 64, 2]
-n_layers_ms = [n_input, 128, 64, 1]
+n_layers_us = [
+    2 * m_fourier_features,
+    *(int(width) for width in _config["field_hidden_layers"]),
+    2,
+]
+n_layers_ms = [
+    n_input,
+    *(int(width) for width in _config["material_hidden_layers"]),
+    1,
+]
 
 # --- Optimizer Learning Rates ---
-lr_us = 1e-3
-lr_ms = 3e-4
-lr_sigma = 1e-2
+lr_us = float(_config["lr_field"])
+lr_ms = float(_config["lr_material"])
+lr_sigma = float(_config["lr_sigma"])
+gradient_clip_norm = float(_config["gradient_clip_norm"])
+if gradient_clip_norm <= 0:
+    raise ValueError("gradient_clip_norm must be positive")
+
+schedule = _config["schedule"]
+expected_schedule_keys = {
+    "warmup_field_cosine_alpha",
+    "warmup_sigma_decay_fraction",
+    "warmup_sigma_cosine_alpha",
+    "inverse_data_initial_weight",
+    "inverse_data_transition_fraction",
+    "inverse_field_cosine_alpha",
+    "inverse_sigma_decay_fraction",
+    "inverse_sigma_cosine_alpha",
+    "inverse_material_cosine_alpha",
+}
+if not isinstance(schedule, dict) or set(schedule) != expected_schedule_keys:
+    raise ValueError(
+        "schedule must define exactly: " + ", ".join(sorted(expected_schedule_keys))
+    )
+schedule = {name: float(value) for name, value in schedule.items()}
+for name in (
+    "warmup_field_cosine_alpha",
+    "warmup_sigma_cosine_alpha",
+    "inverse_field_cosine_alpha",
+    "inverse_sigma_cosine_alpha",
+    "inverse_material_cosine_alpha",
+):
+    if not 0.0 <= schedule[name] <= 1.0:
+        raise ValueError(f"schedule.{name} must lie between 0 and 1")
+for name in (
+    "warmup_sigma_decay_fraction",
+    "inverse_data_transition_fraction",
+    "inverse_sigma_decay_fraction",
+):
+    if not 0.0 < schedule[name] <= 1.0:
+        raise ValueError(f"schedule.{name} must lie in (0, 1]")
+if schedule["inverse_data_initial_weight"] <= 0:
+    raise ValueError("schedule.inverse_data_initial_weight must be positive")
 
 # --- Training Hyperparameters ---
 # Collocation sizes are ordered as (PDE interior, horizontal Neumann, vertical DtN).
-N_adam = (4096, 256, 128)
-N_lbfgs = (2048, 256, 128)
-N_validation = (4096, 256, 128)
-eval_interval = 200
-switch_threshold = 0.0
-switch_window = 10
+N_adam = tuple(int(value) for value in _config["n_adam"])
+N_lbfgs = tuple(int(value) for value in _config["n_lbfgs"])
+N_validation = tuple(int(value) for value in _config["n_validation"])
+if any(len(values) != 3 or min(values) <= 0 for values in (N_adam, N_lbfgs, N_validation)):
+    raise ValueError("n_adam, n_lbfgs and n_validation must contain three positive counts")
+eval_interval = int(_config["eval_interval"])
+switch_threshold = float(_config["switch_threshold"])
+switch_window = int(_config["switch_window"])
 
-max_steps_adam_warmup = 10001
-max_steps_adam_inverse = 100001
-max_steps_lbfgs_inverse = 201
+max_steps_adam_warmup = int(_config["max_steps_adam_warmup"])
+max_steps_adam_inverse = int(_config["max_steps_adam_inverse"])
+max_steps_lbfgs_inverse = int(_config["max_steps_lbfgs_inverse"])
 
-SHOW_PLOTS = True
+SHOW_PLOTS = bool(_config["show_plots"])
 
 # Loss weights are ordered as (PDE, BC, data). Physics is active immediately
 # and the data weight is ramped up, as in the full-field multimode inverse step.
-weights_warmup = jnp.array([10.0, 1.0])
-weights_inverse_final = jnp.array([1.0, 3.0, 10.0])
+weights_warmup = jnp.asarray(_config["weights_warmup"], dtype=jnp.float32)
+weights_inverse_final = jnp.asarray(_config["weights_inverse"], dtype=jnp.float32)
+if weights_warmup.shape != (2,) or weights_inverse_final.shape != (3,):
+    raise ValueError("weights_warmup must have two values and weights_inverse three")
 
 # ==============================================================================
 # SECTION 2: DATA DISCOVERY
@@ -683,7 +798,7 @@ def train(
     mode_data, eval_interval, switch_threshold, switch_window, key,
 ):
     validation_points = regular_collocation_points(N_validation)
-    cache_dir = Path(os.path.join(script_dir,"cache"))
+    cache_dir = configured_output_root / "cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     best_validation_losses = {"warmup": [], "inverse": []}
@@ -698,23 +813,28 @@ def train(
         )
 
     cosine_us_warmup = optax.schedules.cosine_decay_schedule(
-        init_value=lr_us, decay_steps=max(max_steps_adam_warmup, 1), alpha=0.1
+        init_value=lr_us,
+        decay_steps=max(max_steps_adam_warmup, 1),
+        alpha=schedule["warmup_field_cosine_alpha"],
     )
     cosine_sigma_warmup = optax.schedules.cosine_decay_schedule(
         init_value=lr_sigma,
-        decay_steps=max(int(0.5 * max_steps_adam_warmup), 1),
-        alpha=0.001,
+        decay_steps=max(
+            int(schedule["warmup_sigma_decay_fraction"] * max_steps_adam_warmup),
+            1,
+        ),
+        alpha=schedule["warmup_sigma_cosine_alpha"],
     )
     adam_us_warmup = optax.multi_transform(
         transforms={
             "base": optax.chain(
-                optax.clip_by_global_norm(1.0),
+                optax.clip_by_global_norm(gradient_clip_norm),
                 optax.scale_by_adam(),
                 optax.scale_by_schedule(cosine_us_warmup),
                 optax.scale(-1.0),
             ),
             "sigma": optax.chain(
-                optax.clip_by_global_norm(1.0),
+                optax.clip_by_global_norm(gradient_clip_norm),
                 optax.scale_by_adam(),
                 optax.scale_by_schedule(cosine_sigma_warmup),
                 optax.scale(-1.0),
@@ -724,38 +844,62 @@ def train(
     )
 
     data_weight_schedule = optax.linear_schedule(
-        init_value=0.1,
+        init_value=schedule["inverse_data_initial_weight"],
         end_value=float(weights_inverse_final[2]),
-        transition_steps=max(round(0.2 * max_steps_adam_inverse), 1),
+        transition_steps=max(
+            int(
+                schedule["inverse_data_transition_fraction"]
+                * max_steps_adam_inverse
+            ),
+            1,
+        ),
     )
     # Adam is nearly invariant to a uniform scaling of its input gradients.
     # Apply the same normalized data ramp to its *updates* so ms stays nearly
     # frozen until the scattered-field data term is fully introduced.
     ms_update_scale_schedule = optax.linear_schedule(
-        init_value=0.1 / float(weights_inverse_final[2]),
+        init_value=(
+            schedule["inverse_data_initial_weight"]
+            / float(weights_inverse_final[2])
+        ),
         end_value=1.0,
-        transition_steps=max(int(0.2 * max_steps_adam_inverse), 1),
+        transition_steps=max(
+            int(
+                schedule["inverse_data_transition_fraction"]
+                * max_steps_adam_inverse
+            ),
+            1,
+        ),
     )
 
     cosine_us_inverse = optax.schedules.cosine_decay_schedule(
-        init_value=lr_us, decay_steps=max(max_steps_adam_inverse, 1), alpha=0.1
+        init_value=lr_us,
+        decay_steps=max(max_steps_adam_inverse, 1),
+        alpha=schedule["inverse_field_cosine_alpha"],
     )
     cosine_sigma_inverse = optax.schedules.cosine_decay_schedule(
-        init_value=lr_sigma, decay_steps=max(int(0.3 * max_steps_adam_inverse), 1), alpha=0.0001
+        init_value=lr_sigma,
+        decay_steps=max(
+            int(schedule["inverse_sigma_decay_fraction"] * max_steps_adam_inverse),
+            1,
+        ),
+        alpha=schedule["inverse_sigma_cosine_alpha"],
     )
     cosine_ms_inverse = optax.schedules.cosine_decay_schedule(
-        init_value=lr_ms, decay_steps=max(max_steps_adam_inverse, 1), alpha=0.1
+        init_value=lr_ms,
+        decay_steps=max(max_steps_adam_inverse, 1),
+        alpha=schedule["inverse_material_cosine_alpha"],
     )
     adam_us_inverse = optax.multi_transform(
         transforms={
             "base": optax.chain(
-                optax.clip_by_global_norm(1.0),
+                optax.clip_by_global_norm(gradient_clip_norm),
                 optax.scale_by_adam(),
                 optax.scale_by_schedule(cosine_us_inverse),
                 optax.scale(-1.0),
             ),
             "sigma": optax.chain(
-                optax.clip_by_global_norm(1.0),
+                optax.clip_by_global_norm(gradient_clip_norm),
                 optax.scale_by_adam(),
                 optax.scale_by_schedule(cosine_sigma_inverse),
                 optax.scale(-1.0),
@@ -764,7 +908,7 @@ def train(
         param_labels=param_labels,
     )
     adam_ms_inverse = optax.chain(
-        optax.clip_by_global_norm(1.0),
+        optax.clip_by_global_norm(gradient_clip_norm),
         optax.scale_by_adam(),
         optax.scale_by_schedule(cosine_ms_inverse),
         optax.scale_by_schedule(ms_update_scale_schedule),
@@ -936,7 +1080,7 @@ def train(
                     ratio = inverse_snapshot_steps[step]
                     save_celerity_plot(
                         layers_ms,
-                        cache_dir / f"{label}_inverse_adam_snapshot_{defect_name}_{int(round(100 * ratio)):03d}pct.pdf",
+                        cache_dir / f"c_map_scattered__{defect_name}_{label}_inverse_adam_snapshot_{defect_name}_{int(round(100 * ratio)):03d}pct.pdf",
                         f"Inverse Adam snapshot {100 * ratio:.0f}% - {label}",
                         show=False,
                     )
@@ -990,7 +1134,7 @@ def train(
             if max_steps_adam_inverse > 0:
                 save_celerity_plot(
                     layers_ms,
-                    cache_dir / f"{label}_inverse_adam_end.pdf",
+                    cache_dir / f"c_map_scattered__{defect_name}_{label}_inverse_adam_end.pdf",
                     f"End of inverse Adam - {label}",
                     show=False,
                 )
@@ -1121,8 +1265,18 @@ def plot_inverse_losses(loss_inverse_by_package, output_dir):
 def main():
     global key
 
+    output_root = RUN_CONFIG.prepare_output_root(REPOSITORY_ROOT)
+    fig_dir = output_root / "fig"
+    cache_dir = output_root / "cache"
+    checkpoint_dir = output_root / "checkpoints"
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
     print("JAX Devices:", jax.devices())
     print("Default JAX dtype:", jnp.ones(1).dtype)
+    print("Run config ID:", RUN_CONFIG.identifier)
+    print("Run output root:", output_root)
 
     left_path, right_path = boundary_data_paths(data_dir, defect_name, contrast_ratio)
     boundary_data = WaveguideBoundaryData(left_path, right_path)
@@ -1245,19 +1399,6 @@ def main():
             subkey_us, n_layers_us, frequency, mode_index
         )
 
-    fig_dir = Path(script_dir) / "fig"
-    cache_dir = Path(script_dir) / "cache"
-    fig_dir.mkdir(parents=True, exist_ok=True)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
-    print("Plotting initial celerity profile...")
-    save_celerity_plot(
-        layers_ms,
-        fig_dir / "initial_scattered_celerity.pdf",
-        "Initial celerity field",
-        show=SHOW_PLOTS,
-    )
-
     key, subkey = jax.random.split(key)
     (
         params_us, layers_ms, best_params_each_ms,
@@ -1273,7 +1414,6 @@ def main():
     modes_str = "_".join(str(mode_index) for mode_index in all_used_modes)
     freqs_str = "_".join(frequency_label(frequency) for frequency in all_training_frequencies)
 
-    checkpoint_dir = Path(script_dir) / "checkpoints"
     checkpoint_path = (
         checkpoint_dir
         / f"scattered_checkpoint_{defect_name}_{data_ratio_label}_modes{modes_str}_freqs{freqs_str}.npz"
@@ -1314,6 +1454,11 @@ def main():
                 {str(frequency): list(modes) for frequency, modes in package.items()}
                 for package in training_packages
             ],
+            "run_config_id": RUN_CONFIG.identifier,
+            "run_config_source": (
+                str(RUN_CONFIG.source) if RUN_CONFIG.source is not None else None
+            ),
+            "run_config": RUN_CONFIG.values,
         },
     )
     print(f"US/MS checkpoint saved to: {checkpoint_path}")

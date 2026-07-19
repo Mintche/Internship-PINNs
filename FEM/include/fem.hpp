@@ -75,6 +75,14 @@ namespace Fem {
 
     void B_matrix(const usim::MeshP2& mesh, ProfileMatrix<complexe>& B, double k0, double k_d_val, double factor = -1.0);
 
+    void B_matrix_by_tag(const usim::MeshP2& mesh, ProfileMatrix<complexe>& B, double k0, const std::map<int, double>& tag_contrasts, double factor = -1.0);
+
+    void B_matrix_from_nodal_sound_speed(const usim::MeshP2& mesh,
+                                         ProfileMatrix<complexe>& B,
+                                         double omega,
+                                         const std::vector<double>& sound_speed,
+                                         double factor = -1.0);
+
     // -------------------------------------------------------------------------
     // Quadrature 1D (Gauss-Legendre) pour les bords
     // -------------------------------------------------------------------------

@@ -8,6 +8,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -27,12 +28,19 @@ constexpr int defect_tag = 2;
 constexpr int left_tag = 11;
 constexpr int right_tag = 12;
 
+struct TagContrast {
+    int tag = 0;
+    double contrast = 1.0;
+};
+
 struct Configuration {
     filesystem::path mesh_file;
     filesystem::path output_dir;
     string defect_name;
     double c0 = 0.0;
-    double contrast_ratio = 0.0;
+    optional<double> legacy_contrast_ratio;
+    vector<TagContrast> tag_contrasts;
+    optional<filesystem::path> nodal_sound_speed_file;
     vector<double> frequencies;
     vector<int> modes;
     optional<size_t> number_of_data_points;
@@ -63,7 +71,7 @@ void print_usage(const char* executable) {
     cout
         << "Usage:\n  " << executable
         << " --mesh MESH --defectname NAME --freqs F1,F2 --modes M1,M2"
-        << " --outputdir DIR --c0 VALUE --contrast RATIO [options]\n\n"
+        << " --outputdir DIR --c0 VALUE MATERIAL [options]\n\n"
         << "Arguments:\n"
         << "  --mesh PATH                  Maillage Gmsh v2 ASCII\n"
         << "  --defectname NAME            Nom utilise dans les fichiers CSV\n"
@@ -71,14 +79,19 @@ void print_usage(const char* executable) {
         << "  --modes M1,M2                Indices de modes positifs ou nuls\n"
         << "  --outputdir DIR              Dossier de sortie\n"
         << "  --c0 VALUE                   Celerite du milieu sain\n"
-        << "  --contrast RATIO             Rapport c_defaut / c0\n"
+        << "  --contrast RATIO             Rapport c_defaut / c0 pour le tag 2 (ancien format)\n"
+        << "  --tag-contrasts T:R,T:R      Rapports c_tag / c0 par tag physique de surface\n"
+        << "  --nodal-sound-speed PATH     CSV node_id,x,y,c dans l'ordre P2 apres RCM\n"
         << "  --numberofdatapoints N       N points uniformes par bord, N >= 2\n"
         << "  --help                       Afficher cette aide\n\n"
         << "Sans --numberofdatapoints, tous les degres de liberte P2 des ports sont exportes.\n\n"
         << "Exemple:\n  " << executable
         << " --mesh data/test_us_barhalfup_centree.msh --defectname barhalfup"
         << " --freqs 600,800 --modes 0,1,2 --outputdir ../waveguide_2d/data"
-        << " --c0 340 --contrast 0.8 --numberofdatapoints 31\n";
+        << " --c0 340 --contrast 0.8 --numberofdatapoints 31\n  " << executable
+        << " --mesh data/two_zone.msh --defectname barhalf_sym"
+        << " --freqs 600,800 --modes 0,1,2 --outputdir ../waveguide_2d/data"
+        << " --c0 340 --tag-contrasts 2:0.8,3:0.9 --numberofdatapoints 31\n";
 }
 
 string trim(string value) {
@@ -155,6 +168,121 @@ string ratio_label(double ratio) {
     return "ratio" + token;
 }
 
+vector<TagContrast> parse_tag_contrasts(const string& text, const string& option) {
+    vector<TagContrast> contrasts;
+    set<int> seen_tags;
+    string token;
+    stringstream stream(text);
+    while (getline(stream, token, ',')) {
+        token = trim(token);
+        if (token.empty()) throw invalid_argument("Valeur vide dans " + option);
+
+        const size_t separator = token.find(':');
+        if (separator == string::npos || separator == 0 ||
+            separator == token.size() - 1 || token.find(':', separator + 1) != string::npos) {
+            throw invalid_argument("Format attendu pour " + option + ": tag:rapport,tag:rapport");
+        }
+
+        const int tag = parse_int(token.substr(0, separator), option);
+        const double contrast = parse_double(token.substr(separator + 1), option);
+        if (tag <= 0) throw invalid_argument("Les tags de " + option + " doivent etre strictement positifs");
+        if (tag == 1) {
+            throw invalid_argument("Le tag 1 est reserve au milieu sain et utilise --c0");
+        }
+        if (!(contrast > 0.0)) {
+            throw invalid_argument("Les rapports de " + option + " doivent etre strictement positifs");
+        }
+        if (!seen_tags.insert(tag).second) {
+            throw invalid_argument("Tag duplique dans " + option + ": " + to_string(tag));
+        }
+        contrasts.push_back({tag, contrast});
+    }
+    if (contrasts.empty()) throw invalid_argument("La liste " + option + " est vide");
+    sort(contrasts.begin(), contrasts.end(), [](const TagContrast& a, const TagContrast& b) {
+        return a.tag < b.tag;
+    });
+    return contrasts;
+}
+
+vector<int> material_tags(const Configuration& config) {
+    vector<int> tags;
+    tags.reserve(config.tag_contrasts.size());
+    for (const auto& tag_contrast : config.tag_contrasts) {
+        tags.push_back(tag_contrast.tag);
+    }
+    return tags;
+}
+
+vector<double> load_nodal_sound_speed(const filesystem::path& path,
+                                      const MeshP2& mesh) {
+    ifstream input(path);
+    if (!input) throw runtime_error("Impossible d'ouvrir " + path.string());
+    string line;
+    if (!getline(input, line) || trim(line) != "node_id,x,y,c") {
+        throw runtime_error(
+            "Le CSV nodal doit commencer par l'en-tete node_id,x,y,c");
+    }
+
+    vector<double> values(mesh.ndof(), numeric_limits<double>::quiet_NaN());
+    vector<bool> seen(mesh.ndof(), false);
+    size_t row_count = 0;
+    while (getline(input, line)) {
+        line = trim(line);
+        if (line.empty()) continue;
+        replace(line.begin(), line.end(), ',', ' ');
+        stringstream stream(line);
+        int node_id = -1;
+        double x = 0.0;
+        double y = 0.0;
+        double speed = 0.0;
+        string extra;
+        if (!(stream >> node_id >> x >> y >> speed) || (stream >> extra)) {
+            throw runtime_error("Ligne nodale invalide: " + line);
+        }
+        if (node_id < 0 || static_cast<size_t>(node_id) >= mesh.ndof()) {
+            throw runtime_error("node_id nodal hors maillage: " + to_string(node_id));
+        }
+        if (seen[node_id]) {
+            throw runtime_error("node_id nodal duplique: " + to_string(node_id));
+        }
+        const auto& node = mesh.nodes[node_id];
+        const double coordinate_tolerance = 1e-9 * max({1.0, mesh.Lx, mesh.Ly});
+        if (abs(x - node.x) > coordinate_tolerance || abs(y - node.y) > coordinate_tolerance) {
+            throw runtime_error(
+                "Coordonnees incompatibles pour le node_id " + to_string(node_id));
+        }
+        if (!(speed > 0.0) || !isfinite(speed)) {
+            throw runtime_error(
+                "Celerite nodale non positive ou non finie au node_id " +
+                to_string(node_id));
+        }
+        values[node_id] = speed;
+        seen[node_id] = true;
+        ++row_count;
+    }
+    if (row_count != mesh.ndof()) {
+        throw runtime_error(
+            "Le CSV nodal contient " + to_string(row_count) + " lignes pour " +
+            to_string(mesh.ndof()) + " ddl");
+    }
+    return values;
+}
+
+map<int, double> tag_contrast_map(const Configuration& config) {
+    map<int, double> contrasts;
+    for (const auto& tag_contrast : config.tag_contrasts) {
+        contrasts[tag_contrast.tag] = tag_contrast.contrast;
+    }
+    return contrasts;
+}
+
+string data_suffix(const Configuration& config) {
+    if (config.legacy_contrast_ratio.has_value()) {
+        return config.defect_name + "_" + ratio_label(*config.legacy_contrast_ratio);
+    }
+    return config.defect_name;
+}
+
 Configuration parse_arguments(int argc, char** argv) {
     if (argc < 2) {
         print_usage(argv[0]);
@@ -169,6 +297,8 @@ Configuration parse_arguments(int argc, char** argv) {
     bool has_output_dir = false;
     bool has_c0 = false;
     bool has_contrast = false;
+    bool has_tag_contrasts = false;
+    bool has_nodal_sound_speed = false;
 
     auto value_after = [&](int& index, const string& option) -> string {
         if (index + 1 >= argc) throw invalid_argument("Valeur manquante apres " + option);
@@ -203,8 +333,14 @@ Configuration parse_arguments(int argc, char** argv) {
             config.c0 = parse_double(value_after(i, option), option);
             has_c0 = true;
         } else if (option == "--contrast") {
-            config.contrast_ratio = parse_double(value_after(i, option), option);
+            config.legacy_contrast_ratio = parse_double(value_after(i, option), option);
             has_contrast = true;
+        } else if (option == "--tag-contrasts") {
+            config.tag_contrasts = parse_tag_contrasts(value_after(i, option), option);
+            has_tag_contrasts = true;
+        } else if (option == "--nodal-sound-speed") {
+            config.nodal_sound_speed_file = value_after(i, option);
+            has_nodal_sound_speed = true;
         } else if (option == "--numberofdatapoints") {
             const int count = parse_int(value_after(i, option), option);
             if (count < 2) throw invalid_argument("--numberofdatapoints doit etre >= 2");
@@ -220,10 +356,20 @@ Configuration parse_arguments(int argc, char** argv) {
     if (!has_modes) throw invalid_argument("--modes est obligatoire");
     if (!has_output_dir) throw invalid_argument("--outputdir est obligatoire");
     if (!has_c0) throw invalid_argument("--c0 est obligatoire");
-    if (!has_contrast) throw invalid_argument("--contrast est obligatoire");
+    const int material_option_count = static_cast<int>(has_contrast) +
+                                      static_cast<int>(has_tag_contrasts) +
+                                      static_cast<int>(has_nodal_sound_speed);
+    if (material_option_count != 1) {
+        throw invalid_argument(
+            "Fournir exactement un de --contrast ou --tag-contrasts, "
+            "ou utiliser --nodal-sound-speed exclusivement");
+    }
     if (!(config.c0 > 0.0)) throw invalid_argument("--c0 doit etre strictement positif");
-    if (!(config.contrast_ratio > 0.0)) {
+    if (has_contrast && !(*config.legacy_contrast_ratio > 0.0)) {
         throw invalid_argument("--contrast doit etre un rapport strictement positif");
+    }
+    if (has_contrast) {
+        config.tag_contrasts = {{defect_tag, *config.legacy_contrast_ratio}};
     }
     for (double frequency : config.frequencies) {
         if (!(frequency > 0.0)) throw invalid_argument("Toutes les frequences doivent etre positives");
@@ -420,8 +566,13 @@ int main(int argc, char** argv) {
         filesystem::create_directories(config.output_dir);
 
         MeshP2 mesh;
-        mesh.read_msh_v2_ascii(config.mesh_file.string(), {defect_tag});
+        mesh.read_msh_v2_ascii(config.mesh_file.string(), material_tags(config));
         Fem::reorder_mesh_rcm(mesh);
+        const optional<vector<double>> nodal_sound_speed =
+            config.nodal_sound_speed_file.has_value()
+                ? optional<vector<double>>(
+                      load_nodal_sound_speed(*config.nodal_sound_speed_file, mesh))
+                : nullopt;
 
         const BoundaryPort left_port = collect_boundary_port(mesh, left_tag, mesh.xmin);
         const BoundaryPort right_port = collect_boundary_port(mesh, right_tag, mesh.xmax);
@@ -450,23 +601,23 @@ int main(int argc, char** argv) {
                                 ("Mass_matrix_" + config.defect_name + ".csv"),
                             mass, profile);
 
-        const string data_suffix = config.defect_name + "_" + ratio_label(config.contrast_ratio);
+        const string output_suffix = data_suffix(config);
         auto left_output = open_output(config.output_dir /
-                                       ("pinn_boundary_left_" + data_suffix + ".csv"));
+                                       ("pinn_boundary_left_" + output_suffix + ".csv"));
         auto right_output = open_output(config.output_dir /
-                                        ("pinn_boundary_right_" + data_suffix + ".csv"));
+                                        ("pinn_boundary_right_" + output_suffix + ".csv"));
         auto field_output = open_output(config.output_dir /
-                                        ("fem_field_" + data_suffix + ".csv"));
+                                        ("fem_field_" + output_suffix + ".csv"));
         left_output << "f,k0,mode,x,y,Re_U,Im_U\n";
         right_output << "f,k0,mode,x,y,Re_U,Im_U\n";
         field_output << "f,k0,mode,node_id,x,y,Re_U,Im_U\n";
 
         const int highest_requested_mode = *max_element(config.modes.begin(), config.modes.end());
         const double pi = acos(-1.0);
+        const map<int, double> contrasts_by_tag = tag_contrast_map(config);
 
         for (double frequency : config.frequencies) {
             const double k0 = 2.0 * pi * frequency / config.c0;
-            const double kd = k0 / config.contrast_ratio;
             const int number_of_dtn_modes =
                 max(static_cast<int>(floor(mesh.Ly * k0 / pi)) + 5,
                     highest_requested_mode + 1);
@@ -475,7 +626,16 @@ int main(int argc, char** argv) {
                  << ", " << number_of_dtn_modes << " modes DtN...\n";
 
             ProfileMatrix<complexe> system = stiffness;
-            Fem::B_matrix(mesh, system, k0, kd, -1.0);
+            if (nodal_sound_speed.has_value()) {
+                const double omega = 2.0 * pi * frequency;
+                Fem::B_matrix_from_nodal_sound_speed(
+                    mesh, system, omega, *nodal_sound_speed, -1.0);
+            } else if (config.legacy_contrast_ratio.has_value()) {
+                const double kd = k0 / *config.legacy_contrast_ratio;
+                Fem::B_matrix(mesh, system, k0, kd, -1.0);
+            } else {
+                Fem::B_matrix_by_tag(mesh, system, k0, contrasts_by_tag, -1.0);
+            }
 
             FullMatrix<complexe> e_left =
                 Fem::compute_E(mesh, number_of_dtn_modes, left_tag, k0);

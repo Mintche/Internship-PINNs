@@ -375,8 +375,9 @@ def save_uv_checkpoint(
     random_seed: int,
     metadata: Mapping[str, Any] | None = None,
     provenance: Mapping[str, Any] | None = None,
+    overwrite: bool = False,
 ) -> Path:
-    """Save UV/M weights, inference configuration and provenance in NPZ format."""
+    """Save UV/M weights without silently replacing an existing checkpoint."""
     if not params_uv:
         raise ValueError("params_uv is empty")
     if not (length > 0.0 and height > 0.0 and c0 > 0.0):
@@ -401,6 +402,10 @@ def save_uv_checkpoint(
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and not overwrite:
+        raise FileExistsError(
+            f"Refusing to overwrite existing UV checkpoint: {path}"
+        )
     b_base_array = np.asarray(b_base)
     if (
         b_base_array.ndim != 2
@@ -494,6 +499,10 @@ def save_uv_checkpoint(
         ) as stream:
             temporary_path = Path(stream.name)
             np.savez_compressed(stream, **arrays)
+        if path.exists() and not overwrite:
+            raise FileExistsError(
+                f"Refusing to overwrite existing UV checkpoint: {path}"
+            )
         os.replace(temporary_path, path)
     finally:
         if temporary_path is not None and temporary_path.exists():

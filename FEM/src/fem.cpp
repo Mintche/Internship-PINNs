@@ -1,5 +1,37 @@
 #include "fem.hpp"
 
+namespace {
+
+template <typename WavenumberForTriangle>
+void assemble_B_matrix(const usim::MeshP2& mesh, ProfileMatrix<complexe>& B,
+                       double factor, WavenumberForTriangle wavenumber_for_triangle) {
+    auto qp = Fem::get_quadrature_points();
+    std::vector<double> phi(6);
+
+    for (const auto& tri : mesh.triangles) {
+        usim::Point2D p0 = mesh.nodes[tri.node_ids[0]];
+        usim::Point2D p1 = mesh.nodes[tri.node_ids[1]];
+        usim::Point2D p2 = mesh.nodes[tri.node_ids[2]];
+
+        double detJac = (p1.x-p0.x)*(p2.y-p0.y)-(p1.y-p0.y)*(p2.x-p0.x);
+        double k = wavenumber_for_triangle(tri);
+
+        for (const auto& q : qp) {
+            Fem::evaluate_shape_functions(q.x, q.y, phi);
+            double weight = q.w * std::abs(detJac);
+
+            for (int i = 0; i < 6; ++i) {
+                for (int j = 0; j <= i; ++j) {
+                    double val = phi[i] * phi[j] * weight * (k * k);
+                    B(tri.node_ids[i], tri.node_ids[j]) += val * factor;
+                }
+            }
+        }
+    }
+}
+
+} // namespace
+
 namespace Fem {
 
 // Ordre des noeuds : 0,1,2 (sommets) puis 3,4,5 (milieux)
@@ -333,38 +365,68 @@ void M_matrix(const usim::MeshP2& mesh, ProfileMatrix<complexe>& M, double facto
 }
 
 void B_matrix(const usim::MeshP2& mesh, ProfileMatrix<complexe>& B, double k0, double k_d_val, double factor){
-    auto qp = get_quadrature_points();
+    assemble_B_matrix(mesh, B, factor, [=](const usim::TriangleP2& tri) {
+        return tri.is_defect ? k_d_val : k0;
+    });
+}
+
+void B_matrix_by_tag(const usim::MeshP2& mesh, ProfileMatrix<complexe>& B, double k0,
+                     const std::map<int, double>& tag_contrasts, double factor) {
+    assemble_B_matrix(mesh, B, factor, [&](const usim::TriangleP2& tri) {
+        const auto match = tag_contrasts.find(tri.ref);
+        const double contrast = (match == tag_contrasts.end()) ? 1.0 : match->second;
+        return k0 / contrast;
+    });
+}
+
+void B_matrix_from_nodal_sound_speed(const usim::MeshP2& mesh,
+                                     ProfileMatrix<complexe>& B,
+                                     double omega,
+                                     const std::vector<double>& sound_speed,
+                                     double factor) {
+    if (sound_speed.size() != mesh.ndof()) {
+        throw std::invalid_argument(
+            "B_matrix_from_nodal_sound_speed: sound-speed size must equal mesh ndof");
+    }
+    if (!(omega > 0.0) || !std::isfinite(omega)) {
+        throw std::invalid_argument(
+            "B_matrix_from_nodal_sound_speed: omega must be finite and positive");
+    }
+    std::vector<double> squared_slowness(sound_speed.size());
+    for (std::size_t index = 0; index < sound_speed.size(); ++index) {
+        const double speed = sound_speed[index];
+        if (!(speed > 0.0) || !std::isfinite(speed)) {
+            throw std::invalid_argument(
+                "B_matrix_from_nodal_sound_speed: sound speeds must be finite and positive");
+        }
+        squared_slowness[index] = 1.0 / (speed * speed);
+    }
+
+    const auto quadrature_points = get_quadrature_points();
     std::vector<double> phi(6);
+    for (const auto& triangle : mesh.triangles) {
+        const auto& p0 = mesh.nodes[triangle.node_ids[0]];
+        const auto& p1 = mesh.nodes[triangle.node_ids[1]];
+        const auto& p2 = mesh.nodes[triangle.node_ids[2]];
+        const double determinant =
+            (p1.x - p0.x) * (p2.y - p0.y) - (p1.y - p0.y) * (p2.x - p0.x);
 
-    for (const auto& tri : mesh.triangles) {
-
-        // Coordonnées des 3 sommets du triangle (p0, p1, p2)
-
-        usim::Point2D p0 = mesh.nodes[tri.node_ids[0]];
-        usim::Point2D p1 = mesh.nodes[tri.node_ids[1]];
-        usim::Point2D p2 = mesh.nodes[tri.node_ids[2]];
-
-        // detJ (Jacobien géométrique)
-        double detJac = (p1.x-p0.x)*(p2.y-p0.y)-(p1.y-p0.y)*(p2.x-p0.x);
-
-        // CORRECTION : Utilisation de is_defect pour choisir le bon k
-        double k = (tri.is_defect) ? k_d_val : k0;
-
-        // Voir section 1.2 "Modélisation des défauts"
-
-        // Boucle quadrature
-        for (const auto& q : qp) {
-            evaluate_shape_functions(q.x, q.y, phi);
-
-            double weight = q.w * std::abs(detJac);
-
-            // Double boucle sur les fonctions de base
+        for (const auto& point : quadrature_points) {
+            evaluate_shape_functions(point.x, point.y, phi);
+            double material = 0.0;
+            for (int local = 0; local < 6; ++local) {
+                material += phi[local] * squared_slowness[triangle.node_ids[local]];
+            }
+            if (!(material > 0.0) || !std::isfinite(material)) {
+                throw std::runtime_error(
+                    "Non-positive interpolated squared slowness at a quadrature point");
+            }
+            const double weight = point.w * std::abs(determinant);
+            const double coefficient = omega * omega * material * weight * factor;
             for (int i = 0; i < 6; ++i) {
                 for (int j = 0; j <= i; ++j) {
-                    
-                    double val = phi[i] * phi[j] * weight * (k * k);
-                    
-                    B(tri.node_ids[i],tri.node_ids[j]) += val * factor;
+                    B(triangle.node_ids[i], triangle.node_ids[j]) +=
+                        coefficient * phi[i] * phi[j];
                 }
             }
         }

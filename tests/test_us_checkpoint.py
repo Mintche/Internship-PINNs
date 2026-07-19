@@ -100,6 +100,12 @@ def save_synthetic_checkpoint(directory: str | Path) -> USCheckpoint:
 
 
 class USCheckpointTests(unittest.TestCase):
+    def test_existing_checkpoint_is_not_overwritten(self):
+        with tempfile.TemporaryDirectory() as directory:
+            save_synthetic_checkpoint(directory)
+            with self.assertRaisesRegex(FileExistsError, "Refusing to overwrite"):
+                save_synthetic_checkpoint(directory)
+
     def test_round_trip_preserves_fields_and_sound_speed(self):
         params_us, layers_ms = synthetic_parameters()
         b_base = np.asarray([[0.2, 0.4], [-0.1, 0.3]], dtype=np.float32)
