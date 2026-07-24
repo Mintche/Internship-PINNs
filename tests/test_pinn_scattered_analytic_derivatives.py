@@ -22,6 +22,17 @@ FLOAT32_GPU_GRADIENT_RTOL = 2e-3
 
 
 class ScatteredPinnAnalyticDerivativeTests(unittest.TestCase):
+    def test_training_package_parser_requires_incidence_outer_keys(self):
+        package = pinn.parse_training_package(
+            {"-1": {"600": [0]}, "1": {"600": [0, 1]}}
+        )
+        self.assertEqual(
+            pinn.flatten_package(package),
+            [(600.0, 0, -1), (600.0, 0, 1), (600.0, 1, 1)],
+        )
+        with self.assertRaisesRegex(ValueError, "incidence"):
+            pinn.parse_training_package({"600": [0]})
+
     def test_analytic_spatial_derivatives_match_jacfwd(self):
         params = pinn.init_layers_us(
             jax.random.key(123), pinn.n_layers_us, 1000.0, 1
@@ -71,6 +82,7 @@ class ScatteredPinnAnalyticDerivativeTests(unittest.TestCase):
         package = (
             jnp.asarray([600.0], dtype=jnp.float32),
             jnp.asarray([1], dtype=jnp.int32),
+            jnp.asarray([-1], dtype=jnp.int32),
             jnp.zeros((1, 5, 2), dtype=jnp.float32),
             jnp.zeros((1, 5, 2), dtype=jnp.float32),
             y_boundary[None],

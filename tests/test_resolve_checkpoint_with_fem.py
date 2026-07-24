@@ -15,21 +15,21 @@ from tools.resolve_checkpoint_with_fem import (
 
 class ResolveCheckpointWithFEMTest(unittest.TestCase):
     def test_select_cases_filters_available_checkpoint_cases(self) -> None:
-        available = [(600.0, 0), (600.0, 1), (1200.0, 0)]
+        available = [(600.0, 0, -1), (600.0, 1, -1), (1200.0, 0, 1)]
         self.assertEqual(
-            _select_cases(available, frequencies=[600.0], modes=[1]),
-            [(600.0, 1)],
+            _select_cases(available, frequencies=[600.0], modes=[1], incidences=[-1]),
+            [(600.0, 1, -1)],
         )
         with self.assertRaisesRegex(ValueError, "No checkpoint case"):
             _select_cases(available, frequencies=[900.0], modes=None)
 
     def test_case_strings_requires_a_cartesian_product(self) -> None:
         self.assertEqual(
-            _case_strings([(600.0, 0), (600.0, 1)]),
-            ("600", "0,1"),
+            _case_strings([(600.0, 0, -1), (600.0, 1, -1)]),
+            ("600", "0,1", "-1"),
         )
         with self.assertRaisesRegex(ValueError, "Cartesian"):
-            _case_strings([(600.0, 0), (1200.0, 1)])
+            _case_strings([(600.0, 0, -1), (1200.0, 1, 1)])
 
     def test_checkpoint_kind_can_be_explicit_or_inferred(self) -> None:
         from pathlib import Path

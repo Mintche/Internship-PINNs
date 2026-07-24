@@ -27,14 +27,13 @@ from tools.us_checkpoint import collect_us_norms, save_us_checkpoint
 _DEFAULT_RUN_CONFIG = {
     "formulation": "scattered",
     "height": 0.6,
-    "half_length": 2.0,
+    "half_length": 1.0,
     "c0": 340.0,
     "contrast_max": 0.4,
     "celerity_upper_factor": 1.01,
     "data_dir": "FEM",
-    "defect_name": "circlebottomleftlarge",
-    "contrast_ratio": 0.8,
-    "training_packages": [{"1200": [0, 1, 2, 3, 4]}],
+    "defect_name": "barhalf",
+    "training_packages": [{"-1": {"600": [0, 1, 2]}}],
     "material_snapshot_fractions": [0.3, 0.5, 0.8],
     "random_seed": 0,
     "fourier_features": 64,
@@ -64,7 +63,7 @@ _DEFAULT_RUN_CONFIG = {
     "max_steps_adam_warmup": 10001,
     "max_steps_adam_inverse": 100001,
     "max_steps_lbfgs_inverse": 201,
-    "weights_warmup": [10.0, 1.0],
+    "weights_warmup": [1.0, 10.0],
     "weights_inverse": [1.0, 3.0, 10.0],
     "show_plots": True,
     "output_root": "pinn_waveguide_2d",
@@ -101,23 +100,54 @@ if jax.config.jax_compilation_cache_dir is None:
         os.path.join(script_dir, "cache", "jax_compilation"),
     )
 defect_name = str(_config["defect_name"])
-contrast_ratio = float(_config["contrast_ratio"])
-data_ratio_label = format_ratio_label(contrast_ratio)
+VALID_INCIDENCES = {-1, 1}
+
+
+def parse_incidence(value):
+    try:
+        incidence = int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("training_packages incidence keys must be -1 or 1") from error
+    if incidence not in VALID_INCIDENCES:
+        raise ValueError("training_packages incidence keys must be -1 or 1")
+    return incidence
+
+
+def parse_training_package(package):
+    if not isinstance(package, dict) or not package:
+        raise ValueError("Each training package must be a non-empty incidence mapping")
+    parsed = {}
+    for incidence_key, frequency_map in package.items():
+        incidence = parse_incidence(incidence_key)
+        if incidence in parsed:
+            raise ValueError(f"Duplicate incidence {incidence} in one training package")
+        if not isinstance(frequency_map, dict) or not frequency_map:
+            raise ValueError(
+                f"training_packages[{incidence}] must define at least one frequency"
+            )
+        parsed[incidence] = {}
+        for frequency_key, modes in frequency_map.items():
+            frequency = float(frequency_key)
+            if not np.isfinite(frequency) or frequency <= 0.0:
+                raise ValueError("Training frequencies must be finite and positive")
+            mode_values = [int(mode) for mode in modes]
+            if not mode_values or min(mode_values) < 0:
+                raise ValueError("Training mode lists must be non-empty and non-negative")
+            if len(set(mode_values)) != len(mode_values):
+                raise ValueError(
+                    f"Duplicate modes for frequency {frequency}, incidence {incidence}"
+                )
+            parsed[incidence][frequency] = mode_values
+    return parsed
 
 # Each package is trained as one packed selection of frequencies and modes.
-# Example: [{600.0: [0, 1], 1200.0: [0, 1, 2]}]
+# Example: [{"-1": {"600": [0, 1]}, "1": {"600": [0, 1]}}]
 training_packages = [
-    {
-        float(frequency): [int(mode) for mode in modes]
-        for frequency, modes in package.items()
-    }
+    parse_training_package(package)
     for package in _config["training_packages"]
 ]
-if not training_packages or any(
-    not package or any(not modes for modes in package.values())
-    for package in training_packages
-):
-    raise ValueError("training_packages must define at least one frequency/mode case")
+if not training_packages:
+    raise ValueError("training_packages must define at least one case")
 
 # Fractions of the Adam phase-2 budget where the slowness output is plotted.
 m_snapshot = [float(value) for value in _config["material_snapshot_fractions"]]
@@ -214,9 +244,8 @@ if weights_warmup.shape != (2,) or weights_inverse_final.shape != (3,):
 # SECTION 2: DATA DISCOVERY
 # ==============================================================================
 
-def boundary_data_paths(data_dir, defect_name, contrast_ratio):
-    ratio_label = format_ratio_label(contrast_ratio)
-    suffix = f"{defect_name}_{ratio_label}.csv"
+def boundary_data_paths(data_dir, defect_name):
+    suffix = f"{defect_name}.csv"
     left_path = os.path.join(data_dir, "pinn_data", f"pinn_boundary_left_{suffix}")
     right_path = os.path.join(data_dir, "pinn_data", f"pinn_boundary_right_{suffix}")
     missing = [path for path in (left_path, right_path) if not os.path.isfile(path)]
@@ -228,12 +257,13 @@ def boundary_data_paths(data_dir, defect_name, contrast_ratio):
 
 
 def flatten_package(package):
-    """Return sorted (frequency, mode) pairs from one training package."""
+    """Return sorted (frequency, mode, incidence) cases from one package."""
     cases = []
-    for frequency, modes in package.items():
-        for mode_index in modes:
-            cases.append((float(frequency), int(mode_index)))
-    return sorted(cases, key=lambda item: (item[0], item[1]))
+    for incidence, frequency_map in package.items():
+        for frequency, modes in frequency_map.items():
+            for mode_index in modes:
+                cases.append((float(frequency), int(mode_index), int(incidence)))
+    return sorted(cases, key=lambda item: (item[0], item[1], item[2]))
 
 
 def flatten_packages(packages):
@@ -248,9 +278,11 @@ def select_warmup_cases(package_index, cases, previously_trained_cases):
     if package_index == 0:
         return []
     return [
-        (float(frequency), int(mode_index))
-        for frequency, mode_index in cases
-        if (float(frequency), int(mode_index)) not in previously_trained_cases
+        (float(frequency), int(mode_index), int(incidence))
+        for frequency, mode_index, incidence in cases
+        if (
+            float(frequency), int(mode_index), int(incidence)
+        ) not in previously_trained_cases
     ]
 
 
@@ -258,14 +290,26 @@ def frequency_label(frequency):
     return f"{float(frequency):g}".replace(".", "p")
 
 
+def incidence_label(incidence):
+    return "m1" if int(incidence) == -1 else "p1"
+
+
 def package_label(package_index, cases):
-    by_frequency = {}
-    for frequency, mode_index in cases:
-        by_frequency.setdefault(float(frequency), []).append(int(mode_index))
+    by_incidence_frequency = {}
+    for frequency, mode_index, incidence in cases:
+        by_incidence_frequency.setdefault(int(incidence), {}).setdefault(
+            float(frequency), []
+        ).append(int(mode_index))
     tokens = []
-    for frequency in sorted(by_frequency):
-        modes = "_".join(str(mode_index) for mode_index in sorted(by_frequency[frequency]))
-        tokens.append(f"f{frequency_label(frequency)}_m{modes}")
+    for incidence in sorted(by_incidence_frequency):
+        for frequency in sorted(by_incidence_frequency[incidence]):
+            modes = "_".join(
+                str(mode_index)
+                for mode_index in sorted(by_incidence_frequency[incidence][frequency])
+            )
+            tokens.append(
+                f"i{incidence_label(incidence)}_f{frequency_label(frequency)}_m{modes}"
+            )
     return f"pkg{package_index + 1:02d}_" + "__".join(tokens)
 
 
@@ -273,7 +317,7 @@ all_requested_cases = flatten_packages(training_packages)
 if not all_requested_cases:
     raise ValueError("training_packages must contain at least one (frequency, mode) pair")
 
-all_training_frequencies = sorted({frequency for frequency, _ in all_requested_cases})
+all_training_frequencies = sorted({frequency for frequency, _, _ in all_requested_cases})
 
 # ==============================================================================
 # SECTION 3: FOURIER FEATURE MAPPING, INCIDENT MODES & QUADRATURE SETUP
@@ -304,21 +348,22 @@ def beta_for_frequency(frequency):
     return jnp.sqrt(k0**2 - (n_modes * jnp.pi / H) ** 2 + 0j)
 
 
-def incident_wave_complex(x, y, frequency, mode_index):
+def incident_wave_complex(x, y, frequency, mode_index, incidence):
     """Evaluate the physical incident mode u0 at normalized coordinates."""
     mode_index = jnp.asarray(mode_index, dtype=jnp.int32)
+    incidence = jnp.asarray(incidence, dtype=jnp.int32)
     beta_n = beta_for_frequency(frequency)
     beta_mode = jnp.take(beta_n, mode_index)
     mode_float = mode_index.astype(jnp.float32)
     x_phys = x * L
     y_phys = (y + 1.0) * H / 2.0
     mode_shape = jnp.take(a_n, mode_index) * jnp.cos(mode_float * jnp.pi * y_phys / H)
-    return mode_shape * jnp.exp(1j * beta_mode * x_phys)
+    return mode_shape * jnp.exp(-1j * incidence * beta_mode * x_phys)
 
 
-def create_incident_wave_mode(x, y, frequency, mode_index, us_norm_val):
+def create_incident_wave_mode(x, y, frequency, mode_index, incidence, us_norm_val):
     """Evaluate the incident mode u0 scaled by the scattered-field norm."""
-    value = incident_wave_complex(x, y, frequency, mode_index) / us_norm_val
+    value = incident_wave_complex(x, y, frequency, mode_index, incidence) / us_norm_val
     return jnp.stack([jnp.real(value), jnp.imag(value)])
 
 # ==============================================================================
@@ -527,7 +572,7 @@ def scattered_data_loss_single(
 
 def scattered_loss_single(
     params_us, layers_ms, x_pde, y_pde, x_neumann,
-    y_dtn, frequency, mode_index, target_left, target_right,
+    y_dtn, frequency, mode_index, incidence, target_left, target_right,
     y_bnd_left, y_bnd_right, u_norm_val, weights,
 ):
     def us(x, y):
@@ -537,7 +582,9 @@ def scattered_loss_single(
         return forward_ms(layers_ms, jnp.array([x, y]))
 
     def u0(x, y):
-        return create_incident_wave_mode(x, y, frequency, mode_index, u_norm_val)
+        return create_incident_wave_mode(
+            x, y, frequency, mode_index, incidence, u_norm_val
+        )
 
     def us_x(x, y):
         _, derivative = us_value_and_physical_derivative(
@@ -598,21 +645,24 @@ def scattered_loss_single(
 
 def package_scattered_loss_fn(
     params_us_stacked, layers_ms, x_pde, y_pde, x_neumann,
-    y_dtn, frequencies, mode_indices, targets_left, targets_right,
+    y_dtn, frequencies, mode_indices, incidences, targets_left, targets_right,
     y_bnds_left, y_bnds_right, u_norms, weights,
 ):
     """Evaluate the mean weighted scattered-field loss for one package."""
-    def _loss_single(p_us, frequency, mode_index, target_left, target_right, y_left, y_right, u_norm_val):
+    def _loss_single(
+        p_us, frequency, mode_index, incidence,
+        target_left, target_right, y_left, y_right, u_norm_val,
+    ):
         return scattered_loss_single(
             p_us, layers_ms, x_pde, y_pde, x_neumann, y_dtn,
-            frequency, mode_index, target_left, target_right,
+            frequency, mode_index, incidence, target_left, target_right,
             y_left, y_right, u_norm_val, weights,
         )
 
     losses, (pdes, bcs, datas) = jax.vmap(
-        _loss_single, in_axes=(0, 0, 0, 0, 0, 0, 0, 0)
+        _loss_single, in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0)
     )(
-        params_us_stacked, frequencies, mode_indices, targets_left,
+        params_us_stacked, frequencies, mode_indices, incidences, targets_left,
         targets_right, y_bnds_left, y_bnds_right, u_norms,
     )
     return jnp.mean(losses), (jnp.mean(pdes), jnp.mean(bcs), jnp.mean(datas), datas)
@@ -621,12 +671,12 @@ def package_scattered_loss_fn(
 @jax.jit
 def evaluate_inverse_loss(
     params_us_stacked, layers_ms, x_pde, y_pde, x_neumann,
-    y_dtn, frequencies, mode_indices, targets_left, targets_right,
+    y_dtn, frequencies, mode_indices, incidences, targets_left, targets_right,
     y_bnds_left, y_bnds_right, u_norms, weights,
 ):
     return package_scattered_loss_fn(
         params_us_stacked, layers_ms, x_pde, y_pde, x_neumann,
-        y_dtn, frequencies, mode_indices, targets_left, targets_right,
+        y_dtn, frequencies, mode_indices, incidences, targets_left, targets_right,
         y_bnds_left, y_bnds_right, u_norms, weights,
     )
 
@@ -640,7 +690,7 @@ def make_train_step_warmup(adam_opt_us):
     @functools.partial(jax.jit, static_argnames=("N",))
     def train_step_warmup(
         params_us_stacked, layers_ms, opt_state_us, key,
-        frequencies, mode_indices, targets_left, targets_right,
+        frequencies, mode_indices, incidences, targets_left, targets_right,
         y_bnds_left, y_bnds_right, u_norms, current_weights, N,
     ):
         x_pde, y_pde, x_neumann, y_dtn = sample_collocation_points(key, N)
@@ -648,7 +698,7 @@ def make_train_step_warmup(adam_opt_us):
         def loss_all_cases(p_us_stacked):
             return package_scattered_loss_fn(
                 p_us_stacked, layers_ms, x_pde, y_pde, x_neumann, y_dtn,
-                frequencies, mode_indices, targets_left, targets_right,
+                frequencies, mode_indices, incidences, targets_left, targets_right,
                 y_bnds_left, y_bnds_right, u_norms, current_weights,
             )
 
@@ -670,7 +720,7 @@ def make_train_step_inverse_package(adam_opt_us, adam_opt_ms, lbfgs_opt_packed):
     @functools.partial(jax.jit, static_argnames=("N", "use_lbfgs"))
     def train_step_inverse(
         params_us_stacked, layers_ms, opt_state_us, opt_state_ms,
-        opt_state_lbfgs, key, frequencies, mode_indices,
+        opt_state_lbfgs, key, frequencies, mode_indices, incidences,
         targets_left, targets_right, y_bnds_left, y_bnds_right,
         u_norms, current_weights, N, use_lbfgs=False,
     ):
@@ -679,7 +729,7 @@ def make_train_step_inverse_package(adam_opt_us, adam_opt_ms, lbfgs_opt_packed):
         def loss_all_cases(p_us_stacked, l_ms):
             return package_scattered_loss_fn(
                 p_us_stacked, l_ms, x_pde, y_pde, x_neumann, y_dtn,
-                frequencies, mode_indices, targets_left, targets_right,
+                frequencies, mode_indices, incidences, targets_left, targets_right,
                 y_bnds_left, y_bnds_right, u_norms, current_weights,
             )
 
@@ -727,25 +777,35 @@ def make_train_step_inverse_package(adam_opt_us, adam_opt_ms, lbfgs_opt_packed):
 # ==============================================================================
 
 def make_package_arrays(cases, mode_data):
-    frequencies = jnp.array([frequency for frequency, _ in cases], dtype=jnp.float32)
-    mode_indices = jnp.array([mode_index for _, mode_index in cases], dtype=jnp.int32)
+    frequencies = jnp.array([frequency for frequency, _, _ in cases], dtype=jnp.float32)
+    mode_indices = jnp.array([mode_index for _, mode_index, _ in cases], dtype=jnp.int32)
+    incidences = jnp.array([incidence for _, _, incidence in cases], dtype=jnp.int32)
     targets_left = jnp.stack(
-        [mode_data[mode_index]["U_left_norm"][frequency] for frequency, mode_index in cases]
+        [mode_data[case]["U_left_norm"] for case in cases]
     )
     targets_right = jnp.stack(
-        [mode_data[mode_index]["U_right_norm"][frequency] for frequency, mode_index in cases]
+        [mode_data[case]["U_right_norm"] for case in cases]
     )
     y_bnds_left = jnp.stack(
-        [mode_data[mode_index]["Y_left"][frequency] for frequency, mode_index in cases]
+        [mode_data[case]["Y_left"] for case in cases]
     )
     y_bnds_right = jnp.stack(
-        [mode_data[mode_index]["Y_right"][frequency] for frequency, mode_index in cases]
+        [mode_data[case]["Y_right"] for case in cases]
     )
     u_norms = jnp.array(
-        [mode_data[mode_index]["U_norm"][frequency] for frequency, mode_index in cases],
+        [mode_data[case]["U_norm"] for case in cases],
         dtype=jnp.float32,
     )
-    return frequencies, mode_indices, targets_left, targets_right, y_bnds_left, y_bnds_right, u_norms
+    return (
+        frequencies,
+        mode_indices,
+        incidences,
+        targets_left,
+        targets_right,
+        y_bnds_left,
+        y_bnds_right,
+        u_norms,
+    )
 
 
 def snapshot_steps(max_steps, ratios):
@@ -786,9 +846,9 @@ def save_celerity_plot(layers_ms, output_path, title, show=False):
 def format_sigma_scales(params_us_stacked, cases):
     sigma_values = jnp.asarray(jax.device_get(params_us_stacked["sigma"]))
     return " | ".join(
-        f"f{frequency_label(frequency)} M{mode_index} "
+        f"f{frequency_label(frequency)} M{mode_index} I{incidence} "
         f"sigma=({sigma[0]:.3g},{sigma[1]:.3g})"
-        for (frequency, mode_index), sigma in zip(cases, sigma_values)
+        for (frequency, mode_index, incidence), sigma in zip(cases, sigma_values)
     )
 
 
@@ -946,8 +1006,8 @@ def train(
         elif warmup_cases:
             warmup_label = package_label(package_index, warmup_cases)
             warmup_param_us_list = [
-                params_us[(frequency, mode_index)]
-                for frequency, mode_index in warmup_cases
+                params_us[case]
+                for case in warmup_cases
             ]
             warmup_params_us_stacked = jax.tree_util.tree_map(
                 lambda *values: jnp.stack(values, axis=0), *warmup_param_us_list
@@ -1000,7 +1060,10 @@ def train(
                         )
                         best_warmup_summary = {
                             "package": package_index + 1,
-                            "cases": [(float(f), int(m)) for f, m in warmup_cases],
+                            "cases": [
+                                (float(f), int(m), int(i))
+                                for f, m, i in warmup_cases
+                            ],
                             "optimizer": "adam",
                             "step": int(step),
                             "pde": float(pde_loss),
@@ -1033,7 +1096,7 @@ def train(
                 )
             best_validation_losses["warmup"].append(best_warmup_summary)
 
-        param_us_list = [params_us[(frequency, mode_index)] for frequency, mode_index in cases]
+        param_us_list = [params_us[case] for case in cases]
         params_us_stacked = jax.tree_util.tree_map(
             lambda *values: jnp.stack(values, axis=0), *param_us_list
         )
@@ -1113,7 +1176,10 @@ def train(
                         best_params_ms = jax.tree_util.tree_map(jnp.copy, layers_ms)
                         best_inverse_summary = {
                             "package": package_index + 1,
-                            "cases": [(float(f), int(m)) for f, m in cases],
+                            "cases": [
+                                (float(f), int(m), int(i))
+                                for f, m, i in cases
+                            ],
                             "optimizer": "adam",
                             "step": int(step),
                             "pde": float(pde_loss),
@@ -1181,7 +1247,10 @@ def train(
                             best_params_ms = jax.tree_util.tree_map(jnp.copy, layers_ms)
                             best_inverse_summary = {
                                 "package": package_index + 1,
-                                "cases": [(float(f), int(m)) for f, m in cases],
+                                "cases": [
+                                    (float(f), int(m), int(i))
+                                    for f, m, i in cases
+                                ],
                                 "optimizer": "lbfgs",
                                 "step": int(step),
                                 "pde": float(pde_loss),
@@ -1211,7 +1280,7 @@ def train(
         best_params_each_ms.append((package_index, cases, jax.tree_util.tree_map(jnp.copy, layers_ms)))
         best_validation_losses["inverse"].append(best_inverse_summary)
         loss_inverse_by_package.append({"label": label, "cases": cases, "history": inverse_history})
-        previously_trained_cases.update((float(f), int(m)) for f, m in cases)
+        previously_trained_cases.update((float(f), int(m), int(i)) for f, m, i in cases)
 
     return (
         params_us,
@@ -1278,107 +1347,99 @@ def main():
     print("Run config ID:", RUN_CONFIG.identifier)
     print("Run output root:", output_root)
 
-    left_path, right_path = boundary_data_paths(data_dir, defect_name, contrast_ratio)
+    left_path, right_path = boundary_data_paths(data_dir, defect_name)
     boundary_data = WaveguideBoundaryData(left_path, right_path)
 
     requested_cases = flatten_packages(training_packages)
     missing_pairs = [
-        (mode_index, frequency)
-        for frequency, mode_index in requested_cases
-        if not boundary_data.has_pair(mode_index, frequency)
+        (frequency, mode_index, incidence)
+        for frequency, mode_index, incidence in requested_cases
+        if not boundary_data.has_pair(mode_index, frequency, incidence)
     ]
     if missing_pairs:
         raise ValueError(
-            f"The combined FEM boundary files do not contain requested pairs: {missing_pairs}. "
-            f"Available pairs: {boundary_data.available_pairs}"
+            f"The combined FEM boundary files do not contain requested cases: {missing_pairs}. "
+            f"Available triplets: {boundary_data.available_triplets}"
         )
 
     mode_data = {}
-    used_modes = sorted({mode_index for _, mode_index in requested_cases})
-    for mode_index in used_modes:
-        mode_frequencies = sorted(
-            {frequency for frequency, candidate_mode in requested_cases if candidate_mode == mode_index}
+    for frequency, mode_index, incidence in sorted(set(requested_cases)):
+        pair = boundary_data.get_pair(mode_index, frequency, incidence)
+        if not jnp.isclose(pair.x_left, -L, rtol=0.0, atol=1e-6) or not jnp.isclose(
+            pair.x_right, L, rtol=0.0, atol=1e-6
+        ):
+            raise ValueError(
+                f"Boundary coordinates for mode {mode_index}, frequency {frequency}, "
+                f"incidence {incidence} are x_left={pair.x_left}, x_right={pair.x_right}; "
+                f"expected {-L} and {L}"
+            )
+
+        y_left = 2 * jnp.asarray(pair.y_left, dtype=jnp.float32) / H - 1
+        y_right = 2 * jnp.asarray(pair.y_right, dtype=jnp.float32) / H - 1
+
+        total_left = (
+            jnp.asarray(pair.u_re_left, dtype=jnp.float32)
+            + 1j * jnp.asarray(pair.u_im_left, dtype=jnp.float32)
         )
-        Y_left = {}
-        Y_right = {}
-        U_norm = {}
-        U_left_norm = {}
-        U_right_norm = {}
+        total_right = (
+            jnp.asarray(pair.u_re_right, dtype=jnp.float32)
+            + 1j * jnp.asarray(pair.u_im_right, dtype=jnp.float32)
+        )
+        scattered_left = total_left - incident_wave_complex(
+            -1.0, y_left, frequency, mode_index, incidence
+        )
+        scattered_right = total_right - incident_wave_complex(
+            1.0, y_right, frequency, mode_index, incidence
+        )
 
-        for frequency in mode_frequencies:
-            pair = boundary_data.get_pair(mode_index, frequency)
-            if not jnp.isclose(pair.x_left, -L, rtol=0.0, atol=1e-6) or not jnp.isclose(
-                pair.x_right, L, rtol=0.0, atol=1e-6
-            ):
-                raise ValueError(
-                    f"Boundary coordinates for mode {mode_index}, frequency {frequency} are "
-                    f"x_left={pair.x_left}, x_right={pair.x_right}; expected {-L} and {L}"
-                )
-
-            y_left = 2 * jnp.asarray(pair.y_left, dtype=jnp.float32) / H - 1
-            y_right = 2 * jnp.asarray(pair.y_right, dtype=jnp.float32) / H - 1
-            Y_left[frequency] = y_left
-            Y_right[frequency] = y_right
-
-            total_left = (
-                jnp.asarray(pair.u_re_left, dtype=jnp.float32)
-                + 1j * jnp.asarray(pair.u_im_left, dtype=jnp.float32)
-            )
-            total_right = (
-                jnp.asarray(pair.u_re_right, dtype=jnp.float32)
-                + 1j * jnp.asarray(pair.u_im_right, dtype=jnp.float32)
-            )
-            scattered_left = total_left - incident_wave_complex(
-                -1.0, y_left, frequency, mode_index
-            )
-            scattered_right = total_right - incident_wave_complex(
-                1.0, y_right, frequency, mode_index
-            )
-
-            norm = jnp.sqrt(
-                jnp.max(
-                    jnp.concatenate(
-                        (jnp.abs(scattered_left) ** 2, jnp.abs(scattered_right) ** 2)
-                    )
+        norm = jnp.sqrt(
+            jnp.max(
+                jnp.concatenate(
+                    (jnp.abs(scattered_left) ** 2, jnp.abs(scattered_right) ** 2)
                 )
             )
-            if not jnp.isfinite(float(norm)) or float(norm) <= 0.0:
-                raise ValueError(
-                    f"Invalid zero or non-finite scattered-field norm for mode {mode_index}, "
-                    f"frequency {frequency}"
-                )
+        )
+        if not jnp.isfinite(float(norm)) or float(norm) <= 0.0:
+            raise ValueError(
+                "Invalid zero or non-finite scattered-field norm for "
+                f"mode {mode_index}, frequency {frequency}, incidence {incidence}"
+            )
 
-            U_norm[frequency] = norm
-            U_left_norm[frequency] = jnp.stack(
+        case_key = (float(frequency), int(mode_index), int(incidence))
+        mode_data[case_key] = {
+            "Y_left": y_left,
+            "Y_right": y_right,
+            "U_left_norm": jnp.stack(
                 [jnp.real(scattered_left) / norm, jnp.imag(scattered_left) / norm],
                 axis=1,
-            )
-            U_right_norm[frequency] = jnp.stack(
+            ),
+            "U_right_norm": jnp.stack(
                 [jnp.real(scattered_right) / norm, jnp.imag(scattered_right) / norm],
                 axis=1,
-            )
-
-        mode_data[mode_index] = {
-            "Y_left": Y_left,
-            "Y_right": Y_right,
-            "U_left_norm": U_left_norm,
-            "U_right_norm": U_right_norm,
-            "U_norm": U_norm,
+            ),
+            "U_norm": norm,
         }
+
+    used_modes = sorted({mode_index for _, mode_index, _ in requested_cases})
+    used_incidences = sorted({incidence for _, _, incidence in requested_cases})
+    for mode_index in used_modes:
+        mode_cases = [
+            case for case in sorted(mode_data)
+            if case[1] == mode_index
+        ]
         print(
-            f"  Mode {mode_index}: {len(mode_frequencies)} frequencies loaded "
-            f"({mode_frequencies[0]:.0f}-{mode_frequencies[-1]:.0f} Hz)"
+            f"  Mode {mode_index}: {len(mode_cases)} frequency/incidence cases loaded"
         )
 
     for package_index, package in enumerate(training_packages):
         cases = flatten_package(package)
         left_counts = {
-            mode_data[mode_index]["Y_left"][frequency].shape[0]
-            for frequency, mode_index in cases
+            mode_data[case]["Y_left"].shape[0]
+            for case in cases
         }
         right_counts = {
-            mode_data[mode_index]["Y_right"][frequency].shape[0]
-            for frequency, mode_index in cases
+            mode_data[case]["Y_right"].shape[0]
+            for case in cases
         }
         if len(left_counts) != 1 or len(right_counts) != 1:
             raise ValueError(
@@ -1393,9 +1454,9 @@ def main():
     layers_ms[-1]["W"] = layers_ms[-1]["W"] / 10.0
 
     params_us = {}
-    for frequency, mode_index in sorted(set(requested_cases)):
+    for frequency, mode_index, incidence in sorted(set(requested_cases)):
         key, subkey_us = jax.random.split(key)
-        params_us[(frequency, mode_index)] = init_layers_us(
+        params_us[(frequency, mode_index, incidence)] = init_layers_us(
             subkey_us, n_layers_us, frequency, mode_index
         )
 
@@ -1410,13 +1471,18 @@ def main():
         switch_threshold, switch_window, subkey,
     )
 
-    all_used_modes = sorted({mode_index for _, mode_index in requested_cases})
+    all_used_modes = sorted({mode_index for _, mode_index, _ in requested_cases})
+    all_used_incidences = sorted({incidence for _, _, incidence in requested_cases})
     modes_str = "_".join(str(mode_index) for mode_index in all_used_modes)
     freqs_str = "_".join(frequency_label(frequency) for frequency in all_training_frequencies)
+    incidences_str = "_".join(incidence_label(incidence) for incidence in all_used_incidences)
 
     checkpoint_path = (
         checkpoint_dir
-        / f"scattered_checkpoint_{defect_name}_{data_ratio_label}_modes{modes_str}_freqs{freqs_str}.npz"
+        / (
+            f"scattered_checkpoint_{defect_name}_inc{incidences_str}"
+            f"_modes{modes_str}_freqs{freqs_str}.npz"
+        )
     )
     save_us_checkpoint(
         checkpoint_path,
@@ -1441,8 +1507,6 @@ def main():
         random_seed=random_seed,
         metadata={
             "defect_name": defect_name,
-            "contrast_ratio": contrast_ratio,
-            "ratio_label": data_ratio_label,
             "field_formulation": "u_total = u0 + us",
             "residual": "Delta us + omega^2*((m0+ms)*us + ms*u0)",
             "us_normalization": "boundary scattered field max norm after subtracting incident",
@@ -1451,7 +1515,13 @@ def main():
             "warmup_weights": [float(value) for value in weights_warmup],
             "inverse_weight_schedule": "physics_fixed_data_ramp",
             "training_packages": [
-                {str(frequency): list(modes) for frequency, modes in package.items()}
+                {
+                    str(incidence): {
+                        str(frequency): list(modes)
+                        for frequency, modes in frequency_map.items()
+                    }
+                    for incidence, frequency_map in package.items()
+                }
                 for package in training_packages
             ],
             "run_config_id": RUN_CONFIG.identifier,

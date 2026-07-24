@@ -27,14 +27,13 @@ from tools.uv_checkpoint import collect_u_norms, save_uv_checkpoint
 _DEFAULT_RUN_CONFIG = {
     "formulation": "total",
     "height": 0.6,
-    "half_length": 2.0,
+    "half_length": 1.0,
     "c0": 340.0,
     "contrast_max": 0.4,
     "celerity_upper_factor": 1.01,
     "data_dir": "FEM/pinn_data",
-    "defect_name": "circlebottomleftlarge",
-    "contrast_ratio": 0.8,
-    "active_modes_per_frequency": {"1200": [0, 1, 2, 3, 4]},
+    "defect_name": "circlebottomright",
+    "training_packages": [{"-1": {"1200": [0]}}],
     "random_seed": 0,
     "fourier_features": 64,
     "field_hidden_layers": [128, 128, 64],
@@ -58,11 +57,11 @@ _DEFAULT_RUN_CONFIG = {
     "n_validation": [4096, 256, 128],
     "eval_interval": 200,
     "switch_threshold": 0.0,
-    "switch_window": 10,
-    "max_steps_adam_forward": 40001,
-    "max_steps_lbfgs_forward": 3001,
-    "max_steps_adam_inverse": 100001,
-    "max_steps_lbfgs_inverse": 3001,
+    "switch_window": 0,
+    "max_steps_adam_forward": 50001,
+    "max_steps_lbfgs_forward": 0,
+    "max_steps_adam_inverse": 0,
+    "max_steps_lbfgs_inverse": 0,
     "weights_forward": [1.0, 10.0, 0.0],
     "weights_inverse": [1.0, 1.0, 10.0],
     "show_plots": True,
@@ -94,16 +93,98 @@ m_max = 1 / cmin**2
 script_dir = os.path.dirname(os.path.abspath(__file__))
 data_dir = str(RUN_CONFIG.resolve_path(REPOSITORY_ROOT, "data_dir"))
 defect_name = str(_config["defect_name"])
-contrast_ratio = float(_config["contrast_ratio"])
+VALID_INCIDENCES = {-1, 1}
 
-# Frequencies to run training on (curriculum learning: low to high)
-active_modes_per_freq = {
-    float(frequency): [int(mode) for mode in modes]
-    for frequency, modes in _config["active_modes_per_frequency"].items()
-}
-training_frequencies = np.asarray(sorted(active_modes_per_freq), dtype=np.float64)
-if training_frequencies.size == 0 or any(not modes for modes in active_modes_per_freq.values()):
-    raise ValueError("active_modes_per_frequency must define at least one mode")
+
+def parse_incidence(value):
+    try:
+        incidence = int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("training_packages incidence keys must be -1 or 1") from error
+    if incidence not in VALID_INCIDENCES:
+        raise ValueError("training_packages incidence keys must be -1 or 1")
+    return incidence
+
+
+def parse_training_package(package):
+    if not isinstance(package, dict) or not package:
+        raise ValueError("Each training package must be a non-empty incidence mapping")
+    parsed = {}
+    for incidence_key, frequency_map in package.items():
+        incidence = parse_incidence(incidence_key)
+        if incidence in parsed:
+            raise ValueError(f"Duplicate incidence {incidence} in one training package")
+        if not isinstance(frequency_map, dict) or not frequency_map:
+            raise ValueError(
+                f"training_packages[{incidence}] must define at least one frequency"
+            )
+        parsed[incidence] = {}
+        for frequency_key, modes in frequency_map.items():
+            frequency = float(frequency_key)
+            if not np.isfinite(frequency) or frequency <= 0.0:
+                raise ValueError("Training frequencies must be finite and positive")
+            mode_values = [int(mode) for mode in modes]
+            if not mode_values or min(mode_values) < 0:
+                raise ValueError("Training mode lists must be non-empty and non-negative")
+            if len(set(mode_values)) != len(mode_values):
+                raise ValueError(
+                    f"Duplicate modes for frequency {frequency}, incidence {incidence}"
+                )
+            parsed[incidence][frequency] = mode_values
+    return parsed
+
+
+def flatten_package(package):
+    """Return sorted (frequency, mode, incidence) cases from one package."""
+    cases = []
+    for incidence, frequency_map in package.items():
+        for frequency, modes in frequency_map.items():
+            for mode_index in modes:
+                cases.append((float(frequency), int(mode_index), int(incidence)))
+    return sorted(cases, key=lambda item: (item[0], item[1], item[2]))
+
+
+def flatten_packages(packages):
+    cases = []
+    for package in packages:
+        cases.extend(flatten_package(package))
+    return cases
+
+
+def frequency_label(frequency):
+    return f"{float(frequency):g}".replace(".", "p")
+
+
+def incidence_label(incidence):
+    return "m1" if int(incidence) == -1 else "p1"
+
+
+def package_label(package_index, cases):
+    by_incidence_frequency = {}
+    for frequency, mode_index, incidence in cases:
+        by_incidence_frequency.setdefault(int(incidence), {}).setdefault(
+            float(frequency), []
+        ).append(int(mode_index))
+    tokens = []
+    for incidence in sorted(by_incidence_frequency):
+        for frequency in sorted(by_incidence_frequency[incidence]):
+            modes = "_".join(
+                str(mode_index)
+                for mode_index in sorted(by_incidence_frequency[incidence][frequency])
+            )
+            tokens.append(
+                f"i{incidence_label(incidence)}_f{frequency_label(frequency)}_m{modes}"
+            )
+    return f"pkg{package_index + 1:02d}_" + "__".join(tokens)
+
+training_packages = [
+    parse_training_package(package)
+    for package in _config["training_packages"]
+]
+all_requested_cases = flatten_packages(training_packages)
+if not all_requested_cases:
+    raise ValueError("training_packages must define at least one case")
+all_training_frequencies = sorted({frequency for frequency, _, _ in all_requested_cases})
 
 # --- Random Seed ---
 random_seed = int(_config["random_seed"])
@@ -190,9 +271,8 @@ if weights_phase1.shape != (3,) or weights_phase2_final.shape != (3,):
 # SECTION 2: DATA DISCOVERY
 # ==============================================================================
 
-def boundary_data_paths(data_dir, defect_name, contrast_ratio):
-    ratio_label = format_ratio_label(contrast_ratio)
-    suffix = f'{defect_name}_{ratio_label}.csv'
+def boundary_data_paths(data_dir, defect_name):
+    suffix = f'{defect_name}.csv'
     left_path = os.path.join(data_dir, f'pinn_boundary_left_{suffix}')
     right_path = os.path.join(data_dir, f'pinn_boundary_right_{suffix}')
     missing = [path for path in (left_path, right_path) if not os.path.isfile(path)]
@@ -211,7 +291,7 @@ key, subkey = jax.random.split(key)
 B_base = jax.random.normal(subkey, (m_fourier_features, 2))
 
 # Calculate dynamic boundary modes configuration using max training frequency
-fmax = float(max(training_frequencies))
+fmax = float(max(all_training_frequencies))
 N_modes = int(np.round(2 * H * fmax / c0)) + 5
 
 # --- Gauss-Legendre Quadrature Setup ---
@@ -224,6 +304,11 @@ n_modes = jnp.arange(N_modes, dtype=jnp.float32)
 a_n = jnp.sqrt(2.0 / H) * jnp.ones(N_modes, dtype=jnp.float32)
 a_n = a_n.at[0].set(jnp.sqrt(1.0 / H))
 C_quad = a_n[:, None] * jnp.cos(n_modes[:, None] * jnp.pi * y_quad[None, :] / H)
+
+
+def beta_for_frequency(frequency):
+    k0 = 2 * jnp.pi * frequency / c0
+    return jnp.sqrt(k0**2 - (n_modes * jnp.pi / H) ** 2 + 0j)
 
 # ==============================================================================
 # SECTION 4: NEURAL NETWORK UTILITIES
@@ -433,9 +518,10 @@ def uv_value_and_physical_laplacian(params_uv, x, y):
 
 
 def loss_fn(params_uv, layers_m, x_pde, y_pde, x_neumann, y_dtn,
-            f, mode_index, target_u_left, target_u_right, y_bnd_left,
-            y_bnd_right, u_norm_val, weights, beta_n,
+            f, mode_index, incidence, target_u_left, target_u_right, y_bnd_left,
+            y_bnd_right, u_norm_val, weights,
             is_warmup=False, use_healthy_guide=False):
+    beta_n = beta_for_frequency(f)
     
     def uv(x, y):
         return uv_apply(params_uv, x, y)
@@ -467,15 +553,23 @@ def loss_fn(params_uv, layers_m, x_pde, y_pde, x_neumann, y_dtn,
         )
         return laplacian_uv + k2(x, y) * uv_value
     
-    def compute_dtn_loss(x_bnd, y_eval, sign, A_inc=None):
+    def compute_dtn_loss(x_bnd, y_eval, sign):
         uv_quad = jax.vmap(uv, in_axes=(None, 0))(x_bnd, y_gauss_legendre)
         U_quad_complex = uv_quad[:, 0] + 1j * uv_quad[:, 1]
         
         u_n = C_quad @ (w_quad * U_quad_complex)
         
         dtn_n = sign * 1j * beta_n * u_n
-        if A_inc is not None:
-            dtn_n = dtn_n + 2j * beta_n * A_inc
+        A_inc = jnp.zeros(N_modes, dtype=jnp.complex64)
+        x_phys_boundary = x_bnd * L
+        amplitude_incidente = (
+            jnp.exp(-1j * incidence * beta_n[mode_index] * x_phys_boundary)
+            / u_norm_val
+        )
+        A_inc = A_inc.at[mode_index].set(amplitude_incidente)
+        source_modes = -incidence * 2j * beta_n * A_inc
+        incoming_boundary = jnp.asarray(int(x_bnd), dtype=jnp.int32) == incidence
+        dtn_n = dtn_n + jnp.where(incoming_boundary, source_modes, 0.0)
         
         def DtN_eval(y_val):
             C_y = a_n * jnp.cos(n_modes * jnp.pi * (y_val + 1.0) / 2.0)
@@ -488,20 +582,13 @@ def loss_fn(params_uv, layers_m, x_pde, y_pde, x_neumann, y_dtn,
         
         return jnp.mean(jnp.abs(dtn_actual_complex - dtn_pred_complex)**2)
 
-    # Incident field: mode `mode_index` propagating from the left to the right
-    A_inc_left = jnp.zeros(N_modes, dtype=jnp.complex64)
-    amplitude_incidente = jnp.exp(-1j * beta_n[mode_index] * L) / u_norm_val
-    A_inc_left = A_inc_left.at[mode_index].set(amplitude_incidente)
-    
     # PDE Residual Loss
     vmap_pde_residual = jax.vmap(pde_residual, in_axes=(0, 0))
     pde_loss = jnp.mean(vmap_pde_residual(x_pde, y_pde)**2)
     
     # Boundary Conditions Loss
-    dtn_loss_left = compute_dtn_loss(
-        -1.0, y_dtn, sign=-1, A_inc=A_inc_left)
-    dtn_loss_right = compute_dtn_loss(
-        1.0, y_dtn, sign=1, A_inc=None)
+    dtn_loss_left = compute_dtn_loss(-1.0, y_dtn, sign=-1)
+    dtn_loss_right = compute_dtn_loss(1.0, y_dtn, sign=1)
     neum_loss = jnp.mean(
         jax.vmap(uv_y, in_axes=(0, None))(x_neumann, 1.0)**2
         + jax.vmap(uv_y, in_axes=(0, None))(x_neumann, -1.0)**2
@@ -522,20 +609,20 @@ def loss_fn(params_uv, layers_m, x_pde, y_pde, x_neumann, y_dtn,
 
 
 def multimode_loss_fn(params_uv_stacked, layers_m, x_pde, y_pde,
-                      x_neumann, y_dtn, f_val, mode_indices, targets_left,
-                      targets_right, y_bnds_left, y_bnds_right, u_norms,
-                      weights, beta_n):
+                      x_neumann, y_dtn, frequencies, mode_indices, incidences,
+                      targets_left, targets_right, y_bnds_left, y_bnds_right,
+                      u_norms, weights):
     """Evaluate the mean weighted loss over all active incident modes."""
-    def _loss_single(p_uv, mi, tl, tr, yl, yr, un):
+    def _loss_single(p_uv, frequency, mi, incidence, tl, tr, yl, yr, un):
         return loss_fn(
-            p_uv, layers_m, x_pde, y_pde, x_neumann, y_dtn, f_val, mi,
-            tl, tr, yl, yr, un, weights, beta_n,
+            p_uv, layers_m, x_pde, y_pde, x_neumann, y_dtn,
+            frequency, mi, incidence, tl, tr, yl, yr, un, weights,
             is_warmup=False, use_healthy_guide=False,
         )
 
-    vmapped = jax.vmap(_loss_single, in_axes=(0, 0, 0, 0, 0, 0, 0))
+    vmapped = jax.vmap(_loss_single, in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0))
     losses, (pdes, bcs, datas) = vmapped(
-        params_uv_stacked, mode_indices,
+        params_uv_stacked, frequencies, mode_indices, incidences,
         targets_left, targets_right,
         y_bnds_left, y_bnds_right,
         u_norms,
@@ -545,30 +632,31 @@ def multimode_loss_fn(params_uv_stacked, layers_m, x_pde, y_pde,
 
 @functools.partial(jax.jit, static_argnames=('use_healthy_guide',))
 def evaluate_forward_loss(params_uv, layers_m, x_pde, y_pde, x_neumann,
-                          y_dtn, f_val, mode_index, target_left, target_right,
-                          y_bnd_left, y_bnd_right, u_norm, weights, beta_n,
+                          y_dtn, f_val, mode_index, incidence,
+                          target_left, target_right, y_bnd_left, y_bnd_right,
+                          u_norm, weights,
                           use_healthy_guide):
     """Evaluate phase 1 parameters without applying an optimizer update."""
     return loss_fn(
         params_uv, layers_m, x_pde, y_pde, x_neumann, y_dtn,
-        f_val, mode_index,
+        f_val, mode_index, incidence,
         target_left, target_right, y_bnd_left, y_bnd_right,
-        u_norm, weights, beta_n,
+        u_norm, weights,
         is_warmup=True, use_healthy_guide=use_healthy_guide,
     )
 
 
 @jax.jit
 def evaluate_inverse_loss(params_uv_stacked, layers_m, x_pde, y_pde,
-                          x_neumann, y_dtn, f_val, mode_indices, targets_left,
-                          targets_right, y_bnds_left, y_bnds_right, u_norms,
-                          weights, beta_n):
+                          x_neumann, y_dtn, frequencies, mode_indices, incidences,
+                          targets_left, targets_right, y_bnds_left, y_bnds_right,
+                          u_norms, weights):
     """Evaluate phase 2 parameters without applying an optimizer update."""
     return multimode_loss_fn(
         params_uv_stacked, layers_m, x_pde, y_pde, x_neumann, y_dtn,
-        f_val, mode_indices,
+        frequencies, mode_indices, incidences,
         targets_left, targets_right, y_bnds_left, y_bnds_right,
-        u_norms, weights, beta_n,
+        u_norms, weights,
     )
 
 # ==============================================================================
@@ -580,8 +668,8 @@ def make_train_step_forward(adam_opt, lbfgs_opt):
 
     @functools.partial(jax.jit, static_argnames=('N', 'use_lbfgs', 'use_healthy_guide'))
     def train_step_forward(params_uv, layers_m, opt_state_uv, key, f_val, mode_index,
-                           target_left, target_right, y_bnd_left, y_bnd_right, u_norm,
-                           current_weights, beta_n,
+                           incidence, target_left, target_right, y_bnd_left,
+                           y_bnd_right, u_norm, current_weights,
                            N, use_lbfgs=False, use_healthy_guide=True):
         x_pde, y_pde, x_neumann, y_dtn = sample_collocation_points(key, N)
 
@@ -589,10 +677,9 @@ def make_train_step_forward(adam_opt, lbfgs_opt):
             return loss_fn(
                 p_uv, layers_m,
                 x_pde, y_pde, x_neumann, y_dtn,
-                f_val, mode_index,
+                f_val, mode_index, incidence,
                 target_left, target_right,
                 y_bnd_left, y_bnd_right, u_norm, current_weights,
-                beta_n,
                 is_warmup=True, use_healthy_guide=use_healthy_guide,
             )
 
@@ -619,11 +706,10 @@ def make_train_step_inverse_multimode(adam_opt_uv, adam_opt_m, lbfgs_opt_packed)
 
     @functools.partial(jax.jit, static_argnames=('N', 'use_lbfgs'))
     def train_step_inverse(params_uv_stacked, layers_m, opt_state_uv, opt_state_m,
-                           opt_state_lbfgs, key, f_val, mode_indices,
+                           opt_state_lbfgs, key, frequencies, mode_indices, incidences,
                            targets_left, targets_right,
                            y_bnds_left, y_bnds_right, u_norms,
-                           current_weights, beta_n,
-                           N, use_lbfgs=False):
+                           current_weights, N, use_lbfgs=False):
 
         x_pde, y_pde, x_neumann, y_dtn = sample_collocation_points(key, N)
         
@@ -631,9 +717,9 @@ def make_train_step_inverse_multimode(adam_opt_uv, adam_opt_m, lbfgs_opt_packed)
             return multimode_loss_fn(
                 p_uv_stacked, l_m,
                 x_pde, y_pde, x_neumann, y_dtn,
-                f_val, mode_indices,
+                frequencies, mode_indices, incidences,
                 targets_left, targets_right, y_bnds_left, y_bnds_right,
-                u_norms, current_weights, beta_n,
+                u_norms, current_weights,
             )
 
         (loss, aux), (grads_uv, grads_m) = jax.value_and_grad(
@@ -669,45 +755,48 @@ def make_train_step_inverse_multimode(adam_opt_uv, adam_opt_m, lbfgs_opt_packed)
 # SECTION 9: MAIN TRAINING LOOP
 # ==============================================================================
 
+def make_package_arrays(cases, mode_data):
+    frequencies = jnp.asarray([frequency for frequency, _, _ in cases], dtype=jnp.float32)
+    mode_indices = jnp.asarray([mode_index for _, mode_index, _ in cases], dtype=jnp.int32)
+    incidences = jnp.asarray([incidence for _, _, incidence in cases], dtype=jnp.int32)
+    targets_left = jnp.stack([mode_data[case]['U_left_norm'] for case in cases])
+    targets_right = jnp.stack([mode_data[case]['U_right_norm'] for case in cases])
+    y_bnds_left = jnp.stack([mode_data[case]['Y_left'] for case in cases])
+    y_bnds_right = jnp.stack([mode_data[case]['Y_right'] for case in cases])
+    u_norms = jnp.asarray([mode_data[case]['U_norm'] for case in cases], dtype=jnp.float32)
+    return (
+        frequencies,
+        mode_indices,
+        incidences,
+        targets_left,
+        targets_right,
+        y_bnds_left,
+        y_bnds_right,
+        u_norms,
+    )
+
+
+def format_case(case):
+    frequency, mode_index, incidence = case
+    return f"f{frequency_label(frequency)} M{mode_index} I{incidence}"
+
+
 def train(params_uv, layers_m, N_adam, N_lbfgs,
           max_steps_adam_phase1, max_steps_lbfgs_phase1,
           max_steps_adam_phase2, max_steps_lbfgs_phase2,
-          freqs, active_modes_per_freq, mode_data, eval_interval,
+          packages, mode_data, eval_interval,
           switch_threshold, switch_window, key):
-    """
-    Main training loop with curriculum learning over frequencies.
-    
-    For each frequency:
-      - Dynamically select which modes to use (from active_modes_per_freq)
-      - Phase 1: Train each mode's u-network independently (forward problem)
-      - Phase 2: Train all active mode u-networks + shared m jointly (inverse)
-    
-    The m-network carries over between frequencies (curriculum learning).
-    """
+    """Train fullwave UV/M networks over incidence-aware training packages."""
 
-    # Collect all modes that appear in any frequency
-    all_used_modes = set()
-    for modes in active_modes_per_freq.values():
-        all_used_modes.update(modes)
-    
-    loss_forward = {mi: [] for mi in all_used_modes}
+    all_used_cases = sorted(set(flatten_packages(packages)))
+    loss_forward = {case: [] for case in all_used_cases}
     loss_inverse = []
     best_validation_losses = {'forward': [], 'inverse': []}
 
-    # This deterministic grid is used only for convergence checks and best-model
-    # selection. It is denser than, and therefore distinct from, the L-BFGS grid.
     validation_points = regular_collocation_points(N_validation)
-
-    best_params_uv = dict(params_uv)  # shallow copy of the dict
+    best_params_uv = dict(params_uv)
     best_params_each_m = []
 
-    # ------------------------------------------------------------------
-    # Create optimizers and JIT-compiled step functions ONCE to avoid
-    # recompilation at each mode/frequency.
-    # Only the optimizer STATE is re-initialized inside the loop.
-    # ------------------------------------------------------------------
-
-    # Phase 1 optimizer (u-network only, m frozen)
     template_param_uv = next(iter(params_uv.values()))
     param_labels_p1 = jax.tree_util.tree_map(lambda _: 'base', template_param_uv)
     if "sigma" in param_labels_p1:
@@ -739,10 +828,8 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
         transforms={'base': adam_base_p1, 'sigma': adam_sigma_p1},
         param_labels=param_labels_p1)
     lbfgs_uv_p1 = optax.lbfgs()
-
     step_forward = make_train_step_forward(adam_uv_p1, lbfgs_uv_p1)
 
-    # Phase 2 optimizers (u-networks + m jointly)
     cosine_uv_p2 = optax.schedules.cosine_decay_schedule(
         init_value=lr_uv,
         decay_steps=max(max_steps_adam_phase2, 1),
@@ -780,86 +867,76 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
     adam_uv_p2 = optax.multi_transform(
         transforms={'base': adam_base_p2, 'sigma': adam_sigma_p2},
         param_labels=param_labels_p2)
-
     adam_m_p2 = optax.chain(
         optax.clip_by_global_norm(gradient_clip_norm),
         optax.scale_by_adam(),
         optax.scale_by_schedule(cosine_m_p2),
         optax.scale(-1.0))
-    
     lbfgs_packed_p2 = optax.lbfgs()
-
     step_inverse = make_train_step_inverse_multimode(
         adam_uv_p2, adam_m_p2, lbfgs_packed_p2)
 
-    # ------------------------------------------------------------------
-    # Curriculum training loop over frequencies
-    # ------------------------------------------------------------------
-
-    for i, freq in enumerate(freqs):
-        freq = float(freq)
-        freq_modes = active_modes_per_freq[freq]
-        n_modes_used = len(freq_modes)
+    for package_index, package in enumerate(packages):
+        cases = flatten_package(package)
+        if not cases:
+            continue
+        label = package_label(package_index, cases)
+        use_healthy_guide_flag = package_index == 0
 
         print(f"\n{'='*60}")
-        print(f"--- f = {freq} Hz | active modes = {freq_modes} ({n_modes_used} modes) ---")
+        print(f"--- Package {package_index + 1}: {cases} ---")
         print(f"{'='*60}")
 
-        k0 = jnp.float32(2 * jnp.pi * freq / c0)
-        beta_n = jnp.sqrt(k0**2 - (n_modes * jnp.pi / H)**2 + 0j)
-
-        use_healthy_guide_flag = (i == 0)
-
-        # ============================================================
-        # PHASE 1: Forward (train each mode's u-network independently)
-        # ============================================================
-
-        for mode_idx in freq_modes:
-            fm_key = (freq, mode_idx)
-            param_uv = params_uv[fm_key]
-            best_params_uv[fm_key] = param_uv
+        for case in cases:
+            freq, mode_idx, incidence = case
+            param_uv = params_uv[case]
+            best_params_uv[case] = param_uv
             best_loss = float('inf')
             best_forward_summary = None
-
-            print(f"\n--- Phase 1: Mode {mode_idx} | Adam (max {max_steps_adam_phase1} steps) ---")
-
-            # Re-initialize optimizer state (resets cosine schedule counter)
-            opt_state_uv = adam_uv_p1.init(param_uv)
-
-            md = mode_data[mode_idx]
+            md = mode_data[case]
             loss_history_p1 = []
             switched_to_lbfgs = False
+
+            print(
+                f"\n--- Phase 1: {format_case(case)} | "
+                f"Adam (max {max_steps_adam_phase1} steps) ---"
+            )
+            opt_state_uv = adam_uv_p1.init(param_uv)
 
             for step in range(max_steps_adam_phase1):
                 key, subkey = jax.random.split(key)
                 param_uv, opt_state_uv, _, _ = step_forward(
                     param_uv, layers_m, opt_state_uv, subkey, freq, mode_idx,
-                    md['U_left_norm'][freq], md['U_right_norm'][freq],
-                    md['Y_left'][freq], md['Y_right'][freq], md['U_norm'][freq], weights_phase1,
-                    beta_n,
-                    N=N_adam, use_lbfgs=False, use_healthy_guide=use_healthy_guide_flag)
+                    incidence, md['U_left_norm'], md['U_right_norm'],
+                    md['Y_left'], md['Y_right'], md['U_norm'], weights_phase1,
+                    N=N_adam, use_lbfgs=False,
+                    use_healthy_guide=use_healthy_guide_flag)
 
                 if step % eval_interval == 0:
                     loss, validation_aux = evaluate_forward_loss(
                         param_uv, layers_m, *validation_points,
-                        freq, mode_idx,
-                        md['U_left_norm'][freq], md['U_right_norm'][freq],
-                        md['Y_left'][freq], md['Y_right'][freq], md['U_norm'][freq],
-                        weights_phase1, beta_n, use_healthy_guide_flag,
+                        freq, mode_idx, incidence,
+                        md['U_left_norm'], md['U_right_norm'],
+                        md['Y_left'], md['Y_right'], md['U_norm'],
+                        weights_phase1, use_healthy_guide_flag,
                     )
                     pde_loss, bc_loss, _ = validation_aux
                     loss_value = float(loss)
-                    loss_forward[mode_idx].append((pde_loss, bc_loss))
-                    print(f"[Adam M{mode_idx}] Step {step} | val pde {pde_loss:.2e} | val bc {bc_loss:.2e} | weighted val total {loss:.2e} | scales {param_uv['sigma']}")
-                    
+                    loss_forward[case].append((pde_loss, bc_loss))
+                    print(
+                        f"[Adam {format_case(case)}] Step {step} | "
+                        f"val pde {pde_loss:.2e} | val bc {bc_loss:.2e} | "
+                        f"weighted val total {loss:.2e} | scales {param_uv['sigma']}"
+                    )
                     loss_history_p1.append(loss_value)
-                    
+
                     if loss_value < best_loss:
                         best_loss = loss_value
-                        best_params_uv[fm_key] = param_uv
+                        best_params_uv[case] = param_uv
                         best_forward_summary = {
-                            'frequency': freq,
+                            'frequency': float(freq),
                             'mode': int(mode_idx),
+                            'incidence': int(incidence),
                             'optimizer': 'adam',
                             'step': int(step),
                             'pde': float(pde_loss),
@@ -869,43 +946,57 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
                             'weights': [float(value) for value in weights_phase1],
                         }
 
-                    if check_switch_criterion(loss_history_p1, window=switch_window, threshold=switch_threshold):
-                        print(f"[Adam M{mode_idx}] Convergence criterion met at step {step}. Switching to L-BFGS.")
+                    if check_switch_criterion(
+                        loss_history_p1,
+                        window=switch_window,
+                        threshold=switch_threshold,
+                    ):
+                        print(
+                            f"[Adam {format_case(case)}] Convergence criterion met "
+                            f"at step {step}. Switching to L-BFGS."
+                        )
                         switched_to_lbfgs = True
-                        param_uv = best_params_uv[fm_key]
+                        param_uv = best_params_uv[case]
                         break
 
-            # --- Phase 1: L-BFGS ---
             if switched_to_lbfgs or max_steps_lbfgs_phase1 > 0:
-                print(f"\n--- Phase 1: Mode {mode_idx} | L-BFGS (max {max_steps_lbfgs_phase1} steps) ---")
+                print(
+                    f"\n--- Phase 1: {format_case(case)} | "
+                    f"L-BFGS (max {max_steps_lbfgs_phase1} steps) ---"
+                )
                 opt_state_uv = lbfgs_uv_p1.init(param_uv)
 
                 for step in range(max_steps_lbfgs_phase1):
                     param_uv, opt_state_uv, _, _ = step_forward(
                         param_uv, layers_m, opt_state_uv, None, freq, mode_idx,
-                        md['U_left_norm'][freq], md['U_right_norm'][freq],
-                        md['Y_left'][freq], md['Y_right'][freq], md['U_norm'][freq], weights_phase1,
-                        beta_n,
-                        N=N_lbfgs, use_lbfgs=True, use_healthy_guide=use_healthy_guide_flag)
+                        incidence, md['U_left_norm'], md['U_right_norm'],
+                        md['Y_left'], md['Y_right'], md['U_norm'], weights_phase1,
+                        N=N_lbfgs, use_lbfgs=True,
+                        use_healthy_guide=use_healthy_guide_flag)
 
                     if step % eval_interval == 0:
                         loss, validation_aux = evaluate_forward_loss(
                             param_uv, layers_m, *validation_points,
-                            freq, mode_idx,
-                            md['U_left_norm'][freq], md['U_right_norm'][freq],
-                            md['Y_left'][freq], md['Y_right'][freq], md['U_norm'][freq],
-                            weights_phase1, beta_n, use_healthy_guide_flag,
+                            freq, mode_idx, incidence,
+                            md['U_left_norm'], md['U_right_norm'],
+                            md['Y_left'], md['Y_right'], md['U_norm'],
+                            weights_phase1, use_healthy_guide_flag,
                         )
                         pde_loss, bc_loss, _ = validation_aux
                         loss_value = float(loss)
-                        loss_forward[mode_idx].append((pde_loss, bc_loss))
-                        print(f"[LBFGS M{mode_idx}] Step {step} | val pde {pde_loss:.2e} | val bc {bc_loss:.2e} | weighted val total {loss:.2e} | scales {param_uv['sigma']}")
+                        loss_forward[case].append((pde_loss, bc_loss))
+                        print(
+                            f"[LBFGS {format_case(case)}] Step {step} | "
+                            f"val pde {pde_loss:.2e} | val bc {bc_loss:.2e} | "
+                            f"weighted val total {loss:.2e} | scales {param_uv['sigma']}"
+                        )
                         if loss_value < best_loss:
                             best_loss = loss_value
-                            best_params_uv[fm_key] = param_uv
+                            best_params_uv[case] = param_uv
                             best_forward_summary = {
-                                'frequency': freq,
+                                'frequency': float(freq),
                                 'mode': int(mode_idx),
+                                'incidence': int(incidence),
                                 'optimizer': 'lbfgs',
                                 'step': int(step),
                                 'pde': float(pde_loss),
@@ -915,45 +1006,29 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
                                 'weights': [float(value) for value in weights_phase1],
                             }
 
-            # Store the best u-params for this (freq, mode)
             if best_forward_summary is None:
-                raise RuntimeError(
-                    f'No finite validation loss for forward f={freq}, mode={mode_idx}'
-                )
-            params_uv[fm_key] = best_params_uv[fm_key]
+                raise RuntimeError(f'No finite validation loss for forward {case}')
+            params_uv[case] = best_params_uv[case]
             best_validation_losses['forward'].append(best_forward_summary)
-
-        # ============================================================
-        # PHASE 2: Inverse (all modes' u-networks + shared m jointly)
-        # ============================================================
 
         best_loss = float('inf')
         best_params_m = layers_m
         best_inverse_summary = None
-        
+
         if max_steps_adam_phase2 > 0 or max_steps_lbfgs_phase2 > 0:
-
-            print(f"\n--- Phase 2: Multi-mode inverse | Adam (max {max_steps_adam_phase2} steps) ---")
-
-            # Build u-params as a list and stack for vmap
-            param_uv_list = [params_uv[(freq, mi)] for mi in freq_modes]
-            params_uv_stacked = jax.tree_util.tree_map(lambda *args: jnp.stack(args, axis=0), *param_uv_list)
-
-            # Initialize best to current values (avoids NameError if first loss is NaN)
+            print(
+                f"\n--- Phase 2: Package inverse | Adam "
+                f"(max {max_steps_adam_phase2} steps) ---"
+            )
+            param_uv_list = [params_uv[case] for case in cases]
+            params_uv_stacked = jax.tree_util.tree_map(
+                lambda *args: jnp.stack(args, axis=0), *param_uv_list
+            )
             best_params_uv_stacked = jax.tree_util.tree_map(jnp.copy, params_uv_stacked)
-
-            # Re-initialize optimizer states (resets schedule counters)
             opt_state_uv = adam_uv_p2.init(params_uv_stacked)
             opt_state_m = adam_m_p2.init(layers_m)
             opt_state_lbfgs = None
-
-            # Prepare data arrays as stacked tensors (batch dimension for modes)
-            mode_indices_arr = jnp.array([mi for mi in freq_modes], dtype=jnp.int32)
-            targets_left = jnp.stack([mode_data[mi]['U_left_norm'][freq] for mi in freq_modes])
-            targets_right = jnp.stack([mode_data[mi]['U_right_norm'][freq] for mi in freq_modes])
-            y_bnds_left = jnp.stack([mode_data[mi]['Y_left'][freq] for mi in freq_modes])
-            y_bnds_right = jnp.stack([mode_data[mi]['Y_right'][freq] for mi in freq_modes])
-            u_norms = jnp.array([mode_data[mi]['U_norm'][freq] for mi in freq_modes])
+            package_arrays = make_package_arrays(cases, mode_data)
 
             data_weight_schedule = optax.linear_schedule(
                 init_value=schedule["inverse_data_initial_weight"],
@@ -976,40 +1051,47 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
                 )
 
                 key, subkey = jax.random.split(key)
-                params_uv_stacked, layers_m, opt_state_uv, opt_state_m, opt_state_lbfgs, _, _ = step_inverse(
-                    params_uv_stacked, layers_m, opt_state_uv, opt_state_m, opt_state_lbfgs,
-                    subkey, freq, mode_indices_arr,
-                    targets_left, targets_right, y_bnds_left, y_bnds_right, u_norms,
-                    weights_phase2, beta_n,
+                (
+                    params_uv_stacked, layers_m, opt_state_uv, opt_state_m,
+                    opt_state_lbfgs, _, _,
+                ) = step_inverse(
+                    params_uv_stacked, layers_m, opt_state_uv, opt_state_m,
+                    opt_state_lbfgs, subkey, *package_arrays, weights_phase2,
                     N=N_adam, use_lbfgs=False)
 
                 if step % eval_interval == 0:
                     loss, validation_aux = evaluate_inverse_loss(
                         params_uv_stacked, layers_m, *validation_points,
-                        freq, mode_indices_arr,
-                        targets_left, targets_right, y_bnds_left, y_bnds_right,
-                        u_norms, weights_phase2_final, beta_n,
+                        *package_arrays, weights_phase2_final,
                     )
                     pde_loss, bc_loss, data_loss = validation_aux
                     loss_value = float(loss)
                     loss_inverse.append((pde_loss, bc_loss, data_loss))
-                    # Quick unstack of sigma for printing
                     sigmas = []
-                    for idx, mi in enumerate(freq_modes):
-                        sigma_val = params_uv_stacked['sigma'][idx]
-                        sigmas.append(f"M{mi} σ={sigma_val}")
+                    for case_item, sigma_val in zip(cases, params_uv_stacked['sigma']):
+                        sigmas.append(f"{format_case(case_item)} sigma={sigma_val}")
                     sigmas_str = " | ".join(sigmas)
-                    print(f"[Adam] Step {step} | val pde {pde_loss:.2e} | val bc {bc_loss:.2e} | val data {data_loss:.2e} | weighted val total {loss:.2e} | train data weight {weights_phase2[2]:.2e} | {sigmas_str}")
-                    
+                    print(
+                        f"[Adam inverse] Step {step} | val pde {pde_loss:.2e} | "
+                        f"val bc {bc_loss:.2e} | val data {data_loss:.2e} | "
+                        f"weighted val total {loss:.2e} | "
+                        f"train data weight {weights_phase2[2]:.2e} | {sigmas_str}"
+                    )
                     loss_history_p2.append(loss_value)
-                    
+
                     if loss_value < best_loss:
                         best_loss = loss_value
-                        best_params_uv_stacked = jax.tree_util.tree_map(jnp.copy, params_uv_stacked)
-                        best_params_m = layers_m
+                        best_params_uv_stacked = jax.tree_util.tree_map(
+                            jnp.copy, params_uv_stacked
+                        )
+                        best_params_m = jax.tree_util.tree_map(jnp.copy, layers_m)
                         best_inverse_summary = {
-                            'frequency': freq,
-                            'modes': [int(mode) for mode in freq_modes],
+                            'package': package_index + 1,
+                            'label': label,
+                            'cases': [
+                                (float(f), int(m), int(i))
+                                for f, m, i in cases
+                            ],
                             'optimizer': 'adam',
                             'step': int(step),
                             'pde': float(pde_loss),
@@ -1019,44 +1101,64 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
                             'weights': [float(value) for value in weights_phase2_final],
                         }
 
-                    if check_switch_criterion(loss_history_p2, window=switch_window, threshold=switch_threshold):
-                        print(f"[Adam] Convergence criterion met at step {step}. Switching to L-BFGS.")
+                    if check_switch_criterion(
+                        loss_history_p2,
+                        window=switch_window,
+                        threshold=switch_threshold,
+                    ):
+                        print(
+                            f"[Adam inverse] Convergence criterion met at step {step}. "
+                            "Switching to L-BFGS."
+                        )
                         switched_to_lbfgs_p2 = True
                         params_uv_stacked = best_params_uv_stacked
                         layers_m = best_params_m
                         break
 
-            # --- Phase 2: L-BFGS ---
             if switched_to_lbfgs_p2 or max_steps_lbfgs_phase2 > 0:
-                print(f"\n--- Phase 2: Multi-mode inverse | L-BFGS (max {max_steps_lbfgs_phase2} steps) ---")
-                opt_state_lbfgs = lbfgs_packed_p2.init({'uv_list': params_uv_stacked, 'm': layers_m})
+                print(
+                    f"\n--- Phase 2: Package inverse | L-BFGS "
+                    f"(max {max_steps_lbfgs_phase2} steps) ---"
+                )
+                opt_state_lbfgs = lbfgs_packed_p2.init(
+                    {'uv_list': params_uv_stacked, 'm': layers_m}
+                )
 
                 for step in range(max_steps_lbfgs_phase2):
-                    params_uv_stacked, layers_m, opt_state_uv, opt_state_m, opt_state_lbfgs, _, _ = step_inverse(
-                        params_uv_stacked, layers_m, opt_state_uv, opt_state_m, opt_state_lbfgs,
-                        None, freq, mode_indices_arr,
-                        targets_left, targets_right, y_bnds_left, y_bnds_right, u_norms,
-                        weights_phase2_final, beta_n,
+                    (
+                        params_uv_stacked, layers_m, opt_state_uv, opt_state_m,
+                        opt_state_lbfgs, _, _,
+                    ) = step_inverse(
+                        params_uv_stacked, layers_m, opt_state_uv, opt_state_m,
+                        opt_state_lbfgs, None, *package_arrays, weights_phase2_final,
                         N=N_lbfgs, use_lbfgs=True)
 
                     if step % eval_interval == 0:
                         loss, validation_aux = evaluate_inverse_loss(
                             params_uv_stacked, layers_m, *validation_points,
-                            freq, mode_indices_arr,
-                            targets_left, targets_right, y_bnds_left, y_bnds_right,
-                            u_norms, weights_phase2_final, beta_n,
+                            *package_arrays, weights_phase2_final,
                         )
                         pde_loss, bc_loss, data_loss = validation_aux
                         loss_value = float(loss)
                         loss_inverse.append((pde_loss, bc_loss, data_loss))
-                        print(f"[LBFGS] Step {step} | val pde {pde_loss:.2e} | val bc {bc_loss:.2e} | val data {data_loss:.2e} | weighted val total {loss:.2e}")
+                        print(
+                            f"[LBFGS inverse] Step {step} | val pde {pde_loss:.2e} | "
+                            f"val bc {bc_loss:.2e} | val data {data_loss:.2e} | "
+                            f"weighted val total {loss:.2e}"
+                        )
                         if loss_value < best_loss:
                             best_loss = loss_value
-                            best_params_uv_stacked = jax.tree_util.tree_map(jnp.copy, params_uv_stacked)
-                            best_params_m = layers_m
+                            best_params_uv_stacked = jax.tree_util.tree_map(
+                                jnp.copy, params_uv_stacked
+                            )
+                            best_params_m = jax.tree_util.tree_map(jnp.copy, layers_m)
                             best_inverse_summary = {
-                                'frequency': freq,
-                                'modes': [int(mode) for mode in freq_modes],
+                                'package': package_index + 1,
+                                'label': label,
+                                'cases': [
+                                    (float(f), int(m), int(i))
+                                    for f, m, i in cases
+                                ],
                                 'optimizer': 'lbfgs',
                                 'step': int(step),
                                 'pde': float(pde_loss),
@@ -1066,16 +1168,18 @@ def train(params_uv, layers_m, N_adam, N_lbfgs,
                                 'weights': [float(value) for value in weights_phase2_final],
                             }
 
-            # Unstack and store the best parameters back into params_uv
             if best_inverse_summary is None:
                 raise RuntimeError(
-                    f'No finite validation loss for inverse f={freq}'
+                    f'No finite validation loss for inverse package {package_index + 1}'
                 )
-            for idx, mi in enumerate(freq_modes):
-                param_uv_i = jax.tree_util.tree_map(lambda x: x[idx], best_params_uv_stacked)
-                params_uv[(freq, mi)] = param_uv_i
+            for index, case in enumerate(cases):
+                params_uv[case] = jax.tree_util.tree_map(
+                    lambda value, idx=index: value[idx], best_params_uv_stacked
+                )
             layers_m = best_params_m
-            best_params_each_m.append(jax.tree_util.tree_map(jnp.copy, layers_m))
+            best_params_each_m.append(
+                (package_index, cases, jax.tree_util.tree_map(jnp.copy, layers_m))
+            )
             best_validation_losses['inverse'].append(best_inverse_summary)
 
     return (
@@ -1110,103 +1214,73 @@ def main():
     # Data Loading & Preprocessing
     # ==================================================================
     left_path, right_path = boundary_data_paths(
-        data_dir, defect_name, contrast_ratio
+        data_dir, defect_name
     )
     boundary_data = WaveguideBoundaryData(left_path, right_path)
 
-    requested_frequencies = [float(frequency) for frequency in training_frequencies]
-    missing_frequency_configs = [
-        frequency for frequency in requested_frequencies
-        if frequency not in active_modes_per_freq
+    requested_cases = sorted(set(flatten_packages(training_packages)))
+    missing_cases = [
+        case for case in requested_cases
+        if not boundary_data.has_pair(case[1], case[0], case[2])
     ]
-    if missing_frequency_configs:
+    if missing_cases:
         raise ValueError(
-            f'Missing active_modes_per_freq entries for {missing_frequency_configs}'
-        )
-
-    requested_pairs = [
-        (mode_idx, frequency)
-        for frequency in requested_frequencies
-        for mode_idx in active_modes_per_freq[frequency]
-    ]
-    missing_pairs = [
-        pair for pair in requested_pairs
-        if not boundary_data.has_pair(pair[0], pair[1])
-    ]
-    if missing_pairs:
-        raise ValueError(
-            f'The combined FEM boundary files do not contain requested pairs: {missing_pairs}. '
-            f'Available pairs: {boundary_data.available_pairs}'
+            f'The combined FEM boundary files do not contain requested cases: {missing_cases}. '
+            f'Available triplets: {boundary_data.available_triplets}'
         )
 
     mode_data = {}
-    used_modes = sorted({mode_idx for mode_idx, _ in requested_pairs})
+    for frequency, mode_idx, incidence in requested_cases:
+        pair = boundary_data.get_pair(mode_idx, frequency, incidence)
+        if not np.isclose(pair.x_left, -L, rtol=0.0, atol=1e-6) or not np.isclose(
+            pair.x_right, L, rtol=0.0, atol=1e-6
+        ):
+            raise ValueError(
+                f'Boundary coordinates for mode {mode_idx}, frequency {frequency}, '
+                f'incidence {incidence} are x_left={pair.x_left}, x_right={pair.x_right}; '
+                f'expected {-L} and {L}'
+            )
 
-    for mode_idx in used_modes:
-        mode_freqs = sorted({
-            frequency for candidate_mode, frequency in requested_pairs
-            if candidate_mode == mode_idx
-        })
-        Y_left = {}
-        Y_right = {}
-        U_norm = {}
-        U_left_norm = {}
-        U_right_norm = {}
+        y_left = 2 * jnp.asarray(pair.y_left, dtype=jnp.float32) / H - 1
+        y_right = 2 * jnp.asarray(pair.y_right, dtype=jnp.float32) / H - 1
+        re_l = jnp.asarray(pair.u_re_left, dtype=jnp.float32)
+        im_l = jnp.asarray(pair.u_im_left, dtype=jnp.float32)
+        re_r = jnp.asarray(pair.u_re_right, dtype=jnp.float32)
+        im_r = jnp.asarray(pair.u_im_right, dtype=jnp.float32)
 
-        for f in mode_freqs:
-            pair = boundary_data.get_pair(mode_idx, f)
-            if not np.isclose(pair.x_left, -L, rtol=0.0, atol=1e-6) or not np.isclose(
-                pair.x_right, L, rtol=0.0, atol=1e-6
-            ):
-                raise ValueError(
-                    f'Boundary coordinates for mode {mode_idx}, frequency {f} are '
-                    f'x_left={pair.x_left}, x_right={pair.x_right}; expected {-L} and {L}'
-                )
+        norm = jnp.sqrt(jnp.max(jnp.concatenate((
+            re_l**2 + im_l**2,
+            re_r**2 + im_r**2
+        ))))
+        if not np.isfinite(float(norm)) or float(norm) <= 0.0:
+            raise ValueError(
+                f'Invalid zero or non-finite field norm for mode {mode_idx}, '
+                f'frequency {frequency}, incidence {incidence}'
+            )
 
-            Y_left[f] = 2 * jnp.asarray(pair.y_left, dtype=jnp.float32) / H - 1
-            Y_right[f] = 2 * jnp.asarray(pair.y_right, dtype=jnp.float32) / H - 1
-            re_l = jnp.asarray(pair.u_re_left, dtype=jnp.float32)
-            im_l = jnp.asarray(pair.u_im_left, dtype=jnp.float32)
-            re_r = jnp.asarray(pair.u_re_right, dtype=jnp.float32)
-            im_r = jnp.asarray(pair.u_im_right, dtype=jnp.float32)
-
-            norm = jnp.sqrt(jnp.max(jnp.concatenate((
-                re_l**2 + im_l**2,
-                re_r**2 + im_r**2
-            ))))
-            if not np.isfinite(float(norm)) or float(norm) <= 0.0:
-                raise ValueError(
-                    f'Invalid zero or non-finite field norm for mode {mode_idx}, frequency {f}'
-                )
-            
-            U_norm[f] = norm
-            re_l /= norm
-            im_l /= norm
-            re_r /= norm
-            im_r /= norm
-            
-            U_left_norm[f] = jnp.stack([re_l, im_l], axis=1)
-            U_right_norm[f] = jnp.stack([re_r, im_r], axis=1)
-
-        mode_data[mode_idx] = {
-            'Y_left': Y_left,
-            'Y_right': Y_right,
-            'U_left_norm': U_left_norm,
-            'U_right_norm': U_right_norm,
-            'U_norm': U_norm,
+        mode_data[(float(frequency), int(mode_idx), int(incidence))] = {
+            'Y_left': y_left,
+            'Y_right': y_right,
+            'U_left_norm': jnp.stack([re_l / norm, im_l / norm], axis=1),
+            'U_right_norm': jnp.stack([re_r / norm, im_r / norm], axis=1),
+            'U_norm': norm,
         }
+
+    used_modes = sorted({mode_idx for _, mode_idx, _ in requested_cases})
+    for mode_idx in used_modes:
+        mode_cases = [case for case in requested_cases if case[1] == mode_idx]
         print(
-            f"  Mode {mode_idx}: {len(mode_freqs)} frequencies loaded "
-            f"({mode_freqs[0]:.0f}–{mode_freqs[-1]:.0f} Hz)"
+            f"  Mode {mode_idx}: {len(mode_cases)} frequency/incidence cases loaded"
         )
 
-    for frequency in requested_frequencies:
-        modes = active_modes_per_freq[frequency]
-        left_counts = {mode_data[mode]['Y_left'][frequency].shape[0] for mode in modes}
-        right_counts = {mode_data[mode]['Y_right'][frequency].shape[0] for mode in modes}
+    for package_index, package in enumerate(training_packages):
+        cases = flatten_package(package)
+        left_counts = {mode_data[case]['Y_left'].shape[0] for case in cases}
+        right_counts = {mode_data[case]['Y_right'].shape[0] for case in cases}
         if len(left_counts) != 1 or len(right_counts) != 1:
             raise ValueError(
-                f'All active modes at {frequency} Hz must use the same number of samples per side'
+                f'All cases in package {package_index + 1} must use the same number '
+                'of samples per side'
             )
 
     # ==================================================================
@@ -1222,12 +1296,13 @@ def main():
     )
     layers_m[-1]["W"] /= 10.0
 
-    # Wavefield networks: one per (frequency, mode)
+    # Wavefield networks: one per (frequency, mode, incidence)
     params_uv = {}
-    for freq, modes in active_modes_per_freq.items():
-        for mode_idx in modes:
-            key, subkey_f = jax.random.split(key)
-            params_uv[(freq, mode_idx)] = init_layers_uv(subkey_f, n_layers_uv, freq, mode_idx)
+    for freq, mode_idx, incidence in requested_cases:
+        key, subkey_f = jax.random.split(key)
+        params_uv[(freq, mode_idx, incidence)] = init_layers_uv(
+            subkey_f, n_layers_uv, freq, mode_idx
+        )
 
     # ==================================================================
     # Initial Sound Speed Plot
@@ -1266,7 +1341,7 @@ def main():
         params_uv, layers_m, N_adam, N_lbfgs,
         max_steps_adam_phase1, max_steps_lbfgs_phase1,
         max_steps_adam_phase2, max_steps_lbfgs_phase2,
-        training_frequencies, active_modes_per_freq, mode_data,
+        training_packages, mode_data,
         eval_interval, switch_threshold, switch_window, subkey
     )
 
@@ -1275,14 +1350,19 @@ def main():
     # ==================================================================
 
     # Precompute common strings for filenames (computed once)
-    all_used_modes = sorted(set(mi for modes in active_modes_per_freq.values() for mi in modes))
+    all_used_modes = sorted({mode_idx for _, mode_idx, _ in requested_cases})
+    all_used_incidences = sorted({incidence for _, _, incidence in requested_cases})
     modes_str = '_'.join(str(mi) for mi in all_used_modes)
-    freqs_str = '_'.join(str(int(f)) for f in training_frequencies)
+    freqs_str = '_'.join(frequency_label(frequency) for frequency in all_training_frequencies)
+    incidences_str = '_'.join(incidence_label(incidence) for incidence in all_used_incidences)
 
     # Save every UV network together with the Fourier basis and physical scaling.
     checkpoint_path = os.path.join(
         checkpoint_dir,
-        f'checkpoint_fullwave_{defect_name}_modes{modes_str}_freqs{freqs_str}.npz'
+        (
+            f'checkpoint_fullwave_{defect_name}_inc{incidences_str}'
+            f'_modes{modes_str}_freqs{freqs_str}.npz'
+        )
     )
     save_uv_checkpoint(
         checkpoint_path,
@@ -1307,11 +1387,16 @@ def main():
         random_seed=random_seed,
         metadata={
             'defect_name': defect_name,
-            'contrast_ratio': contrast_ratio,
-            'active_modes_per_freq': {
-                str(frequency): list(modes)
-                for frequency, modes in active_modes_per_freq.items()
-            },
+            'training_packages': [
+                {
+                    str(incidence): {
+                        str(frequency): list(modes)
+                        for frequency, modes in frequency_map.items()
+                    }
+                    for incidence, frequency_map in package.items()
+                }
+                for package in training_packages
+            ],
             'run_config_id': RUN_CONFIG.identifier,
             'run_config_source': (
                 str(RUN_CONFIG.source) if RUN_CONFIG.source is not None else None
@@ -1322,10 +1407,10 @@ def main():
     print(f'UV/M checkpoint saved to: {checkpoint_path}')
 
     # --- Plot Phase 1 (Forward) Training Losses per mode ---
-    for mode_idx in sorted(loss_forward.keys()):
-        if len(loss_forward[mode_idx]) == 0:
+    for case in sorted(loss_forward.keys()):
+        if len(loss_forward[case]) == 0:
             continue
-        loss_fwd_arr = np.array(loss_forward[mode_idx])
+        loss_fwd_arr = np.array(loss_forward[case])
         pde_losses = loss_fwd_arr[:, 0]
         bc_losses = loss_fwd_arr[:, 1]
         total_losses = weights_phase1[0] * pde_losses + weights_phase1[1] * bc_losses
@@ -1335,14 +1420,15 @@ def main():
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
         ax1.semilogy(x_axis, pde_losses, label="PDE Loss")
         ax1.semilogy(x_axis, bc_losses, label="BC Loss")
-        ax1.set_title(f"Phase 1 Mode {mode_idx}: Partial Loss")
+        case_title = format_case(case)
+        ax1.set_title(f"Phase 1 {case_title}: Partial Loss")
         ax1.set_xlabel("Steps")
         ax1.set_ylabel("Loss")
         ax1.legend(loc="upper right")
         ax1.grid(True)
 
         ax2.semilogy(x_axis, total_losses, label="Weighted Validation Loss", color='black')
-        ax2.set_title(f"Phase 1 Mode {mode_idx}: Weighted Validation Loss")
+        ax2.set_title(f"Phase 1 {case_title}: Weighted Validation Loss")
         ax2.set_xlabel("Steps")
         ax2.legend(loc="upper right")
         ax2.grid(True)
@@ -1387,7 +1473,7 @@ def main():
         plt.close()
 
     # --- Plot final reconstructed sound speed field c(x, y) ---
-    for i, layers_m_each in enumerate(best_params_each_m):
+    for package_index, cases, layers_m_each in best_params_each_m:
         def c_final(x, y, _lm=layers_m_each):
             return c(x, y, _lm)
 
@@ -1398,12 +1484,12 @@ def main():
         plt.figure(figsize=(7, 3.5))
         plt.pcolormesh(x_c, y_c, c_grid_final, rasterized=True)
         plt.colorbar(label="Sound speed c(x, y)")
-        modes_per_freq_str = ' | '.join([f"{int(f)}Hz:M{active_modes_per_freq[float(f)]}" for f in training_frequencies[:i+1]])
-        plt.title(f"Reconstructed c(x,y) — {modes_per_freq_str}")
+        label = package_label(package_index, cases)
+        plt.title(f"Reconstructed c(x,y) - {label}")
         plt.tight_layout()
         plt.savefig(
             fig_dir
-            / f'c_map_fullwave_{defect_name}_freq{int(training_frequencies[i])}_m{modes_str}_f{freqs_str}.pdf'
+            / f'c_map_fullwave_{defect_name}_{label}.pdf'
         )
         if SHOW_PLOTS:
             plt.show()

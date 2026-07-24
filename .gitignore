@@ -19,3 +19,5 @@ __pycache__/
 /pinn_waveguide_2d/cache/
 
 /*.md
+
+/val_fem/

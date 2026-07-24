@@ -37,6 +37,7 @@ class MisfitMetrics:
 class ComparisonResult:
     frequency: float
     mode: int
+    incidence: int
     fem_values: np.ndarray
     pinn_values: np.ndarray
     metrics: MisfitMetrics
@@ -55,6 +56,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fem-field", required=True, type=Path)
     parser.add_argument("--frequency", type=float)
     parser.add_argument("--mode", type=int)
+    parser.add_argument("--incidence", type=int, choices=[-1, 1])
     return parser.parse_args()
 
 
@@ -82,20 +84,23 @@ def select_cases(
     fem_data: FEMFieldData,
     frequency: float | None = None,
     mode: int | None = None,
-) -> list[tuple[float, int]]:
+    incidence: int | None = None,
+) -> list[tuple[float, int, int]]:
     cases = checkpoint.available_cases()
     if frequency is not None:
         cases = [case for case in cases if np.isclose(case[0], frequency)]
     if mode is not None:
         cases = [case for case in cases if case[1] == mode]
+    if incidence is not None:
+        cases = [case for case in cases if case[2] == incidence]
     if not cases:
-        raise ValueError("No checkpoint case matches the requested frequency/mode filters")
+        raise ValueError("No checkpoint case matches the requested filters")
 
-    missing = [case for case in cases if not fem_data.has_case(*case)]
+    missing = [case for case in cases if not fem_data.has_case(case[0], case[1], case[2])]
     if missing:
         raise ValueError(
             f"Selected checkpoint cases are missing from the FEM field: {missing}; "
-            f"available FEM cases: {fem_data.available_cases}"
+            f"available FEM cases: {fem_data.available_triplets}"
         )
     return cases
 
@@ -157,28 +162,33 @@ def prepare_comparisons(
     fem_data: FEMFieldData,
     mass_matrix: SymmetricCOOMatrix,
     stiffness_matrix: SymmetricCOOMatrix | None,
-    cases: list[tuple[float, int]],
+    cases: list[tuple[float, int, int]],
 ) -> list[ComparisonResult]:
-    for frequency, mode in cases:
-        fem_case = fem_data.case(frequency, mode)
+    for frequency, mode, incidence in cases:
+        fem_case = fem_data.case(frequency, mode, incidence)
         expected_k0 = 2.0 * np.pi * frequency / checkpoint.c0
         if not np.isclose(fem_case.k0, expected_k0, rtol=1e-7, atol=1e-9):
             raise ValueError(
-                f"FEM/checkpoint c0 mismatch for f={frequency}, mode={mode}: "
+                f"FEM/checkpoint c0 mismatch for f={frequency}, mode={mode}, "
+                f"incidence={incidence}: "
                 f"FEM k0={fem_case.k0}, expected {expected_k0}"
             )
 
     predictions = {
         case: checkpoint.predict_physical(
-            case[0], case[1], fem_data.x, fem_data.y, physical_units=True
+            case[0], case[1], fem_data.x, fem_data.y,
+            physical_units=True,
+            incidence=case[2],
         )
         for case in cases
     }
 
     results = []
-    for frequency, mode in cases:
-        fem_case = fem_data.case(frequency, mode)
-        pinn_values = np.asarray(predictions[(frequency, mode)], dtype=np.complex128)
+    for frequency, mode, incidence in cases:
+        fem_case = fem_data.case(frequency, mode, incidence)
+        pinn_values = np.asarray(
+            predictions[(frequency, mode, incidence)], dtype=np.complex128
+        )
         metrics = compute_misfit_metrics(
             fem_case.values, pinn_values, mass_matrix, stiffness_matrix
         )
@@ -186,6 +196,7 @@ def prepare_comparisons(
             ComparisonResult(
                 frequency=frequency,
                 mode=mode,
+                incidence=incidence,
                 fem_values=fem_case.values,
                 pinn_values=pinn_values,
                 metrics=metrics,
@@ -196,7 +207,10 @@ def prepare_comparisons(
 
 def print_metrics(result: ComparisonResult) -> None:
     metrics = result.metrics
-    print(f"f={result.frequency:.8g} Hz, mode={result.mode}")
+    print(
+        f"f={result.frequency:.8g} Hz, mode={result.mode}, "
+        f"incidence={result.incidence}"
+    )
     print(
         f"  L2: absolute={metrics.l2_absolute:.8e}, "
         f"relative={metrics.l2_relative:.8e} ({100.0 * metrics.l2_relative:.5f} %)"
@@ -250,7 +264,8 @@ def create_comparison_figure(
     if metrics.h1_relative is not None:
         metric_title += f", relative H1={100.0 * metrics.h1_relative:.4g} %"
     figure.suptitle(
-        f"FEM-PINN comparison — f={result.frequency:.8g} Hz, mode={result.mode} — "
+        f"FEM-PINN comparison - f={result.frequency:.8g} Hz, "
+        f"mode={result.mode}, incidence={result.incidence} - "
         + metric_title
     )
     figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.92))
@@ -273,10 +288,14 @@ def main() -> None:
         )
 
     cases = select_cases(
-        checkpoint, fem_data, frequency=args.frequency, mode=args.mode
+        checkpoint,
+        fem_data,
+        frequency=args.frequency,
+        mode=args.mode,
+        incidence=args.incidence,
     )
     fem_only_cases = sorted(
-        set(fem_data.available_cases) - set(checkpoint.available_cases())
+        set(fem_data.available_triplets) - set(checkpoint.available_cases())
     )
     if fem_only_cases:
         print(f"FEM-only cases ignored: {fem_only_cases}")

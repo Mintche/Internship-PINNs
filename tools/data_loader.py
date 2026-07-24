@@ -5,8 +5,19 @@ import numpy as np
 import pandas as pd
 
 
-REQUIRED_COLUMNS = ("f", "k0", "mode", "x", "y", "Re_U", "Im_U")
-FEM_FIELD_COLUMNS = ("f", "k0", "mode", "node_id", "x", "y", "Re_U", "Im_U")
+VALID_INCIDENCES = {-1, 1}
+REQUIRED_COLUMNS = ("incidence", "f", "k0", "mode", "x", "y", "Re_U", "Im_U")
+FEM_FIELD_COLUMNS = (
+    "incidence",
+    "f",
+    "k0",
+    "mode",
+    "node_id",
+    "x",
+    "y",
+    "Re_U",
+    "Im_U",
+)
 MATRIX_COLUMNS = ("row", "col", "value")
 
 
@@ -21,6 +32,7 @@ def format_ratio_label(ratio: float) -> str:
 
 @dataclass(frozen=True)
 class BoundaryPair:
+    incidence: int
     mode: int
     frequency: float
     k0: float
@@ -45,6 +57,7 @@ class _BoundaryTrace:
 
 @dataclass(frozen=True)
 class FEMFieldCase:
+    incidence: int
     frequency: float
     mode: int
     k0: float
@@ -112,15 +125,17 @@ class WaveguideBoundaryData:
             )
 
         self._pairs = {}
-        for mode, frequency in sorted(left_keys):
-            left_trace = left[(mode, frequency)]
-            right_trace = right[(mode, frequency)]
+        for mode, frequency, incidence in sorted(left_keys):
+            left_trace = left[(mode, frequency, incidence)]
+            right_trace = right[(mode, frequency, incidence)]
             if not np.isclose(left_trace.k0, right_trace.k0, rtol=1e-6, atol=1e-7):
                 raise ValueError(
-                    f"Inconsistent k0 for mode {mode}, frequency {frequency}: "
+                    f"Inconsistent k0 for mode {mode}, frequency {frequency}, "
+                    f"incidence {incidence}: "
                     f"{left_trace.k0} versus {right_trace.k0}"
                 )
-            self._pairs[(mode, frequency)] = BoundaryPair(
+            self._pairs[(mode, frequency, incidence)] = BoundaryPair(
+                incidence=incidence,
                 mode=mode,
                 frequency=frequency,
                 k0=left_trace.k0,
@@ -134,8 +149,18 @@ class WaveguideBoundaryData:
                 u_im_right=right_trace.u_im,
             )
 
-        self.available_pairs = tuple(sorted(self._pairs))
-        self.modes = np.asarray(sorted({mode for mode, _ in self.available_pairs}), dtype=np.int32)
+        self.available_triplets = tuple(sorted(self._pairs))
+        self.available_pairs = tuple(
+            sorted({(mode, frequency) for mode, frequency, incidence in self.available_triplets
+                    if incidence == -1})
+        )
+        self.modes = np.asarray(
+            sorted({mode for mode, _, _ in self.available_triplets}), dtype=np.int32
+        )
+        self.incidences = np.asarray(
+            sorted({incidence for _, _, incidence in self.available_triplets}),
+            dtype=np.int32,
+        )
 
     @staticmethod
     def _load_side(filepath: Path, side: str):
@@ -167,26 +192,44 @@ class WaveguideBoundaryData:
             raise ValueError(f"{filepath} contains an invalid mode index")
         dataframe["mode"] = np.rint(modes).astype(np.int64)
 
-        duplicate_mask = dataframe.duplicated(subset=["mode", "f", "y"], keep=False)
+        incidences = dataframe["incidence"].to_numpy(dtype=np.float64)
+        if not np.equal(incidences, np.rint(incidences)).all():
+            raise ValueError(f"{filepath} contains a non-integer incidence")
+        dataframe["incidence"] = np.rint(incidences).astype(np.int64)
+        invalid_incidences = sorted(set(dataframe["incidence"]) - VALID_INCIDENCES)
+        if invalid_incidences:
+            raise ValueError(
+                f"{filepath} contains invalid incidence values: {invalid_incidences}"
+            )
+
+        duplicate_mask = dataframe.duplicated(
+            subset=["incidence", "mode", "f", "y"], keep=False
+        )
         if duplicate_mask.any():
-            duplicate = dataframe.loc[duplicate_mask, ["mode", "f", "y"]].iloc[0].tolist()
+            duplicate = dataframe.loc[
+                duplicate_mask, ["incidence", "mode", "f", "y"]
+            ].iloc[0].tolist()
             raise ValueError(f"Duplicate boundary sample {duplicate} in {filepath}")
 
         traces = {}
-        for (mode, frequency), subset in dataframe.groupby(["mode", "f"], sort=True):
+        for (incidence, mode, frequency), subset in dataframe.groupby(
+            ["incidence", "mode", "f"], sort=True
+        ):
             subset = subset.sort_values("y", kind="stable")
             x_values = subset["x"].to_numpy(dtype=np.float64)
             k0_values = subset["k0"].to_numpy(dtype=np.float64)
             if not np.allclose(x_values, x_values[0], rtol=0.0, atol=1e-7):
                 raise ValueError(
-                    f"Boundary x is not constant for mode {mode}, frequency {frequency} in {filepath}"
+                    f"Boundary x is not constant for mode {mode}, frequency "
+                    f"{frequency}, incidence {incidence} in {filepath}"
                 )
             if not np.allclose(k0_values, k0_values[0], rtol=1e-7, atol=1e-7):
                 raise ValueError(
-                    f"k0 is not constant for mode {mode}, frequency {frequency} in {filepath}"
+                    f"k0 is not constant for mode {mode}, frequency {frequency}, "
+                    f"incidence {incidence} in {filepath}"
                 )
 
-            key = (int(mode), float(frequency))
+            key = (int(mode), float(frequency), int(incidence))
             traces[key] = _BoundaryTrace(
                 k0=float(k0_values[0]),
                 x=float(x_values[0]),
@@ -196,33 +239,52 @@ class WaveguideBoundaryData:
             )
         return traces
 
-    def _resolve_key(self, mode: int, frequency: float):
-        exact_key = (int(mode), float(frequency))
+    @staticmethod
+    def _validate_incidence(incidence: int) -> int:
+        incidence = int(incidence)
+        if incidence not in VALID_INCIDENCES:
+            raise ValueError("incidence must be -1 or 1")
+        return incidence
+
+    def _resolve_key(self, mode: int, frequency: float, incidence: int = -1):
+        incidence = self._validate_incidence(incidence)
+        exact_key = (int(mode), float(frequency), incidence)
         if exact_key in self._pairs:
             return exact_key
 
         tolerance = max(1e-5, abs(float(frequency)) * 1e-7)
         candidates = [
-            key for key in self.available_pairs
-            if key[0] == int(mode) and np.isclose(key[1], frequency, rtol=0.0, atol=tolerance)
+            key for key in self.available_triplets
+            if (
+                key[0] == int(mode)
+                and key[2] == incidence
+                and np.isclose(key[1], frequency, rtol=0.0, atol=tolerance)
+            )
         ]
         if len(candidates) == 1:
             return candidates[0]
-        raise KeyError(f"No boundary data for mode {mode}, frequency {frequency}")
+        raise KeyError(
+            f"No boundary data for mode {mode}, frequency {frequency}, "
+            f"incidence {incidence}"
+        )
 
-    def has_pair(self, mode: int, frequency: float) -> bool:
+    def has_pair(self, mode: int, frequency: float, incidence: int = -1) -> bool:
         try:
-            self._resolve_key(mode, frequency)
+            self._resolve_key(mode, frequency, incidence)
         except KeyError:
             return False
         return True
 
-    def get_pair(self, mode: int, frequency: float) -> BoundaryPair:
-        return self._pairs[self._resolve_key(mode, frequency)]
+    def get_pair(self, mode: int, frequency: float, incidence: int = -1) -> BoundaryPair:
+        return self._pairs[self._resolve_key(mode, frequency, incidence)]
 
-    def frequencies_for_mode(self, mode: int) -> np.ndarray:
-        frequencies = [frequency for candidate_mode, frequency in self.available_pairs
-                       if candidate_mode == int(mode)]
+    def frequencies_for_mode(self, mode: int, incidence: int = -1) -> np.ndarray:
+        incidence = self._validate_incidence(incidence)
+        frequencies = [
+            frequency for candidate_mode, frequency, candidate_incidence
+            in self.available_triplets
+            if candidate_mode == int(mode) and candidate_incidence == incidence
+        ]
         return np.asarray(frequencies, dtype=np.float32)
 
 
@@ -256,6 +318,16 @@ class FEMFieldData:
         if (dataframe["f"] <= 0.0).any() or (dataframe["k0"] <= 0.0).any():
             raise ValueError(f"{self.filepath} contains a non-positive frequency or k0")
 
+        incidences = dataframe["incidence"].to_numpy(dtype=np.float64)
+        if not np.equal(incidences, np.rint(incidences)).all():
+            raise ValueError(f"{self.filepath} contains a non-integer incidence")
+        dataframe["incidence"] = np.rint(incidences).astype(np.int64)
+        invalid_incidences = sorted(set(dataframe["incidence"]) - VALID_INCIDENCES)
+        if invalid_incidences:
+            raise ValueError(
+                f"{self.filepath} contains invalid incidence values: {invalid_incidences}"
+            )
+
         modes = dataframe["mode"].to_numpy(dtype=np.float64)
         node_ids = dataframe["node_id"].to_numpy(dtype=np.float64)
         if not np.equal(modes, np.rint(modes)).all() or (modes < 0.0).any():
@@ -266,39 +338,44 @@ class FEMFieldData:
         dataframe["node_id"] = np.rint(node_ids).astype(np.int64)
 
         duplicate_mask = dataframe.duplicated(
-            subset=["f", "mode", "node_id"], keep=False
+            subset=["incidence", "f", "mode", "node_id"], keep=False
         )
         if duplicate_mask.any():
             duplicate = dataframe.loc[
-                duplicate_mask, ["f", "mode", "node_id"]
+                duplicate_mask, ["incidence", "f", "mode", "node_id"]
             ].iloc[0].tolist()
             raise ValueError(f"Duplicate FEM node sample {duplicate} in {self.filepath}")
 
-        self._cases: dict[tuple[float, int], FEMFieldCase] = {}
+        self._cases: dict[tuple[float, int, int], FEMFieldCase] = {}
         reference_x = None
         reference_y = None
         reference_node_ids = None
 
-        for (frequency, mode), subset in dataframe.groupby(["f", "mode"], sort=True):
+        for (incidence, frequency, mode), subset in dataframe.groupby(
+            ["incidence", "f", "mode"], sort=True
+        ):
             subset = subset.sort_values("node_id", kind="stable")
             case_node_ids = subset["node_id"].to_numpy(dtype=np.int64, copy=True)
             expected_ids = np.arange(case_node_ids.size, dtype=np.int64)
             if not np.array_equal(case_node_ids, expected_ids):
                 raise ValueError(
-                    f"node_id must be contiguous from 0 for f={frequency}, mode={mode}"
+                    f"node_id must be contiguous from 0 for f={frequency}, "
+                    f"mode={mode}, incidence={incidence}"
                 )
 
             x = subset["x"].to_numpy(dtype=np.float64, copy=True)
             y = subset["y"].to_numpy(dtype=np.float64, copy=True)
             if np.unique(np.column_stack((x, y)), axis=0).shape[0] != x.size:
                 raise ValueError(
-                    f"Duplicate physical node coordinates for f={frequency}, mode={mode}"
+                    f"Duplicate physical node coordinates for f={frequency}, "
+                    f"mode={mode}, incidence={incidence}"
                 )
 
             k0_values = subset["k0"].to_numpy(dtype=np.float64)
             if not np.allclose(k0_values, k0_values[0], rtol=1e-7, atol=1e-7):
                 raise ValueError(
-                    f"k0 is not constant for f={frequency}, mode={mode}"
+                    f"k0 is not constant for f={frequency}, mode={mode}, "
+                    f"incidence={incidence}"
                 )
 
             if reference_node_ids is None:
@@ -314,8 +391,9 @@ class FEMFieldData:
                     "All FEM cases must share the same node ordering and coordinates"
                 )
 
-            key = (float(frequency), int(mode))
+            key = (float(frequency), int(mode), int(incidence))
             self._cases[key] = FEMFieldCase(
+                incidence=key[2],
                 frequency=key[0],
                 mode=key[1],
                 k0=float(k0_values[0]),
@@ -328,37 +406,55 @@ class FEMFieldData:
                 ),
             )
 
-        self.available_cases = tuple(sorted(self._cases))
-        first_case = self._cases[self.available_cases[0]]
+        self.available_triplets = tuple(sorted(self._cases))
+        self.available_cases = tuple(
+            sorted({(frequency, mode) for frequency, mode, incidence
+                    in self.available_triplets if incidence == -1})
+        )
+        first_case = self._cases[self.available_triplets[0]]
         self.node_ids = first_case.node_ids
         self.x = first_case.x
         self.y = first_case.y
         self.size = self.node_ids.size
 
-    def _resolve_key(self, frequency: float, mode: int) -> tuple[float, int]:
-        exact_key = (float(frequency), int(mode))
+    @staticmethod
+    def _validate_incidence(incidence: int) -> int:
+        incidence = int(incidence)
+        if incidence not in VALID_INCIDENCES:
+            raise ValueError("incidence must be -1 or 1")
+        return incidence
+
+    def _resolve_key(
+        self, frequency: float, mode: int, incidence: int = -1
+    ) -> tuple[float, int, int]:
+        incidence = self._validate_incidence(incidence)
+        exact_key = (float(frequency), int(mode), incidence)
         if exact_key in self._cases:
             return exact_key
         matches = [
-            key for key in self.available_cases
-            if key[1] == int(mode) and np.isclose(key[0], frequency)
+            key for key in self.available_triplets
+            if (
+                key[1] == int(mode)
+                and key[2] == incidence
+                and np.isclose(key[0], frequency)
+            )
         ]
         if len(matches) != 1:
             raise KeyError(
-                f"FEM case (f={frequency}, mode={mode}) is unavailable; "
-                f"available cases: {self.available_cases}"
+                f"FEM case (f={frequency}, mode={mode}, incidence={incidence}) "
+                f"is unavailable; available triplets: {self.available_triplets}"
             )
         return matches[0]
 
-    def has_case(self, frequency: float, mode: int) -> bool:
+    def has_case(self, frequency: float, mode: int, incidence: int = -1) -> bool:
         try:
-            self._resolve_key(frequency, mode)
+            self._resolve_key(frequency, mode, incidence)
         except KeyError:
             return False
         return True
 
-    def case(self, frequency: float, mode: int) -> FEMFieldCase:
-        return self._cases[self._resolve_key(frequency, mode)]
+    def case(self, frequency: float, mode: int, incidence: int = -1) -> FEMFieldCase:
+        return self._cases[self._resolve_key(frequency, mode, incidence)]
 
 
 def load_symmetric_coo_matrix(

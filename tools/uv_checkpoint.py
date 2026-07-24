@@ -19,15 +19,17 @@ from typing import Any, Mapping
 import numpy as np
 
 
-FORMAT_VERSION = 2
-SUPPORTED_FORMAT_VERSIONS = {1, FORMAT_VERSION}
+FORMAT_VERSION = 3
+SUPPORTED_FORMAT_VERSIONS = {FORMAT_VERSION}
 PROVENANCE_PACKAGES = ("jax", "jaxlib", "optax", "numpy", "pandas", "matplotlib")
+VALID_INCIDENCES = {-1, 1}
 
 
 @dataclass(frozen=True)
 class UVCase:
     frequency: float
     mode: int
+    incidence: int
     u_norm: float
     sigma: np.ndarray
     layers: list[dict[str, np.ndarray]]
@@ -121,7 +123,7 @@ class UVCheckpoint:
     length: float
     height: float
     c0: float
-    cases: dict[tuple[float, int], UVCase]
+    cases: dict[tuple[float, int, int], UVCase]
     metadata: dict[str, Any]
     format_version: int = 1
     sound_speed: SoundSpeedModel | None = None
@@ -130,17 +132,23 @@ class UVCheckpoint:
     random_seed: int | None = None
     provenance: dict[str, Any] = field(default_factory=dict)
 
-    def available_cases(self) -> list[tuple[float, int]]:
-        return sorted(self.cases, key=lambda item: (item[0], item[1]))
+    def available_cases(self) -> list[tuple[float, int, int]]:
+        return sorted(self.cases, key=lambda item: (item[0], item[1], item[2]))
 
-    def case(self, frequency: float, mode: int) -> UVCase:
+    def case(self, frequency: float, mode: int, incidence: int = -1) -> UVCase:
+        incidence = _validate_incidence(incidence)
         matches = [
-            case for (stored_frequency, stored_mode), case in self.cases.items()
-            if stored_mode == mode and np.isclose(stored_frequency, frequency)
+            case
+            for (stored_frequency, stored_mode, stored_incidence), case in self.cases.items()
+            if (
+                stored_mode == mode
+                and stored_incidence == incidence
+                and np.isclose(stored_frequency, frequency)
+            )
         ]
         if len(matches) != 1:
             raise KeyError(
-                f"Case (f={frequency}, mode={mode}) is unavailable. "
+                f"Case (f={frequency}, mode={mode}, incidence={incidence}) is unavailable. "
                 f"Available cases: {self.available_cases()}"
             )
         return matches[0]
@@ -153,9 +161,10 @@ class UVCheckpoint:
         y_norm: np.ndarray,
         physical_units: bool = True,
         batch_size: int = 65536,
+        incidence: int = -1,
     ) -> np.ndarray:
         """Evaluate the complex UV network at normalized coordinates in [-1, 1]^2."""
-        case = self.case(frequency, mode)
+        case = self.case(frequency, mode, incidence)
         x_values = np.asarray(x_norm, dtype=np.float32)
         y_values = np.asarray(y_norm, dtype=np.float32)
         if x_values.shape != y_values.shape:
@@ -194,6 +203,7 @@ class UVCheckpoint:
         y: np.ndarray,
         physical_units: bool = True,
         batch_size: int = 65536,
+        incidence: int = -1,
     ) -> np.ndarray:
         """Evaluate a UV network at physical coordinates in [-L, L] x [0, H]."""
         x_values = np.asarray(x, dtype=np.float64)
@@ -226,6 +236,7 @@ class UVCheckpoint:
             y_norm,
             physical_units=physical_units,
             batch_size=batch_size,
+            incidence=incidence,
         )
 
     def predict_sound_speed_physical(
@@ -309,6 +320,16 @@ def collect_provenance(repository_root: Path | str | None = None) -> dict[str, A
     }
 
 
+def _validate_incidence(incidence: Any) -> int:
+    try:
+        value = int(incidence)
+    except (TypeError, ValueError) as error:
+        raise ValueError("incidence must be either -1 or 1") from error
+    if value not in VALID_INCIDENCES:
+        raise ValueError("incidence must be either -1 or 1")
+    return value
+
+
 def _validate_layers(layers: Any, name: str) -> list[int]:
     if not isinstance(layers, (list, tuple)) or not layers:
         raise ValueError(f"{name} must contain at least one layer")
@@ -336,33 +357,35 @@ def _validate_layers(layers: Any, name: str) -> list[int]:
 
 
 def collect_u_norms(
-    params_uv: Mapping[tuple[float, int], Any],
-    mode_data: Mapping[int, Mapping[str, Any]],
-) -> dict[tuple[float, int], float]:
-    """Extract the normalization used by pinn_waveguide_multi_modes.py."""
-    norms: dict[tuple[float, int], float] = {}
-    for frequency, mode in params_uv:
+    params_uv: Mapping[tuple[float, int, int], Any],
+    mode_data: Mapping[tuple[float, int, int], Mapping[str, Any]],
+) -> dict[tuple[float, int, int], float]:
+    """Extract the normalization used by pinn_fullwave_waveguide.py."""
+    norms: dict[tuple[float, int, int], float] = {}
+    for frequency, mode, incidence in params_uv:
         frequency = float(frequency)
         mode = int(mode)
+        incidence = _validate_incidence(incidence)
+        key = (frequency, mode, incidence)
         try:
-            candidates = mode_data[mode]["U_norm"]
+            norm = float(mode_data[key]["U_norm"])
         except KeyError as error:
-            raise KeyError(f"U_norm is missing for mode={mode}") from error
-        matches = [
-            float(value) for stored_frequency, value in candidates.items()
-            if np.isclose(float(stored_frequency), frequency)
-        ]
-        if len(matches) != 1:
-            raise KeyError(f"U_norm is missing or ambiguous for f={frequency}, mode={mode}")
-        norms[(frequency, mode)] = matches[0]
+            raise KeyError(
+                f"U_norm is missing for f={frequency}, mode={mode}, incidence={incidence}"
+            ) from error
+        if not np.isfinite(norm) or norm <= 0.0:
+            raise ValueError(
+                f"U_norm must be positive for f={frequency}, mode={mode}, incidence={incidence}"
+            )
+        norms[key] = norm
     return norms
 
 
 def save_uv_checkpoint(
     path: Path | str,
-    params_uv: Mapping[tuple[float, int], Mapping[str, Any]],
+    params_uv: Mapping[tuple[float, int, int], Mapping[str, Any]],
     b_base: Any,
-    u_norms: Mapping[tuple[float, int], float],
+    u_norms: Mapping[tuple[float, int, int], float],
     *,
     length: float,
     height: float,
@@ -417,25 +440,45 @@ def save_uv_checkpoint(
     manifest_cases = []
     uv_architecture: list[int] | None = None
 
-    for case_index, ((frequency, mode), parameters) in enumerate(
-        sorted(params_uv.items(), key=lambda item: (float(item[0][0]), int(item[0][1])))
+    for case_index, ((frequency, mode, incidence), parameters) in enumerate(
+        sorted(
+            params_uv.items(),
+            key=lambda item: (float(item[0][0]), int(item[0][1]), int(item[0][2])),
+        )
     ):
         frequency = float(frequency)
         mode = int(mode)
+        incidence = _validate_incidence(incidence)
         norm_matches = [
-            float(value) for (norm_frequency, norm_mode), value in u_norms.items()
-            if int(norm_mode) == mode and np.isclose(float(norm_frequency), frequency)
+            float(value)
+            for (norm_frequency, norm_mode, norm_incidence), value in u_norms.items()
+            if (
+                int(norm_mode) == mode
+                and _validate_incidence(norm_incidence) == incidence
+                and np.isclose(float(norm_frequency), frequency)
+            )
         ]
         if len(norm_matches) != 1:
-            raise KeyError(f"U_norm is missing or ambiguous for f={frequency}, mode={mode}")
+            raise KeyError(
+                "U_norm is missing or ambiguous for "
+                f"f={frequency}, mode={mode}, incidence={incidence}"
+            )
+        if not np.isfinite(norm_matches[0]) or norm_matches[0] <= 0.0:
+            raise ValueError(
+                f"U_norm must be positive for f={frequency}, mode={mode}, incidence={incidence}"
+            )
 
         prefix = f"case_{case_index}"
         sigma = np.asarray(parameters["sigma"])
         if sigma.shape != (2,) or not np.isfinite(sigma).all():
-            raise ValueError(f"Invalid sigma for f={frequency}, mode={mode}")
+            raise ValueError(
+                f"Invalid sigma for f={frequency}, mode={mode}, incidence={incidence}"
+            )
         arrays[f"{prefix}_sigma"] = sigma
         layers = parameters["layers"]
-        case_architecture = _validate_layers(layers, f"layers_uv[{frequency}, {mode}]")
+        case_architecture = _validate_layers(
+            layers, f"layers_uv[{frequency}, {mode}, {incidence}]"
+        )
         if uv_architecture is None:
             uv_architecture = case_architecture
         elif case_architecture != uv_architecture:
@@ -447,6 +490,7 @@ def save_uv_checkpoint(
             "prefix": prefix,
             "frequency": frequency,
             "mode": mode,
+            "incidence": incidence,
             "u_norm": norm_matches[0],
             "n_layers": len(layers),
         })
@@ -524,8 +568,10 @@ def load_uv_checkpoint(path: Path | str) -> UVCheckpoint:
                 f"supported versions: {sorted(SUPPORTED_FORMAT_VERSIONS)}"
             )
 
-        cases: dict[tuple[float, int], UVCase] = {}
+        cases: dict[tuple[float, int, int], UVCase] = {}
         for description in manifest["cases"]:
+            if "incidence" not in description:
+                raise ValueError("Checkpoint case is missing required incidence")
             prefix = description["prefix"]
             layers = [
                 {
@@ -537,11 +583,15 @@ def load_uv_checkpoint(path: Path | str) -> UVCheckpoint:
             case = UVCase(
                 frequency=float(description["frequency"]),
                 mode=int(description["mode"]),
+                incidence=_validate_incidence(description["incidence"]),
                 u_norm=float(description["u_norm"]),
                 sigma=np.asarray(archive[f"{prefix}_sigma"]),
                 layers=layers,
             )
-            cases[(case.frequency, case.mode)] = case
+            key = (case.frequency, case.mode, case.incidence)
+            if key in cases:
+                raise ValueError(f"Duplicate checkpoint case {key}")
+            cases[key] = case
         b_base = np.asarray(archive["b_base"])
 
         sound_speed = None
@@ -605,7 +655,7 @@ def export_predictions_csv(
     path: Path | str,
     checkpoint: UVCheckpoint,
     evaluation_grid: Mapping[str, np.ndarray],
-    cases: list[tuple[float, int]] | None = None,
+    cases: list[tuple[float, int, int]] | None = None,
     physical_units: bool = True,
 ) -> Path:
     """Evaluate selected UV networks on the exact FEM grid and export one CSV."""
@@ -615,18 +665,19 @@ def export_predictions_csv(
     with path.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.writer(stream)
         writer.writerow((
-            "f", "k0", "mode", "grid_i", "x", "y", "x_norm", "y_norm",
+            "incidence", "f", "k0", "mode", "grid_i", "x", "y", "x_norm", "y_norm",
             "Re_U", "Im_U", "abs_U",
         ))
-        for frequency, mode in selected_cases:
+        for frequency, mode, incidence in selected_cases:
             values = checkpoint.predict(
                 frequency, mode, evaluation_grid["x_norm"], evaluation_grid["y_norm"],
                 physical_units=physical_units,
+                incidence=incidence,
             )
             k0 = 2.0 * np.pi * frequency / checkpoint.c0
             for index, value in enumerate(values):
                 writer.writerow((
-                    f"{frequency:.17g}", f"{k0:.17g}", mode,
+                    incidence, f"{frequency:.17g}", f"{k0:.17g}", mode,
                     int(evaluation_grid["grid_i"][index]),
                     f"{evaluation_grid['x'][index]:.17g}",
                     f"{evaluation_grid['y'][index]:.17g}",
@@ -652,6 +703,7 @@ def parse_args() -> argparse.Namespace:
     export_parser.add_argument("--output", required=True, type=Path)
     export_parser.add_argument("--frequency", type=float)
     export_parser.add_argument("--mode", type=int)
+    export_parser.add_argument("--incidence", type=int, choices=sorted(VALID_INCIDENCES))
     export_parser.add_argument(
         "--normalized-output", action="store_true",
         help="Do not multiply outputs by U_norm",
@@ -690,6 +742,8 @@ def main() -> None:
         selected_cases = [case for case in selected_cases if np.isclose(case[0], args.frequency)]
     if args.mode is not None:
         selected_cases = [case for case in selected_cases if case[1] == args.mode]
+    if args.incidence is not None:
+        selected_cases = [case for case in selected_cases if case[2] == args.incidence]
     if not selected_cases:
         raise ValueError("No checkpoint case matches the requested filters")
     grid = load_evaluation_grid(args.grid_map)

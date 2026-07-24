@@ -30,12 +30,21 @@ MS_MAX = 1.0e-5
 
 def synthetic_parameters():
     params_us = {
-        (600.0, 0): {
+        (600.0, 0, -1): {
             "sigma": np.asarray([1.5, 0.5], dtype=np.float32),
             "layers": [
                 {
                     "W": np.arange(8, dtype=np.float32).reshape(4, 2) / 20.0,
                     "b": np.asarray([0.1, -0.2], dtype=np.float32),
+                }
+            ],
+        },
+        (600.0, 0, 1): {
+            "sigma": np.asarray([1.25, 0.75], dtype=np.float32),
+            "layers": [
+                {
+                    "W": np.arange(8, dtype=np.float32).reshape(4, 2) / 25.0,
+                    "b": np.asarray([-0.05, 0.15], dtype=np.float32),
                 }
             ],
         }
@@ -63,7 +72,7 @@ def save_synthetic_checkpoint(directory: str | Path) -> USCheckpoint:
         path,
         params_us,
         b_base,
-        {(600.0, 0): 2.5},
+        {(600.0, 0, -1): 2.5, (600.0, 0, 1): 2.75},
         length=1.0,
         height=0.6,
         c0=340.0,
@@ -115,12 +124,21 @@ class USCheckpointTests(unittest.TestCase):
             height=0.6,
             c0=340.0,
             cases={
-                (600.0, 0): USCase(
+                (600.0, 0, -1): USCase(
                     frequency=600.0,
                     mode=0,
+                    incidence=-1,
                     field_norm=2.5,
-                    sigma=params_us[(600.0, 0)]["sigma"],
-                    layers=params_us[(600.0, 0)]["layers"],
+                    sigma=params_us[(600.0, 0, -1)]["sigma"],
+                    layers=params_us[(600.0, 0, -1)]["layers"],
+                ),
+                (600.0, 0, 1): USCase(
+                    frequency=600.0,
+                    mode=0,
+                    incidence=1,
+                    field_norm=2.75,
+                    sigma=params_us[(600.0, 0, 1)]["sigma"],
+                    layers=params_us[(600.0, 0, 1)]["layers"],
                 )
             },
             ms_model=MSSoundSpeedModel(
@@ -135,7 +153,8 @@ class USCheckpointTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             checkpoint = save_synthetic_checkpoint(directory)
 
-            self.assertEqual(checkpoint.format_version, 1)
+            self.assertEqual(checkpoint.format_version, 2)
+            self.assertEqual(checkpoint.available_cases(), [(600.0, 0, -1), (600.0, 0, 1)])
             self.assertEqual(checkpoint.random_seed, 7)
             self.assertEqual(
                 checkpoint.best_validation_losses["inverse"][0]["weighted_total"],
@@ -155,6 +174,10 @@ class USCheckpointTests(unittest.TestCase):
             np.testing.assert_allclose(
                 checkpoint.predict_incident_physical(600.0, 0, x, y),
                 reference.predict_incident_physical(600.0, 0, x, y),
+            )
+            np.testing.assert_allclose(
+                checkpoint.predict_incident_physical(600.0, 0, x, y, incidence=1),
+                reference.predict_incident_physical(600.0, 0, x, y, incidence=1),
             )
             np.testing.assert_allclose(
                 checkpoint.predict_total_physical(600.0, 0, x, y),
@@ -201,6 +224,38 @@ class USCheckpointTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "us_checkpoint_npz"):
                 load_us_checkpoint(path)
 
+    def test_current_manifest_requires_incidence(self):
+        manifest = {
+            "format": "us_checkpoint_npz",
+            "format_version": 2,
+            "geometry": {"length": 1.0, "height": 0.6},
+            "c0": 340.0,
+            "cases": [
+                {
+                    "prefix": "case_0",
+                    "frequency": 600.0,
+                    "mode": 0,
+                    "field_norm": 1.0,
+                    "n_layers": 1,
+                }
+            ],
+            "sound_speed_model": {
+                "prefix": "ms",
+                "n_layers": 1,
+                "ms_min": MS_MIN,
+                "ms_max": MS_MAX,
+            },
+            "metadata": {"defect_name": "circlebottomleft", "contrast_ratio": 0.8},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "missing_incidence.npz"
+            with path.open("wb") as stream:
+                np.savez_compressed(
+                    stream, manifest_json=np.asarray(json.dumps(manifest))
+                )
+            with self.assertRaisesRegex(ValueError, "missing required incidence"):
+                load_us_checkpoint(path)
+
     def test_invalid_inputs_are_rejected(self):
         params_us, layers_ms = synthetic_parameters()
         b_base = np.asarray([[0.2, 0.4], [-0.1, 0.3]], dtype=np.float32)
@@ -222,7 +277,7 @@ class USCheckpointTests(unittest.TestCase):
                     Path(directory) / "bad_bounds.npz",
                     params_us,
                     b_base,
-                    {(600.0, 0): 2.5},
+                    {(600.0, 0, -1): 2.5, (600.0, 0, 1): 2.75},
                     **{**common_kwargs, "ms_min": 1.0e-5, "ms_max": 1.0e-7},
                 )
             with self.assertRaisesRegex(ValueError, "ms bounds"):
@@ -230,7 +285,7 @@ class USCheckpointTests(unittest.TestCase):
                     Path(directory) / "positive_bounds.npz",
                     params_us,
                     b_base,
-                    {(600.0, 0): 2.5},
+                    {(600.0, 0, -1): 2.5, (600.0, 0, 1): 2.75},
                     **{**common_kwargs, "ms_min": 1.0e-7, "ms_max": 1.0e-5},
                 )
             with self.assertRaisesRegex(KeyError, "field_norm"):
@@ -242,7 +297,7 @@ class USCheckpointTests(unittest.TestCase):
                     **common_kwargs,
                 )
             bad_params = {
-                (600.0, 0): {
+                (600.0, 0, -1): {
                     "sigma": np.asarray([1.0, 1.0]),
                     "layers": [{"W": np.zeros((3, 2)), "b": np.zeros(2)}],
                 }
@@ -252,7 +307,7 @@ class USCheckpointTests(unittest.TestCase):
                     Path(directory) / "bad_layers.npz",
                     bad_params,
                     b_base,
-                    {(600.0, 0): 2.5},
+                    {(600.0, 0, -1): 2.5},
                     **common_kwargs,
                 )
 
@@ -281,6 +336,7 @@ class USCheckpointTests(unittest.TestCase):
                 rows = list(csv.DictReader(stream))
 
             self.assertEqual(set(rows[0].keys()), {
+                "incidence",
                 "f",
                 "k0",
                 "mode",
@@ -296,6 +352,7 @@ class USCheckpointTests(unittest.TestCase):
             expected = checkpoint.predict_total(
                 600.0, 0, grid["x_norm"], grid["y_norm"]
             )
+            self.assertEqual(rows[0]["incidence"], "-1")
             self.assertAlmostEqual(float(rows[0]["Re_U"]), expected[0].real)
             self.assertAlmostEqual(float(rows[0]["Im_U"]), expected[0].imag)
 
@@ -326,7 +383,7 @@ class USCheckpointTests(unittest.TestCase):
                 fem_data,
                 mass_matrix,
                 stiffness_matrix=None,
-                cases=[(600.0, 0)],
+                cases=[(600.0, 0, -1)],
             )[0]
             self.assertEqual(result.metrics.l2_absolute, 0.0)
             self.assertEqual(result.metrics.l2_relative, 0.0)
@@ -343,15 +400,16 @@ class _FakeFEMData:
         self.x = x
         self.y = y
         self.size = x.size
-        self.available_cases = ((600.0, 0),)
+        self.available_triplets = ((600.0, 0, -1),)
+        self.available_cases = self.available_triplets
         self._case = _FakeFEMCase(k0=2.0 * np.pi * 600.0 / c0, values=values)
 
-    def has_case(self, frequency: float, mode: int) -> bool:
-        return np.isclose(frequency, 600.0) and mode == 0
+    def has_case(self, frequency: float, mode: int, incidence: int = -1) -> bool:
+        return np.isclose(frequency, 600.0) and mode == 0 and incidence == -1
 
-    def case(self, frequency: float, mode: int) -> _FakeFEMCase:
-        if not self.has_case(frequency, mode):
-            raise KeyError((frequency, mode))
+    def case(self, frequency: float, mode: int, incidence: int = -1) -> _FakeFEMCase:
+        if not self.has_case(frequency, mode, incidence):
+            raise KeyError((frequency, mode, incidence))
         return self._case
 
 

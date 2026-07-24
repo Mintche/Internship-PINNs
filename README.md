@@ -17,6 +17,7 @@ Internship-PINNs/
 │   ├── uv_checkpoint.py          # Save and evaluate UV/M networks
 │   ├── us_checkpoint.py          # Save and evaluate scattered US/MS networks
 │   ├── compare_pinn_fem.py       # Nodal FEM–PINN comparison
+│   ├── plot_fem_convergence.py   # L2/H1 convergence against a fine FEM reference
 │   ├── compare_pinn_pinn.py      # Nodal PINN–PINN comparison
 │   ├── compare_sound_speed.py    # Sound-speed reconstruction and misfit
 │   ├── summarize_sound_speed_checkpoints.py
@@ -66,6 +67,30 @@ The `Mass_matrix_*.csv` and `Stiff_matrix_*.csv` files contain the lower
 triangles of the matrices in COO format. The `fem_field_*.csv` file contains
 the complex field at all P2 degrees of freedom, in the same RCM ordering as
 the matrices.
+
+### FEM mesh convergence
+
+List the field files from the coarsest mesh to the finest one, then give the
+mass and stiffness matrices of that last mesh:
+
+```bash
+MPLCONFIGDIR=/tmp/matplotlib .venv/bin/python tools/plot_fem_convergence.py \
+  results/fem_h0/fem_field_2circles.csv \
+  results/fem_h1/fem_field_2circles.csv \
+  results/fem_h2/fem_field_2circles.csv \
+  results/fem_h3/fem_field_2circles.csv \
+  --mass-matrix results/fem_h3/Mass_matrix_2circles.csv \
+  --stiffness-matrix results/fem_h3/Stiff_matrix_2circles.csv \
+  --frequency 1200 --mode 0 \
+  --output results/fem_convergence.pdf
+```
+
+The last solution is the reference and is therefore not plotted as a zero
+error on the logarithmic axes. Coarser fields are linearly transferred from
+their exported P2 node clouds to the reference nodes. This is useful as a quick
+mesh-independence diagnostic; measuring the formal P2 convergence order would
+require exporting the coarse-element connectivity and using the exact P2
+prolongation.
 
 ## Multi-Mode Training
 

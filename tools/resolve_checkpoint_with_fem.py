@@ -32,6 +32,7 @@ from tools.uv_checkpoint import load_uv_checkpoint  # noqa: E402
 CSV_FIELDS = (
     "frequency",
     "mode",
+    "incidence",
     "pinn_vs_resolved_l2",
     "pinn_vs_resolved_h1",
     "resolved_vs_truth_l2",
@@ -59,6 +60,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--frequency", type=float, action="append")
     parser.add_argument("--mode", type=int, action="append")
+    parser.add_argument("--incidence", type=int, choices=[-1, 1], action="append")
     parser.add_argument(
         "--generator",
         type=Path,
@@ -119,10 +121,11 @@ def _checkpoint_kind(path: Path, requested: str) -> str:
 
 
 def _select_cases(
-    available: list[tuple[float, int]],
+    available: list[tuple[float, int, int]],
     frequencies: list[float] | None,
     modes: list[int] | None,
-) -> list[tuple[float, int]]:
+    incidences: list[int] | None = None,
+) -> list[tuple[float, int, int]]:
     cases = available
     if frequencies is not None:
         cases = [
@@ -132,8 +135,10 @@ def _select_cases(
         ]
     if modes is not None:
         cases = [case for case in cases if case[1] in modes]
+    if incidences is not None:
+        cases = [case for case in cases if case[2] in incidences]
     if not cases:
-        raise ValueError("No checkpoint case matches the requested frequencies and modes")
+        raise ValueError("No checkpoint case matches the requested filters")
     return cases
 
 
@@ -143,7 +148,7 @@ def _load_checkpoint(
     if formulation == "total":
         checkpoint = load_uv_checkpoint(path)
         if checkpoint.sound_speed is None:
-            raise ValueError("A format-v2 total-field checkpoint is required")
+            raise ValueError("A format-v3 total-field checkpoint is required")
         predictor = checkpoint.predict_physical
     else:
         checkpoint = load_us_checkpoint(path)
@@ -168,18 +173,25 @@ def _write_nodal_material(
     return speed
 
 
-def _case_strings(cases: list[tuple[float, int]]) -> tuple[str, str]:
-    frequencies = sorted({frequency for frequency, _ in cases})
-    modes = sorted({mode for _, mode in cases})
-    expected = {(frequency, mode) for frequency in frequencies for mode in modes}
+def _case_strings(cases: list[tuple[float, int, int]]) -> tuple[str, str, str]:
+    frequencies = sorted({frequency for frequency, _, _ in cases})
+    modes = sorted({mode for _, mode, _ in cases})
+    incidences = sorted({incidence for _, _, incidence in cases})
+    expected = {
+        (frequency, mode, incidence)
+        for frequency in frequencies
+        for mode in modes
+        for incidence in incidences
+    }
     if set(cases) != expected:
         raise ValueError(
-            "The FEM generator currently accepts a Cartesian frequency/mode product; "
+            "The FEM generator currently accepts a Cartesian frequency/mode/incidence product; "
             "select cases that form a complete product"
         )
     return (
         ",".join(f"{frequency:.17g}" for frequency in frequencies),
         ",".join(str(mode) for mode in modes),
+        ",".join(str(incidence) for incidence in incidences),
     )
 
 
@@ -202,11 +214,13 @@ def main() -> None:
     fem_truth = FEMFieldData(args.fem_field_truth)
     validate_geometry(checkpoint, fem_truth)
     cases = _select_cases(
-        checkpoint.available_cases(), args.frequency, args.mode
+        checkpoint.available_cases(), args.frequency, args.mode, args.incidence
     )
-    for frequency, mode in cases:
-        if not fem_truth.has_case(frequency, mode):
-            raise ValueError(f"Truth FEM field lacks f={frequency}, mode={mode}")
+    for frequency, mode, incidence in cases:
+        if not fem_truth.has_case(frequency, mode, incidence):
+            raise ValueError(
+                f"Truth FEM field lacks f={frequency}, mode={mode}, incidence={incidence}"
+            )
 
     mass = load_symmetric_coo_matrix(args.mass_matrix, expected_size=fem_truth.size)
     stiffness = load_symmetric_coo_matrix(
@@ -215,7 +229,7 @@ def main() -> None:
     observed_boundary = WaveguideBoundaryData(
         args.boundary_left_truth, args.boundary_right_truth
     )
-    frequency_text, mode_text = _case_strings(cases)
+    frequency_text, mode_text, incidence_text = _case_strings(cases)
 
     # Delay the only persistent write until every input and the requested case
     # selection has been validated. The directory is intentionally exclusive so
@@ -233,6 +247,8 @@ def main() -> None:
         frequency_text,
         "--modes",
         mode_text,
+        "--incidence",
+        incidence_text,
         "--outputdir",
         str(args.output_dir),
         "--c0",
@@ -252,23 +268,23 @@ def main() -> None:
     )
 
     rows: list[dict[str, float | int]] = []
-    for frequency, mode in cases:
-        if not resolved_field.has_case(frequency, mode):
+    for frequency, mode, incidence in cases:
+        if not resolved_field.has_case(frequency, mode, incidence):
             raise ValueError(
-                f"Resolved FEM field lacks f={frequency}, mode={mode}"
+                f"Resolved FEM field lacks f={frequency}, mode={mode}, incidence={incidence}"
             )
-        truth = fem_truth.case(frequency, mode).values
-        resolved = resolved_field.case(frequency, mode).values
+        truth = fem_truth.case(frequency, mode, incidence).values
+        resolved = resolved_field.case(frequency, mode, incidence).values
         pinn = np.asarray(
-            predict_total(frequency, mode, fem_truth.x, fem_truth.y),
+            predict_total(frequency, mode, fem_truth.x, fem_truth.y, incidence=incidence),
             dtype=np.complex128,
         )
         pinn_vs_resolved = compute_misfit_metrics(resolved, pinn, mass, stiffness)
         resolved_vs_truth = compute_misfit_metrics(truth, resolved, mass, stiffness)
         pinn_vs_truth = compute_misfit_metrics(truth, pinn, mass, stiffness)
 
-        observed_pair = observed_boundary.get_pair(mode, frequency)
-        resolved_pair = resolved_boundary.get_pair(mode, frequency)
+        observed_pair = observed_boundary.get_pair(mode, frequency, incidence)
+        resolved_pair = resolved_boundary.get_pair(mode, frequency, incidence)
         _validate_boundary_sampling(observed_pair, resolved_pair)
         observed_trace = _trace(observed_pair)
         resolved_trace = _trace(resolved_pair)
@@ -277,18 +293,21 @@ def main() -> None:
             mode,
             np.full_like(observed_pair.y_left, observed_pair.x_left),
             observed_pair.y_left,
+            incidence=incidence,
         )
         pinn_right = predict_total(
             frequency,
             mode,
             np.full_like(observed_pair.y_right, observed_pair.x_right),
             observed_pair.y_right,
+            incidence=incidence,
         )
         pinn_trace = np.concatenate((pinn_left, pinn_right)).astype(np.complex128)
         rows.append(
             {
                 "frequency": frequency,
                 "mode": mode,
+                "incidence": incidence,
                 "pinn_vs_resolved_l2": pinn_vs_resolved.l2_relative,
                 "pinn_vs_resolved_h1": pinn_vs_resolved.h1_relative,
                 "resolved_vs_truth_l2": resolved_vs_truth.l2_relative,
@@ -339,7 +358,8 @@ def main() -> None:
 
     for row in rows:
         print(
-            f"f={row['frequency']:.8g}, mode={row['mode']}: "
+            f"f={row['frequency']:.8g}, mode={row['mode']}, "
+            f"incidence={row['incidence']}: "
             f"PINN/resolved FEM L2={100.0 * row['pinn_vs_resolved_l2']:.2f}%, "
             f"resolved/truth L2={100.0 * row['resolved_vs_truth_l2']:.2f}%, "
             f"trace resolved/data={100.0 * row['resolved_vs_observed_trace']:.2f}%"

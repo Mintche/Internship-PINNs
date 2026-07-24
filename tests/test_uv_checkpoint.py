@@ -16,12 +16,21 @@ from tools.uv_checkpoint import (
 
 def synthetic_parameters():
     params_uv = {
-        (600.0, 0): {
+        (600.0, 0, -1): {
             "sigma": np.asarray([1.5, 0.5], dtype=np.float32),
             "layers": [
                 {
                     "W": np.arange(8, dtype=np.float32).reshape(4, 2) / 20.0,
                     "b": np.asarray([0.1, -0.2], dtype=np.float32),
+                }
+            ],
+        },
+        (600.0, 0, 1): {
+            "sigma": np.asarray([1.25, 0.75], dtype=np.float32),
+            "layers": [
+                {
+                    "W": np.arange(8, dtype=np.float32).reshape(4, 2) / 25.0,
+                    "b": np.asarray([-0.05, 0.15], dtype=np.float32),
                 }
             ],
         }
@@ -46,7 +55,9 @@ class UVCheckpointTests(unittest.TestCase):
         params_uv, layers_m = synthetic_parameters()
         b_base = np.asarray([[0.2, 0.4], [-0.1, 0.3]], dtype=np.float32)
         losses = {
-            "forward": [{"frequency": 600.0, "mode": 0, "weighted_total": 0.2}],
+            "forward": [
+                {"frequency": 600.0, "mode": 0, "incidence": -1, "weighted_total": 0.2}
+            ],
             "inverse": [{"frequency": 600.0, "weighted_total": 0.1}],
         }
         provenance = {
@@ -62,12 +73,21 @@ class UVCheckpointTests(unittest.TestCase):
             height=0.6,
             c0=340.0,
             cases={
-                (600.0, 0): UVCase(
+                (600.0, 0, -1): UVCase(
                     frequency=600.0,
                     mode=0,
+                    incidence=-1,
                     u_norm=2.5,
-                    sigma=params_uv[(600.0, 0)]["sigma"],
-                    layers=params_uv[(600.0, 0)]["layers"],
+                    sigma=params_uv[(600.0, 0, -1)]["sigma"],
+                    layers=params_uv[(600.0, 0, -1)]["layers"],
+                ),
+                (600.0, 0, 1): UVCase(
+                    frequency=600.0,
+                    mode=0,
+                    incidence=1,
+                    u_norm=2.75,
+                    sigma=params_uv[(600.0, 0, 1)]["sigma"],
+                    layers=params_uv[(600.0, 0, 1)]["layers"],
                 )
             },
             metadata={"defect_name": "barhalf", "contrast_ratio": 0.8},
@@ -84,7 +104,7 @@ class UVCheckpointTests(unittest.TestCase):
                 path,
                 params_uv,
                 b_base,
-                {(600.0, 0): 2.5},
+                {(600.0, 0, -1): 2.5, (600.0, 0, 1): 2.75},
                 length=1.0,
                 height=0.6,
                 c0=340.0,
@@ -106,7 +126,8 @@ class UVCheckpointTests(unittest.TestCase):
             )
             checkpoint = load_uv_checkpoint(path)
 
-            self.assertEqual(checkpoint.format_version, 2)
+            self.assertEqual(checkpoint.format_version, 3)
+            self.assertEqual(checkpoint.available_cases(), [(600.0, 0, -1), (600.0, 0, 1)])
             self.assertEqual(checkpoint.random_seed, 7)
             self.assertEqual(checkpoint.provenance, provenance)
             self.assertEqual(checkpoint.best_validation_losses, losses)
@@ -115,10 +136,15 @@ class UVCheckpointTests(unittest.TestCase):
             x = np.asarray([-0.5, 0.0, 0.5])
             y = np.asarray([0.1, 0.3, 0.5])
             uv = checkpoint.predict_physical(600.0, 0, x, y)
+            uv_right = checkpoint.predict_physical(600.0, 0, x, y, incidence=1)
             speed = checkpoint.predict_sound_speed_physical(x, y)
             np.testing.assert_allclose(
                 uv,
                 reference.predict_physical(600.0, 0, x, y),
+            )
+            np.testing.assert_allclose(
+                uv_right,
+                reference.predict_physical(600.0, 0, x, y, incidence=1),
             )
             np.testing.assert_allclose(
                 speed,
@@ -132,7 +158,7 @@ class UVCheckpointTests(unittest.TestCase):
             self.assertTrue((speed <= 476.0).all())
             self.assertFalse(list(Path(directory).glob("*.tmp")))
 
-    def test_v1_checkpoint_stays_loadable(self):
+    def test_v1_checkpoint_is_rejected(self):
         manifest = {
             "format": "uv_checkpoint_npz",
             "format_version": 1,
@@ -160,16 +186,34 @@ class UVCheckpointTests(unittest.TestCase):
             path = Path(directory) / "v1.npz"
             with path.open("wb") as stream:
                 np.savez_compressed(stream, **arrays)
-            checkpoint = load_uv_checkpoint(path)
+            with self.assertRaisesRegex(ValueError, "Unsupported checkpoint version"):
+                load_uv_checkpoint(path)
 
-        self.assertEqual(checkpoint.format_version, 1)
-        self.assertIsNone(checkpoint.sound_speed)
-        values = checkpoint.predict(600.0, 0, np.asarray([0.0]), np.asarray([0.0]))
-        np.testing.assert_allclose(values, np.asarray([1.0 - 1.0j]))
-        with self.assertRaisesRegex(ValueError, "v2"):
-            checkpoint.predict_sound_speed_physical(
-                np.asarray([0.0]), np.asarray([0.3])
-            )
+    def test_current_manifest_requires_incidence(self):
+        manifest = {
+            "format": "uv_checkpoint_npz",
+            "format_version": 3,
+            "geometry": {"length": 1.0, "height": 0.6},
+            "c0": 340.0,
+            "cases": [
+                {
+                    "prefix": "case_0",
+                    "frequency": 600.0,
+                    "mode": 0,
+                    "u_norm": 1.0,
+                    "n_layers": 1,
+                }
+            ],
+            "metadata": {"defect_name": "barhalf", "contrast_ratio": 0.8},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "missing_incidence.npz"
+            with path.open("wb") as stream:
+                np.savez_compressed(
+                    stream, manifest_json=np.asarray(json.dumps(manifest))
+                )
+            with self.assertRaisesRegex(ValueError, "missing required incidence"):
+                load_uv_checkpoint(path)
 
     def test_existing_checkpoint_is_not_overwritten(self):
         params_uv, layers_m = synthetic_parameters()
@@ -191,7 +235,7 @@ class UVCheckpointTests(unittest.TestCase):
                 path,
                 params_uv,
                 np.ones((2, 2)),
-                {(600.0, 0): 1.0},
+                {(600.0, 0, -1): 1.0, (600.0, 0, 1): 1.25},
                 **arguments,
             )
             with self.assertRaisesRegex(FileExistsError, "Refusing to overwrite"):
@@ -199,7 +243,7 @@ class UVCheckpointTests(unittest.TestCase):
                     path,
                     params_uv,
                     np.ones((2, 2)),
-                    {(600.0, 0): 1.0},
+                    {(600.0, 0, -1): 1.0, (600.0, 0, 1): 1.25},
                     **arguments,
                 )
 
@@ -211,7 +255,7 @@ class UVCheckpointTests(unittest.TestCase):
                     Path(directory) / "invalid.npz",
                     params_uv,
                     np.ones((2, 2)),
-                    {(600.0, 0): 1.0},
+                    {(600.0, 0, -1): 1.0, (600.0, 0, 1): 1.25},
                     length=1.0,
                     height=0.6,
                     c0=340.0,

@@ -17,6 +17,17 @@ FLOAT32_GRADIENT_RTOL = 2e-3
 
 
 class FullwavePinnAnalyticDerivativeTests(unittest.TestCase):
+    def test_training_package_parser_requires_incidence_outer_keys(self):
+        package = pinn.parse_training_package(
+            {"-1": {"600": [0]}, "1": {"600": [0, 1]}}
+        )
+        self.assertEqual(
+            pinn.flatten_package(package),
+            [(600.0, 0, -1), (600.0, 0, 1), (600.0, 1, 1)],
+        )
+        with self.assertRaisesRegex(ValueError, "incidence"):
+            pinn.parse_training_package({"600": [0]})
+
     def test_analytic_spatial_derivatives_match_jacfwd(self):
         params = pinn.init_layers_uv(
             jax.random.key(123), pinn.n_layers_uv, 1000.0, 1
@@ -65,11 +76,8 @@ class FullwavePinnAnalyticDerivativeTests(unittest.TestCase):
         target = jnp.zeros((5, 2), dtype=jnp.float32)
         frequency = jnp.asarray(600.0, dtype=jnp.float32)
         mode_index = jnp.asarray(1, dtype=jnp.int32)
+        incidence = jnp.asarray(-1, dtype=jnp.int32)
         weights = jnp.asarray([1.0, 1.0, 10.0], dtype=jnp.float32)
-        k0 = 2.0 * jnp.pi * frequency / pinn.c0
-        beta_n = jnp.sqrt(
-            k0**2 - (pinn.n_modes * jnp.pi / pinn.H) ** 2 + 0j
-        )
 
         def evaluate():
             return jax.jit(
@@ -80,13 +88,13 @@ class FullwavePinnAnalyticDerivativeTests(unittest.TestCase):
                         *collocation,
                         frequency,
                         mode_index,
+                        incidence,
                         target,
                         target,
                         y_boundary,
                         y_boundary,
                         jnp.asarray(1.0, dtype=jnp.float32),
                         weights,
-                        beta_n,
                         is_warmup=False,
                         use_healthy_guide=False,
                     ),
