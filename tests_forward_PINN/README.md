@@ -1,19 +1,22 @@
 # Controlled forward PINN benchmark
 
-This directory validates the two field architectures used by the inverse PINNs
-on a known coefficient map.  It does **not** train a material network and the FEM
-field is never used by the physics loss or by checkpoint selection.
+This directory validates the forward PINN field architectures on known
+coefficient maps.  It does not train a material network, and the FEM field is
+used only for reference metrics, never by the physics loss or checkpoint
+selection.
 
-The benchmark case is the two-circle waveguide at 1200 Hz, incident mode 0:
+The heterogeneous report benchmark is the one-circle waveguide at 1200 Hz,
+incident mode 0:
 
 - background speed: `c0 = 340 m/s`;
-- circle `(-0.3, 0.4)`, radius `0.1`, speed ratio `0.8`;
-- circle `(0.3, 0.2)`, radius `0.1`, speed ratio `1.1`;
-- fine FEM reference: 173365 P2 degrees of freedom.
+- circle `(0.2, 0.2)`, radius `0.1`, speed ratio `0.8`;
+- fine FEM reference: 89372 P2 degrees of freedom.
 
-An additional homogeneous control is provided in
-`forward_homogeneous_1200_m0.json`.  Its exact total field is the incident
-waveguide mode
+The homogeneous controls are
+`forward_homogeneous_600_m0_uniform.json`,
+`forward_homogeneous_600_m0_manual.json`, and
+`forward_homogeneous_1200_m0_manual.json`.  Their exact total field is the
+incident waveguide mode
 
 ```text
 u(x,y) = a_m cos(m pi y/H) exp(i beta_m x),
@@ -22,144 +25,190 @@ u(x,y) = a_m cos(m pi y/H) exp(i beta_m x),
 and its exact scattered field is zero.  This control loads no FEM field or FEM
 matrix.  L2/H1 errors are evaluated on an independent structured P1
 triangulation: each rectangular cell is divided into two triangles and the
-corresponding mass and stiffness matrices are assembled.  The default
-`[256, 80]` resolution means 40,960 triangles.
+corresponding mass and stiffness matrices are assembled.
 
-The five variants are:
+## Variants
 
-- `classical_total`: coordinate MLP, automatic derivatives, constant Adam rate;
-- `adapted_total`: Fourier architecture and analytic derivatives, total field;
-- `adapted_scattered`: exactly the same adapted architecture and optimizer,
-  but trained on the scattered-field equation;
-- `adapted_total_RAD`: `adapted_total` with residual-based adaptive
-  distribution (RAD) sampling;
-- `adapted_scattered_RAD`: `adapted_scattered` with the same RAD sampling.
+The active campaign variants are the names exposed by `VARIANTS` in
+`model_variants.py`.  The available formulations are:
 
-The RAD implementation follows Wu et al., [*A comprehensive study of
-non-adaptive and residual-based adaptive sampling for physics-informed neural
-networks*](https://arxiv.org/abs/2207.10289), and its [official reference
-implementation](https://github.com/lu-group/pinn-sampling).  A dense uniform
-candidate pool is assigned the discrete probabilities
+- `classical_total`: coordinate MLP, tanh activations, automatic spatial
+  derivatives, constant Adam learning rate;
+- `fourier_total`: Fourier features, standard tanh MLP, analytic spatial
+  derivatives, total-field equation;
+- `fourier_modified_total`: Fourier features plus the modified MLP from Wang,
+  Teng and Perdikaris, total-field equation;
+- `fourier_scattered`: Fourier features, standard tanh MLP, analytic spatial
+  derivatives, scattered-field equation;
+- `fourier_modified_scattered`: Fourier features plus modified MLP,
+  scattered-field equation.
+
+Each formulation also has an adaptive-loss-weight counterpart with the
+`_adweights` suffix, for example `classical_total_adweights` and
+`fourier_modified_scattered_adweights`.  The suffix changes only the loss
+weighting: architecture, physical formulation, optimizer, and parameter count
+remain those of the base variant.  These variants are accepted by `run` and by
+`campaign --variants`, but the campaign default remains the five static
+variants listed above.
+
+RAD is available independently with the `_rad` suffix, and can be combined
+with adaptive weights using `_rad_adweights`.  For example,
+`fourier_total_rad` uses residual-based adaptive sampling with static loss
+weights, while `fourier_total_rad_adweights` enables both mechanisms.  RAD
+also leaves the architecture and physical formulation of its base variant
+unchanged.
+
+Variant behavior is token based: `fourier` activates the trainable Fourier
+scales, `modified` activates the gated modified MLP, and `scattered` switches
+from total-field to scattered-field physics; `rad` and `adweights` activate
+their respective training strategies.  The modified MLP uses two tanh encoders
+`U` and `V`, tanh gates `Z`, the blend `(1 - Z) U + Z V`, and a linear
+two-component complex output.
+
+The RAD suffix activates the configured mixture of fresh uniform points and
+points bootstrapped from the residual-weighted candidate distribution.  Its
+candidate count, retained RAD point count, residual parameters, batch size,
+and refresh interval are controlled by the existing `rad_*` JSON fields.
+
+Static loss weights are configured as `[PDE, Neumann, DtN]`.  The CSV histories
+still include `bc_loss = neumann_loss + dtn_loss`, which is used for the PDE/BC
+gradient cosine.
+
+The physical Helmholtz residual is divided by `k0**2` before its mean-square
+loss is computed.  The physical Neumann and DtN residuals are first order and
+are normalized by `k0`; in the implementation this is applied equivalently by
+dividing their squared losses by `k0**2`.  Each Neumann abscissa is evaluated
+on both rigid walls and each DtN ordinate on both ports.
+
+## Optimization
+
+All active variants are trained with Adam only.  There is no L-BFGS phase, no
+gradient clipping, and no learning-rate decay for field weights.
+
+Fourier variants train `sigma` for
 
 ```text
-p_i ∝ epsilon_i^k / mean(epsilon^k) + c,
+N_sigma = max(1, int(fourier_sigma_decay_fraction * adam_steps))
 ```
 
-where `epsilon_i` is the Euclidean magnitude of the complex Helmholtz residual.
-The supplied configurations use `k = 1`, `c = 0.1`, 100,000 candidates, and
-refresh their probabilities every 500 Adam iterations.
+updates.  Its learning rate follows a cosine decay from
+`fourier_sigma_learning_rate` to
+`fourier_sigma_cosine_alpha * fourier_sigma_learning_rate`.  After that point,
+the training step applies `stop_gradient` to `sigma` and forces the Optax sigma
+update to zero, while field weights continue with the same Adam state.
 
-`collocation_adam[0]` remains the total PDE batch size for every variant.  With
-the supplied `rad_points = 512`, each RAD Adam update therefore concatenates
-3,584 fresh uniform points with a fresh 512-point bootstrap **with replacement**
-from the cached candidate distribution.  Before the first adaptive refresh,
-the cached distribution is uniform.  The paired non-RAD and RAD variants keep
-the same boundary clouds and the RAD uniform points are the prefix of the
-non-RAD PDE cloud generated from the same key.  L-BFGS similarly keeps its
-configured total PDE count and replaces 512 regular points by one fixed RAD
-bootstrap because its line search requires a deterministic objective.
-FEM/reference values are never used for sampling or checkpoint selection.
+### Adaptive loss weights
 
-The classical model has the same hidden widths but fewer trainable parameters
-because its two coordinate inputs replace 128 Fourier inputs.  Parameter counts
-are written to every run summary.
+An `_adweights` run requires this JSON object:
+
+```json
+"adweights": {
+  "epsilon": 1e-8,
+  "alpha": 0.1,
+  "initial_lambdas": [0.01, 0.001, 1.0],
+  "update_interval_adam": 500,
+  "custom_weights": [1.0, 1.0, 1.0]
+}
+```
+
+All triplets use the `[PDE, Neumann, DtN]` order.  At Adam step `1`, the three
+raw component losses are differentiated on the exact step batch and recorded,
+while the configured initial weights are retained.  Starting at step
+`1 + update_interval_adam`, the moving averages and weights are updated at the
+configured interval.  For each component update,
+
+```text
+lambda_tilde_i = L2 norm(gradient(loss_i))
+lambda_i = (1 - alpha) lambda_i + alpha lambda_tilde_i
+raw_weight_i = 1 / (epsilon + lambda_i)
+effective_weight_i = custom_weight_i * raw_weight_i
+```
+
+Only currently trainable parameters contribute to the norm, so Fourier
+`sigma` is excluded after it freezes.  The weights are not normalized or
+clipped and are treated as constants during the corresponding Adam update.
+The adaptive objective is reported in the loss history, while
+`checkpoint_best_monitor.npz` is selected using the comparable raw sum
+`PDE + Neumann + DtN`.
 
 ## Install-time verification
 
-The tests use deliberately tiny networks and batches.  They do not load the fine
-FEM files or launch a scientific training run:
+The tests use deliberately tiny networks and batches.  They do not load the
+fine FEM files or launch a scientific training run:
 
 ```bash
 MPLCONFIGDIR=/tmp/matplotlib JAX_PLATFORMS=cpu \
-  .venv/bin/python -m unittest tests_forward_PINN.test_forward_ablation -v
+  .venv/bin/python -m unittest tests.test_forward_ablation -v
 ```
 
 ## One run
 
-The optimizer budgets are required explicitly.  This example is illustrative;
-choose the final report budget before starting:
+The Adam budget is required explicitly.  This example is illustrative; choose
+the final report budget before starting:
 
 ```bash
 XLA_PYTHON_CLIENT_MEM_FRACTION=0.5 \
   .venv/bin/python tests_forward_PINN/forward_ablation.py run \
-  --config tests_forward_PINN/forward_2circles_1200_m0.json \
-  --variant adapted_total \
+  --config tests_forward_PINN/forward_circlebottomright_1200_m0.json \
+  --variant fourier_modified_scattered \
   --seed 0 \
-  --adam-steps 30000 \
-  --lbfgs-steps 500
+  --adam-steps 30000
 ```
 
 The generated run directory is exclusive.  Repeating the same configuration
 refuses to overwrite it.
 
-For the homogeneous analytic control, replace the configuration only:
+For the homogeneous analytic control, replace the configuration:
 
 ```bash
 XLA_PYTHON_CLIENT_MEM_FRACTION=0.5 \
   .venv/bin/python tests_forward_PINN/forward_ablation.py run \
-  --config tests_forward_PINN/forward_homogeneous_1200_m0.json \
-  --variant adapted_total \
+  --config tests_forward_PINN/forward_homogeneous_1200_m0_manual.json \
+  --variant fourier_modified_total \
   --seed 0 \
-  --adam-steps 30000 \
-  --lbfgs-steps 500
+  --adam-steps 30000
 ```
 
-For `adapted_scattered`, the analytic target is `u_s = 0`; reported L2/H1
-errors nevertheless compare the reconstructed physical total field `u0 + us`
-to the exact mode `u0`, as for the other variants.
+For scattered variants, reported L2/H1 errors still compare the reconstructed
+physical total field `u0 + us` to the reference total field.
 
-The same statement applies to `adapted_scattered_RAD`.
+## Campaign
 
-## One-seed RAD comparison
-
-The campaign launches the five variants sequentially in fresh Python
-subprocesses.  Its default is deliberately the single seed `0` for this first
-RAD screening:
-
-```bash
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.5 \
-  .venv/bin/python tests_forward_PINN/forward_ablation.py campaign \
-  --config tests_forward_PINN/forward_2circles_1200_m0.json \
-  --adam-steps 30000 \
-  --lbfgs-steps 500
-```
-
-No campaign is launched automatically by tests or imports.
-
-After changing only the RAD protocol, rerun just the two affected variants with:
+The campaign launches the active variants sequentially in fresh Python
+subprocesses.  By default it launches only the five static variants, and its
+default seed list is deliberately the single seed `0`:
 
 ```bash
 XLA_PYTHON_CLIENT_MEM_FRACTION=0.5 \
   .venv/bin/python tests_forward_PINN/forward_ablation.py campaign \
   --config tests_forward_PINN/forward_circlebottomright_1200_m0.json \
-  --variants adapted_total_RAD,adapted_scattered_RAD \
-  --adam-steps 50000 \
-  --lbfgs-steps 0
+  --adam-steps 30000
 ```
+
+No campaign is launched automatically by tests or imports.
 
 Each run contains:
 
 - `manifest.json` and `effective_config.json`;
-- `loss_history.csv` at the inexpensive fixed-monitor cadence;
+- `loss_history.csv` at the fixed-monitor cadence;
 - `gradient_history.csv` at the configured optimizer-batch cadence;
-- `fem_metrics.csv` at the less frequent reference cadence (the historical
-  filename is retained for plotting compatibility);
+- `adweights_history.csv` for adaptive runs, with the initial state and one
+  row per component at every weight update;
+- `fem_metrics.csv` at the reference cadence;
 - `rad_resampling_history.csv` for RAD runs with at least one probability
   refresh;
 - `checkpoint_final.npz` and `checkpoint_best_monitor.npz`;
-- `summary.json`, including synchronized Adam and L-BFGS times.
+- `summary.json`, including `optimizer_seconds`, `rad_resampling_seconds`,
+  `adweights_seconds`, `training_seconds`, adaptive final weights,
+  `sigma_train_steps`, and final L2/H1 metrics.
 
-By default, fixed losses are evaluated every 200 Adam steps and every 100
-L-BFGS steps.  Raw gradient statistics are evaluated every 500 Adam steps and
-every 250 L-BFGS steps.  Reference L2/H1 errors are evaluated every 1000 Adam
-steps and every 500 L-BFGS steps, plus the initial state, optimizer transition,
-and final state.  These intervals are editable in the JSON configuration.
-
-Synchronized optimizer updates, including the inexpensive per-step bootstrap,
-contribute to `optimizer_seconds`.  Candidate generation, residual evaluation,
-and probability/CDF construction contribute to `rad_resampling_seconds`; their
-sum is `training_seconds`.  Compilation, reference inference, matrix norms,
-checkpoint writes, and plots are excluded.
+Synchronized Adam updates contribute to `optimizer_seconds`.  RAD candidate
+generation, residual evaluation, and probability/CDF construction contribute
+to `rad_resampling_seconds`.  Required adaptive component-gradient
+norms contribute to `adweights_seconds`; their sum with the other two timings
+is `training_seconds`.
+Compilation, reference inference, matrix norms, checkpoint writes, and plots
+are excluded.
 
 ## Aggregate and plot completed runs
 
@@ -174,16 +223,15 @@ MPLCONFIGDIR=/tmp/matplotlib \
 
 The output directory must not already exist.  It receives PDF and PNG figures
 for raw losses, gradient statistics, reference errors versus iterations,
-reference errors versus measured optimizer-plus-RAD time, and training times,
-together with `runs.csv`, `aggregate.csv`, and concatenated histories.  Thin
-lines show individual seeds;
-the main iteration-based lines and bands show the arithmetic mean plus or minus
-one sample standard deviation.  L2/H1 points retain their native, coarser
-cadence.
+reference errors versus measured training time, training times, and adaptive
+raw/effective weights when present, together with `runs.csv`, `aggregate.csv`,
+and concatenated histories including `adweights_history_all.csv`.  Thin lines
+show individual seeds; the main iteration-based lines and bands show the
+arithmetic mean plus or minus one sample standard deviation.
 
-All metrics compare the physical total field.  For the scattered model this
-means evaluating `u0 + us`.  Relative norms use the mass and stiffness matrices
-of either the fine FEM mesh or the independent analytic triangulation:
+All metrics compare the physical total field.  Relative norms use the mass and
+stiffness matrices of either the fine FEM mesh or the independent analytic
+triangulation:
 
 ```text
 relative L2 = sqrt(e* M e) / sqrt(u_ref* M u_ref)

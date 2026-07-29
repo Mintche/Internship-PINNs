@@ -24,8 +24,8 @@ r  = 0.1;   // rayon du défaut
 // ----------------------
 // Paramètres de maillage
 // ----------------------
-h_bulk   = 0.04/4;   // taille dans le milieu
-h_defaut = 0.015/4;  // taille près du défaut
+h_bulk   = 0.01;   // taille dans le milieu
+h_defaut = 0.005;  // taille près du défaut
 
 Mesh.CharacteristicLengthMin = h_defaut;
 Mesh.CharacteristicLengthMax = h_bulk;

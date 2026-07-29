@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Sequence
 
@@ -12,28 +13,22 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
 
-VARIANT_ORDER = (
-    "classical_total",
-    "adapted_total",
-    "adapted_scattered",
-    "adapted_total_RAD",
-    "adapted_scattered_RAD",
-)
-VARIANT_LABELS = {
-    "classical_total": "Classical total",
-    "adapted_total": "Adapted total",
-    "adapted_scattered": "Adapted scattered",
-    "adapted_total_RAD": "Adapted total + Modified RAD",
-    "adapted_scattered_RAD": "Adapted scattered + Modified RAD",
-}
+from tests_forward_PINN.model_variants import VARIANTS, uses_adweights, variant_label
+
+
+VARIANT_ORDER = VARIANTS
 VARIANT_COLORS = {
-    "classical_total": "#4C78A8",
-    "adapted_total": "#F58518",
-    "adapted_scattered": "#54A24B",
-    "adapted_total_RAD": "#E45756",
-    "adapted_scattered_RAD": "#B279A2",
+    variant: plt.get_cmap("tab20")(index)
+    for index, variant in enumerate(VARIANT_ORDER)
 }
+
+
+def _label(variant: str) -> str:
+    return variant_label(variant) if variant in VARIANT_ORDER else variant
 
 
 def discover_runs(campaign_root: str | Path) -> list[Path]:
@@ -46,12 +41,13 @@ def discover_runs(campaign_root: str | Path) -> list[Path]:
 
 def load_campaign_frames(
     campaign_root: str | Path,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     campaign_root = Path(campaign_root)
     summaries = []
     loss_frames = []
     fem_frames = []
     gradient_frames = []
+    adweights_frames = []
     missing_gradient_directories = []
     identities: set[tuple[str, int]] = set()
     for directory in discover_runs(campaign_root):
@@ -67,6 +63,10 @@ def load_campaign_frames(
         fem = pd.read_csv(directory / "fem_metrics.csv")
         gradient_path = directory / "gradient_history.csv"
         gradient = pd.read_csv(gradient_path) if gradient_path.is_file() else None
+        adweights_path = directory / "adweights_history.csv"
+        adweights = (
+            pd.read_csv(adweights_path) if adweights_path.is_file() else None
+        )
         for frame, expected in (
             (loss, "loss_monitor"),
             (fem, "fem_metrics"),
@@ -86,6 +86,17 @@ def load_campaign_frames(
             if set(zip(gradient["variant"], gradient["seed"])) != {identity}:
                 raise ValueError(f"Gradient history identity mismatch in {directory}")
             gradient_frames.append(gradient)
+        if uses_adweights(identity[0]):
+            if adweights is None:
+                raise ValueError(f"Missing adweights history in {directory}")
+            if (
+                adweights.empty
+                or set(adweights["record_type"]) != {"adweights_state"}
+            ):
+                raise ValueError(f"Invalid adweights history in {directory}")
+            if set(zip(adweights["variant"], adweights["seed"])) != {identity}:
+                raise ValueError(f"Adweights history identity mismatch in {directory}")
+            adweights_frames.append(adweights)
         loss_frames.append(loss)
         fem_frames.append(fem)
 
@@ -125,9 +136,8 @@ def load_campaign_frames(
                 )
 
     runs = pd.DataFrame(summaries)
-    for column in ("adam_steps", "lbfgs_steps"):
-        if column in runs and runs[column].nunique() != 1:
-            raise ValueError(f"Runs use inconsistent {column} values")
+    if "adam_steps" in runs and runs["adam_steps"].nunique() != 1:
+        raise ValueError("Runs use inconsistent adam_steps values")
     losses = pd.concat(loss_frames, ignore_index=True)
     fem_metrics = pd.concat(fem_frames, ignore_index=True)
     gradients = (
@@ -135,15 +145,22 @@ def load_campaign_frames(
         if gradient_frames
         else pd.DataFrame()
     )
-    return runs, losses, fem_metrics, gradients
+    adweights_history = (
+        pd.concat(adweights_frames, ignore_index=True)
+        if adweights_frames
+        else pd.DataFrame()
+    )
+    return runs, losses, fem_metrics, gradients, adweights_history
 
 
 def aggregate_runs(runs: pd.DataFrame) -> pd.DataFrame:
+    runs = runs.copy()
+    if "adweights_seconds" not in runs:
+        runs["adweights_seconds"] = 0.0
     metrics = [
         "optimizer_seconds",
-        "adam_optimizer_seconds",
-        "lbfgs_optimizer_seconds",
         "rad_resampling_seconds",
+        "adweights_seconds",
         "training_seconds",
         "final_l2_relative",
         "final_h1_relative",
@@ -192,20 +209,6 @@ def _positive_plot_floor(frame: pd.DataFrame, metric: str) -> float:
     return max(0.5 * float(positive.min()), np.finfo(float).tiny)
 
 
-def _mark_phase_switch(axis: plt.Axes, frame: pd.DataFrame) -> None:
-    if "phase" in frame and "local_step" in frame:
-        lbfgs = frame.loc[frame["phase"] == "lbfgs"]
-        if not lbfgs.empty:
-            switches = np.unique(
-                lbfgs["global_step"].to_numpy(dtype=int)
-                - lbfgs["local_step"].to_numpy(dtype=int)
-            )
-            if switches.size == 1:
-                axis.axvline(
-                    switches[0], color="0.35", linestyle="--", linewidth=1.0
-                )
-
-
 def _plot_positive_history(
     axis: plt.Axes,
     frame: pd.DataFrame,
@@ -240,11 +243,10 @@ def _plot_positive_history(
             mean,
             color=color,
             linewidth=2.0,
-            label=VARIANT_LABELS[variant],
+            label=_label(variant),
         )
         axis.fill_between(x, lower, mean + std, color=color, alpha=0.2)
-    _mark_phase_switch(axis, frame)
-    axis.set_xlabel("Global optimizer iteration")
+    axis.set_xlabel("Steps")
     axis.set_ylabel(ylabel)
     axis.grid(True, which="both", alpha=0.25)
 
@@ -258,7 +260,8 @@ def _all_finite_values_are_positive(frame: pd.DataFrame, metrics: Sequence[str])
 def _plot_gradient_norm_history(axis: plt.Axes, gradients: pd.DataFrame) -> None:
     metrics = (
         ("pde_gradient_l2_norm", "PDE", "-"),
-        ("bc_gradient_l2_norm", "BC", "--"),
+        ("neumann_gradient_l2_norm", "Neumann", "--"),
+        ("dtn_gradient_l2_norm", "DtN", ":"),
     )
     use_log = _all_finite_values_are_positive(
         gradients, [metric for metric, _, _ in metrics]
@@ -298,7 +301,7 @@ def _plot_gradient_norm_history(axis: plt.Axes, gradients: pd.DataFrame) -> None
                     color=color,
                     linewidth=2.0,
                     linestyle=linestyle,
-                    label=f"{VARIANT_LABELS[variant]} {metric_label}",
+                    label=f"{_label(variant)} {metric_label}",
                 )
                 axis.fill_between(x, lower, mean + std, color=color, alpha=0.12)
             else:
@@ -308,10 +311,9 @@ def _plot_gradient_norm_history(axis: plt.Axes, gradients: pd.DataFrame) -> None
                     color=color,
                     linewidth=2.0,
                     linestyle=linestyle,
-                    label=f"{VARIANT_LABELS[variant]} {metric_label}",
+                    label=f"{_label(variant)} {metric_label}",
                 )
                 axis.fill_between(x, mean - std, mean + std, color=color, alpha=0.12)
-    _mark_phase_switch(axis, gradients)
     axis.set_xlabel("Global optimizer iteration")
     axis.set_ylabel("Gradient L2 norm")
     axis.grid(True, which="both", alpha=0.25)
@@ -346,21 +348,21 @@ def _plot_linear_history(
             mean,
             color=color,
             linewidth=2.0,
-            label=VARIANT_LABELS[variant],
+            label=_label(variant),
         )
         axis.fill_between(x, mean - std, mean + std, color=color, alpha=0.2)
-    _mark_phase_switch(axis, frame)
     axis.set_xlabel("Global optimizer iteration")
     axis.set_ylabel(ylabel)
     axis.grid(True, which="both", alpha=0.25)
 
 
 def create_loss_figure(losses: pd.DataFrame) -> plt.Figure:
-    figure, axes = plt.subplots(1, 3, figsize=(16, 4.7), sharex=True)
+    figure, axes = plt.subplots(1, 4, figsize=(19, 4.7), sharex=True)
     panels = (
         ("unweighted_total", "Unweighted PDE + BC"),
         ("pde_loss", "Raw PDE loss"),
-        ("bc_loss", "Raw boundary loss"),
+        ("neumann_loss", "Raw Neumann loss"),
+        ("dtn_loss", "Raw DtN loss"),
     )
     for axis, (metric, label) in zip(axes, panels):
         _plot_positive_history(axis, losses, metric, label)
@@ -389,6 +391,8 @@ def create_gradient_figure(gradients: pd.DataFrame) -> plt.Figure:
         "seed",
         "global_step",
         "pde_gradient_l2_norm",
+        "neumann_gradient_l2_norm",
+        "dtn_gradient_l2_norm",
         "bc_gradient_l2_norm",
         "pde_bc_gradient_cosine",
     }
@@ -408,6 +412,66 @@ def create_gradient_figure(gradients: pd.DataFrame) -> plt.Figure:
     axes[1].set_ylim(-1.05, 1.05)
     axes[1].set_title("PDE/BC gradient cosine")
     axes[0].legend(loc="best", fontsize="small")
+    figure.tight_layout()
+    return figure
+
+
+def create_adweights_figure(adweights: pd.DataFrame) -> plt.Figure:
+    required = {
+        "variant",
+        "seed",
+        "global_step",
+        "component",
+        "inverse_weight",
+        "effective_weight",
+    }
+    missing = sorted(required - set(adweights.columns))
+    if missing:
+        raise ValueError(f"Adweights table is missing columns: {missing}")
+    components = (
+        ("pde", "PDE", "-"),
+        ("neumann", "Neumann", "--"),
+        ("dtn", "DtN", ":"),
+    )
+    figure, axes = plt.subplots(1, 2, figsize=(13, 4.9), sharex=True)
+    for axis, metric, title in (
+        (axes[0], "inverse_weight", "Raw inverse weights"),
+        (axes[1], "effective_weight", "Custom-scaled effective weights"),
+    ):
+        use_log = _all_finite_values_are_positive(adweights, [metric])
+        for component, component_label, linestyle in components:
+            component_rows = adweights.loc[adweights["component"] == component]
+            for variant in VARIANT_ORDER:
+                subset = component_rows.loc[component_rows["variant"] == variant]
+                if subset.empty:
+                    continue
+                color = VARIANT_COLORS[variant]
+                for _, individual in subset.groupby("seed"):
+                    individual = individual.sort_values("global_step")
+                    plotter = axis.semilogy if use_log else axis.plot
+                    plotter(
+                        individual["global_step"],
+                        individual[metric],
+                        color=color,
+                        alpha=0.14,
+                        linewidth=0.8,
+                        linestyle=linestyle,
+                    )
+                aggregate = _mean_std(subset, metric)
+                plotter = axis.semilogy if use_log else axis.plot
+                plotter(
+                    aggregate["global_step"],
+                    aggregate["mean"],
+                    color=color,
+                    linewidth=2.0,
+                    linestyle=linestyle,
+                    label=f"{_label(variant)} {component_label}",
+                )
+        axis.set_xlabel("Global optimizer iteration")
+        axis.set_ylabel("Loss weight")
+        axis.set_title(title)
+        axis.grid(True, which="both", alpha=0.25)
+    axes[0].legend(loc="best", fontsize="x-small")
     figure.tight_layout()
     return figure
 
@@ -436,9 +500,9 @@ def create_error_time_figure(fem_metrics: pd.DataFrame) -> plt.Figure:
                     color=color,
                     alpha=0.8,
                     linewidth=1.5,
-                    label=(VARIANT_LABELS[variant] if seed_index == 0 else None),
+                    label=(_label(variant) if seed_index == 0 else None),
                 )
-        axis.set_xlabel("Measured optimizer + modified RAD time [s]")
+        axis.set_xlabel("Measured training time [s]")
         axis.set_ylabel(label)
         axis.set_title(label)
         axis.grid(True, which="both", alpha=0.25)
@@ -448,16 +512,35 @@ def create_error_time_figure(fem_metrics: pd.DataFrame) -> plt.Figure:
 
 
 def create_timing_figure(runs: pd.DataFrame) -> plt.Figure:
-    figure, axes = plt.subplots(1, 4, figsize=(19, 4.7), sharey=True)
-    panels = (
-        ("adam_optimizer_seconds", "Adam"),
-        ("lbfgs_optimizer_seconds", "L-BFGS"),
-        ("rad_resampling_seconds", "Modified RAD resampling"),
-        ("training_seconds", "Optimizer + Modified RAD"),
+    if "adweights_seconds" not in runs:
+        runs = runs.assign(adweights_seconds=0.0)
+    panels = [("optimizer_seconds", "Adam optimizer")]
+    has_rad_time = (
+        "rad_resampling_seconds" in runs
+        and bool(np.any(runs["rad_resampling_seconds"].to_numpy(dtype=float) > 0.0))
     )
+    if has_rad_time:
+        panels.append(("rad_resampling_seconds", "RAD resampling"))
+    has_adweights_time = bool(
+        np.any(runs["adweights_seconds"].to_numpy(dtype=float) > 0.0)
+    )
+    if has_adweights_time:
+        panels.append(("adweights_seconds", "Adaptive-weight updates"))
+    if has_rad_time or has_adweights_time:
+        panels.append(("training_seconds", "Total training"))
+    figure, axes = plt.subplots(
+        1,
+        len(panels),
+        figsize=(max(5.5, 4.8 * len(panels)), 4.7),
+        sharey=True,
+    )
+    axes = np.atleast_1d(axes)
+    variants = [
+        variant for variant in VARIANT_ORDER if not runs.loc[runs["variant"] == variant].empty
+    ]
     random = np.random.default_rng(0)
     for axis, (metric, title) in zip(axes, panels):
-        for index, variant in enumerate(VARIANT_ORDER):
+        for index, variant in enumerate(variants):
             values = runs.loc[runs["variant"] == variant, metric].to_numpy(dtype=float)
             if values.size == 0:
                 continue
@@ -479,9 +562,9 @@ def create_timing_figure(runs: pd.DataFrame) -> plt.Figure:
                 capsize=4,
                 linewidth=1.4,
             )
-        axis.set_xticks(range(len(VARIANT_ORDER)))
+        axis.set_xticks(range(len(variants)))
         axis.set_xticklabels(
-            [VARIANT_LABELS[value] for value in VARIANT_ORDER], rotation=20, ha="right"
+            [_label(value) for value in variants], rotation=20, ha="right"
         )
         axis.set_title(title)
         axis.grid(True, axis="y", alpha=0.25)
@@ -503,7 +586,9 @@ def write_campaign_outputs(
 ) -> Path:
     output = Path(output_directory)
     output.mkdir(parents=True, exist_ok=False)
-    runs, losses, fem_metrics, gradients = load_campaign_frames(campaign_root)
+    runs, losses, fem_metrics, gradients, adweights = load_campaign_frames(
+        campaign_root
+    )
     aggregate = aggregate_runs(runs)
     runs.sort_values(["variant", "seed"]).to_csv(output / "runs.csv", index=False)
     aggregate.to_csv(output / "aggregate.csv", index=False)
@@ -517,6 +602,10 @@ def write_campaign_outputs(
         gradients.sort_values(["variant", "seed", "global_step"]).to_csv(
             output / "gradient_history_all.csv", index=False
         )
+    if not adweights.empty:
+        adweights.sort_values(
+            ["variant", "seed", "global_step", "component"]
+        ).to_csv(output / "adweights_history_all.csv", index=False)
 
     figures = {
         "losses": create_loss_figure(losses),
@@ -526,6 +615,8 @@ def write_campaign_outputs(
     }
     if not gradients.empty:
         figures["gradient_stats"] = create_gradient_figure(gradients)
+    if not adweights.empty:
+        figures["adweights_weights"] = create_adweights_figure(adweights)
     for name, figure in figures.items():
         _save_figure(figure, output / name)
     if show:

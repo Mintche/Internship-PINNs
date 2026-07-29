@@ -31,8 +31,8 @@ y_bar = 0.05;
 // ----------------------
 // Paramètres de maillage
 // ----------------------
-h_bulk   = 0.04;   // taille dans le milieu
-h_defaut = 0.015;  // taille près du défaut
+h_bulk   = 0.01;   // taille dans le milieu
+h_defaut = 0.005;  // taille près du défaut
 
 Mesh.CharacteristicLengthMin = h_defaut;
 Mesh.CharacteristicLengthMax = h_bulk;

@@ -39,8 +39,8 @@ DefineConstant[
 // -----------------------------------------------------------------------------
 // Parametres de maillage
 // -----------------------------------------------------------------------------
-h_bulk   = 0.04;
-h_defaut = 0.015;
+h_bulk   = 0.01;
+h_defaut = 0.005;
 
 Mesh.CharacteristicLengthMin = h_defaut;
 Mesh.CharacteristicLengthMax = h_bulk;

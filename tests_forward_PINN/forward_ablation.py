@@ -35,12 +35,21 @@ from tools.experiment_manifest import (
     configuration_id,
     write_manifest_exclusive,
 )
+from tests_forward_PINN.model_variants import (
+    BASE_VARIANTS,
+    VARIANTS,
+    _validate_variant,
+    initialize_model,
+    is_rad_variant,
+    is_scattered_variant,
+    model_value,
+    uses_adweights,
+    uses_fourier_features,
+    value_gradient_laplacian,
+    variant_parameter_count,
+)
 
 
-BASE_VARIANTS = ("classical_total", "adapted_total", "adapted_scattered")
-RAD_VARIANTS = ("adapted_total_RAD", "adapted_scattered_RAD")
-VARIANTS = (*BASE_VARIANTS, *RAD_VARIANTS)
-SCATTERED_VARIANTS = ("adapted_scattered", "adapted_scattered_RAD")
 RAD_REFERENCE = "https://arxiv.org/abs/2207.10289"
 RAD_SAMPLING_PROTOCOL = "uniform_plus_candidate_bootstrap_with_replacement_v2"
 
@@ -50,6 +59,67 @@ class Circle:
     center: tuple[float, float]
     radius: float
     speed_ratio: float
+
+
+@dataclass(frozen=True)
+class AdWeightsConfig:
+    epsilon: float
+    alpha: float
+    initial_lambdas: tuple[float, float, float]
+    update_interval_adam: int
+    custom_weights: tuple[float, float, float]
+
+    @classmethod
+    def from_mapping(cls, raw: Mapping[str, Any]) -> "AdWeightsConfig":
+        expected = {
+            "epsilon",
+            "alpha",
+            "initial_lambdas",
+            "update_interval_adam",
+            "custom_weights",
+        }
+        missing = sorted(expected - set(raw))
+        unknown = sorted(set(raw) - expected)
+        if missing or unknown:
+            raise ValueError(
+                f"Invalid adweights configuration keys; missing={missing}, "
+                f"unknown={unknown}"
+            )
+
+        def triplet(name: str) -> tuple[float, float, float]:
+            values = tuple(float(value) for value in raw[name])
+            if len(values) != 3:
+                raise ValueError(f"adweights.{name} must contain three values")
+            return values
+
+        config = cls(
+            epsilon=float(raw["epsilon"]),
+            alpha=float(raw["alpha"]),
+            initial_lambdas=triplet("initial_lambdas"),
+            update_interval_adam=int(raw["update_interval_adam"]),
+            custom_weights=triplet("custom_weights"),
+        )
+        config.validate()
+        return config
+
+    def validate(self) -> None:
+        scalars = (self.epsilon, self.alpha, *self.initial_lambdas, *self.custom_weights)
+        if not all(math.isfinite(value) for value in scalars):
+            raise ValueError("All adweights values must be finite")
+        if self.epsilon <= 0.0:
+            raise ValueError("adweights.epsilon must be positive")
+        if not 0.0 <= self.alpha <= 1.0:
+            raise ValueError("adweights.alpha must lie in [0, 1]")
+        if min(self.initial_lambdas) < 0.0:
+            raise ValueError("adweights.initial_lambdas must be non-negative")
+        if min(self.custom_weights) < 0.0 or not any(
+            value > 0.0 for value in self.custom_weights
+        ):
+            raise ValueError(
+                "adweights.custom_weights must be non-negative and not all zero"
+            )
+        if self.update_interval_adam <= 0:
+            raise ValueError("adweights.update_interval_adam must be positive")
 
 
 @dataclass(frozen=True)
@@ -64,16 +134,13 @@ class ForwardConfig:
     hidden_layers: tuple[int, ...]
     fourier_features: int
     classical_learning_rate: float
-    adapted_field_learning_rate: float
-    adapted_sigma_learning_rate: float
-    gradient_clip_norm: float
-    adapted_field_cosine_alpha: float
-    adapted_sigma_decay_fraction: float
-    adapted_sigma_cosine_alpha: float
-    classical_loss_weights: tuple[float, float]
-    adapted_loss_weights: tuple[float, float]
+    fourier_field_learning_rate: float
+    fourier_sigma_learning_rate: float
+    fourier_sigma_decay_fraction: float
+    fourier_sigma_cosine_alpha: float
+    classical_loss_weights: tuple[float, float, float]
+    fourier_loss_weights: tuple[float, float, float]
     collocation_adam: tuple[int, int, int]
-    collocation_lbfgs: tuple[int, int, int]
     collocation_monitor: tuple[int, int, int]
     rad_k: float
     rad_c: float
@@ -82,11 +149,8 @@ class ForwardConfig:
     rad_candidate_points: int
     rad_candidate_batch_size: int
     loss_eval_interval_adam: int
-    loss_eval_interval_lbfgs: int
     fem_eval_interval_adam: int
-    fem_eval_interval_lbfgs: int
     gradient_eval_interval_adam: int
-    gradient_eval_interval_lbfgs: int
     fem_prediction_batch_size: int
     reference_kind: str
     analytic_triangulation: tuple[int, int] | None
@@ -94,6 +158,7 @@ class ForwardConfig:
     mass_matrix: Path | None
     stiffness_matrix: Path | None
     output_root: Path
+    adweights: AdWeightsConfig | None
 
     @classmethod
     def from_json(cls, path: str | Path) -> "ForwardConfig":
@@ -109,20 +174,18 @@ class ForwardConfig:
             "fem_field",
             "mass_matrix",
             "stiffness_matrix",
+            "adweights",
         }
-        allowed = set(cls.__dataclass_fields__) | {"circles"}
-        required = allowed - optional
+        required = set(cls.__dataclass_fields__) | {"circles"}
+        required -= optional
         reference_kind = str(raw.get("reference_kind", "fem"))
         if reference_kind == "fem":
             required |= {"fem_field", "mass_matrix", "stiffness_matrix"}
         elif reference_kind == "analytic_mode":
             required |= {"analytic_triangulation"}
-        unknown = sorted(set(raw) - allowed)
         missing = sorted(required - set(raw))
-        if unknown or missing:
-            raise ValueError(
-                f"Invalid configuration keys; missing={missing}, unknown={unknown}"
-            )
+        if missing:
+            raise ValueError(f"Invalid configuration keys; missing={missing}")
 
         circles = tuple(
             Circle(
@@ -139,10 +202,10 @@ class ForwardConfig:
                 raise ValueError(f"{name} must contain three positive integers")
             return values
 
-        def pair(name: str) -> tuple[float, float]:
+        def loss_weight_triplet(name: str) -> tuple[float, float, float]:
             values = tuple(float(value) for value in raw[name])
-            if len(values) != 2 or min(values) <= 0.0:
-                raise ValueError(f"{name} must contain two positive values")
+            if len(values) != 3 or min(values) <= 0.0:
+                raise ValueError(f"{name} must contain three positive values")
             return values
 
         def integer_pair(name: str) -> tuple[int, int]:
@@ -166,16 +229,13 @@ class ForwardConfig:
             hidden_layers=tuple(int(value) for value in raw["hidden_layers"]),
             fourier_features=int(raw["fourier_features"]),
             classical_learning_rate=float(raw["classical_learning_rate"]),
-            adapted_field_learning_rate=float(raw["adapted_field_learning_rate"]),
-            adapted_sigma_learning_rate=float(raw["adapted_sigma_learning_rate"]),
-            gradient_clip_norm=float(raw["gradient_clip_norm"]),
-            adapted_field_cosine_alpha=float(raw["adapted_field_cosine_alpha"]),
-            adapted_sigma_decay_fraction=float(raw["adapted_sigma_decay_fraction"]),
-            adapted_sigma_cosine_alpha=float(raw["adapted_sigma_cosine_alpha"]),
-            classical_loss_weights=pair("classical_loss_weights"),
-            adapted_loss_weights=pair("adapted_loss_weights"),
+            fourier_field_learning_rate=float(raw["fourier_field_learning_rate"]),
+            fourier_sigma_learning_rate=float(raw["fourier_sigma_learning_rate"]),
+            fourier_sigma_decay_fraction=float(raw["fourier_sigma_decay_fraction"]),
+            fourier_sigma_cosine_alpha=float(raw["fourier_sigma_cosine_alpha"]),
+            classical_loss_weights=loss_weight_triplet("classical_loss_weights"),
+            fourier_loss_weights=loss_weight_triplet("fourier_loss_weights"),
             collocation_adam=triple("collocation_adam"),
-            collocation_lbfgs=triple("collocation_lbfgs"),
             collocation_monitor=triple("collocation_monitor"),
             rad_k=float(raw["rad_k"]),
             rad_c=float(raw["rad_c"]),
@@ -184,11 +244,8 @@ class ForwardConfig:
             rad_candidate_points=int(raw["rad_candidate_points"]),
             rad_candidate_batch_size=int(raw["rad_candidate_batch_size"]),
             loss_eval_interval_adam=int(raw["loss_eval_interval_adam"]),
-            loss_eval_interval_lbfgs=int(raw["loss_eval_interval_lbfgs"]),
             fem_eval_interval_adam=int(raw["fem_eval_interval_adam"]),
-            fem_eval_interval_lbfgs=int(raw["fem_eval_interval_lbfgs"]),
             gradient_eval_interval_adam=int(raw["gradient_eval_interval_adam"]),
-            gradient_eval_interval_lbfgs=int(raw["gradient_eval_interval_lbfgs"]),
             fem_prediction_batch_size=int(raw["fem_prediction_batch_size"]),
             reference_kind=reference_kind,
             analytic_triangulation=(
@@ -206,11 +263,20 @@ class ForwardConfig:
                 else None
             ),
             output_root=repository_path("output_root"),
+            adweights=(
+                AdWeightsConfig.from_mapping(raw["adweights"])
+                if isinstance(raw.get("adweights"), dict)
+                else None
+            ),
         )
+        if "adweights" in raw and not isinstance(raw["adweights"], dict):
+            raise ValueError("adweights must be a JSON object")
         config.validate()
         return config
 
     def validate(self) -> None:
+        if self.adweights is not None:
+            self.adweights.validate()
         if self.frequency <= 0.0 or self.height <= 0.0 or self.half_length <= 0.0:
             raise ValueError("frequency and domain dimensions must be positive")
         if self.mode < 0 or self.c0 <= 0.0:
@@ -243,28 +309,23 @@ class ForwardConfig:
             raise ValueError("feature and reference batch counts must be positive")
         positive_scalars = (
             self.classical_learning_rate,
-            self.adapted_field_learning_rate,
-            self.adapted_sigma_learning_rate,
-            self.gradient_clip_norm,
-            self.adapted_sigma_decay_fraction,
+            self.fourier_field_learning_rate,
+            self.fourier_sigma_learning_rate,
+            self.fourier_sigma_decay_fraction,
         )
         if min(positive_scalars) <= 0.0:
-            raise ValueError("learning rates, clipping, and decay fraction must be positive")
-        if not 0.0 <= self.adapted_field_cosine_alpha <= 1.0:
-            raise ValueError("adapted_field_cosine_alpha must lie in [0, 1]")
-        if not 0.0 <= self.adapted_sigma_cosine_alpha <= 1.0:
-            raise ValueError("adapted_sigma_cosine_alpha must lie in [0, 1]")
-        if not 0.0 < self.adapted_sigma_decay_fraction <= 1.0:
-            raise ValueError("adapted_sigma_decay_fraction must lie in (0, 1]")
+            raise ValueError("learning rates and decay fraction must be positive")
+        if not 0.0 <= self.fourier_sigma_cosine_alpha <= 1.0:
+            raise ValueError("fourier_sigma_cosine_alpha must lie in [0, 1]")
+        if not 0.0 < self.fourier_sigma_decay_fraction <= 1.0:
+            raise ValueError("fourier_sigma_decay_fraction must lie in (0, 1]")
         if self.rad_k < 0.0 or self.rad_c < 0.0:
             raise ValueError("RAD k and c must be non-negative")
         if self.rad_points <= 0:
             raise ValueError("rad_points must be positive")
-        if self.rad_points >= min(
-            self.collocation_adam[0], self.collocation_lbfgs[0]
-        ):
+        if self.rad_points >= self.collocation_adam[0]:
             raise ValueError(
-                "rad_points must be smaller than the Adam and L-BFGS PDE counts"
+                "rad_points must be smaller than the Adam PDE counts"
             )
         if min(
             self.rad_resample_interval_adam,
@@ -274,18 +335,12 @@ class ForwardConfig:
             raise ValueError("RAD interval and candidate counts must be positive")
         intervals = (
             self.loss_eval_interval_adam,
-            self.loss_eval_interval_lbfgs,
             self.fem_eval_interval_adam,
-            self.fem_eval_interval_lbfgs,
             self.gradient_eval_interval_adam,
-            self.gradient_eval_interval_lbfgs,
         )
         if min(intervals) <= 0:
             raise ValueError("All evaluation intervals must be positive")
-        if (
-            self.fem_eval_interval_adam < self.loss_eval_interval_adam
-            or self.fem_eval_interval_lbfgs < self.loss_eval_interval_lbfgs
-        ):
+        if (self.fem_eval_interval_adam < self.loss_eval_interval_adam):
             raise ValueError(
                 "FEM evaluation intervals must not be shorter than loss intervals"
             )
@@ -308,6 +363,21 @@ class ForwardConfig:
             values[name] = str(value) if value is not None else None
         values["output_root"] = str(self.output_root)
         return canonical_manifest(values)
+
+
+def require_adweights_config(
+    config: ForwardConfig, variant: str
+) -> AdWeightsConfig:
+    _validate_variant(variant)
+    if not uses_adweights(variant):
+        raise ValueError(f"Variant {variant!r} does not use adaptive weights")
+    if config.adweights is None:
+        raise ValueError(
+            f"Variant {variant!r} requires an 'adweights' JSON object with "
+            "epsilon, alpha, initial_lambdas, update_interval_adam, and "
+            "custom_weights"
+        )
+    return config.adweights
 
 
 @dataclass(frozen=True)
@@ -341,56 +411,6 @@ class MisfitMetrics:
     h1_relative: float
 
 
-def _init_layers(key: jax.Array, dimensions: Sequence[int]) -> list[dict[str, jax.Array]]:
-    keys = jax.random.split(key, len(dimensions) - 1)
-    layers = []
-    for layer_key, fan_in, fan_out in zip(keys, dimensions[:-1], dimensions[1:]):
-        scale = jnp.sqrt(2.0 / (fan_in + fan_out))
-        layers.append(
-            {
-                "W": jax.random.normal(layer_key, (fan_in, fan_out)) * scale,
-                "b": jnp.zeros((fan_out,), dtype=jnp.float32),
-            }
-        )
-    return layers
-
-
-def initialize_model(
-    key: jax.Array,
-    config: ForwardConfig,
-    variant: str,
-) -> tuple[dict[str, Any], jax.Array]:
-    """Initialize one field model and its fixed Fourier basis."""
-    _validate_variant(variant)
-    basis_key, layers_key = jax.random.split(key)
-    b_base = jax.random.normal(
-        basis_key, (config.fourier_features, 2), dtype=jnp.float32
-    )
-    if variant == "classical_total":
-        dimensions = (2, *config.hidden_layers, 2)
-        return {"layers": _init_layers(layers_key, dimensions)}, b_base
-
-    dimensions = (2 * config.fourier_features, *config.hidden_layers, 2)
-    layers = _init_layers(layers_key, dimensions)
-    # Preserve the stabilized output initialization of the scattered pipeline,
-    # identically for both adapted formulations.
-    layers[-1]["W"] = layers[-1]["W"] / 10.0
-    kx = 2.0 * jnp.pi * config.frequency / config.c0
-    ky_index = config.mode + int(config.mode == 0)
-    ky = ky_index * jnp.pi / config.height
-    return {
-        "layers": layers,
-        "sigma": jnp.asarray([kx, ky], dtype=jnp.float32),
-    }, b_base
-
-
-def variant_parameter_count(config: ForwardConfig, variant: str) -> int:
-    params, _ = initialize_model(jax.random.key(0), config, variant)
-    return int(
-        sum(np.prod(leaf.shape, dtype=np.int64) for leaf in jax.tree_util.tree_leaves(params))
-    )
-
-
 def _build_context(config: ForwardConfig, b_base: jax.Array) -> ForwardContext:
     n_modes = int(round(2.0 * config.height * config.frequency / config.c0)) + 5
     nodes, weights = np.polynomial.legendre.leggauss(3 * n_modes)
@@ -418,132 +438,6 @@ def _build_context(config: ForwardConfig, b_base: jax.Array) -> ForwardContext:
         modal_basis_quadrature=jnp.asarray(basis, dtype=jnp.float32),
         field_scale=float(modal_scales[config.mode]),
     )
-
-
-def _validate_variant(variant: str) -> None:
-    if variant not in VARIANTS:
-        raise ValueError(f"Unknown variant {variant!r}; expected one of {VARIANTS}")
-
-
-def is_rad_variant(variant: str) -> bool:
-    _validate_variant(variant)
-    return variant in RAD_VARIANTS
-
-
-def is_scattered_variant(variant: str) -> bool:
-    _validate_variant(variant)
-    return variant in SCATTERED_VARIANTS
-
-
-def _forward_layers(layers: Sequence[Mapping[str, jax.Array]], values: jax.Array) -> jax.Array:
-    for layer in layers[:-1]:
-        values = jax.nn.tanh(values @ layer["W"] + layer["b"])
-    return values @ layers[-1]["W"] + layers[-1]["b"]
-
-
-def _adapted_features(
-    params: Mapping[str, Any], context: ForwardContext, x: jax.Array, y: jax.Array
-) -> jax.Array:
-    x_physical = x * context.config.half_length
-    y_physical = (y + 1.0) * context.config.height / 2.0
-    wavevectors = context.b_base * params["sigma"]
-    projection = wavevectors[:, 0] * x_physical + wavevectors[:, 1] * y_physical
-    return jnp.concatenate((jnp.cos(projection), jnp.sin(projection)))
-
-
-def model_value(
-    params: Mapping[str, Any],
-    context: ForwardContext,
-    variant: str,
-    x: jax.Array,
-    y: jax.Array,
-) -> jax.Array:
-    if variant == "classical_total":
-        features = jnp.stack((x, y))
-    else:
-        features = _adapted_features(params, context, x, y)
-    return _forward_layers(params["layers"], features)
-
-
-def adapted_value_gradient_laplacian(
-    params: Mapping[str, Any], context: ForwardContext, x: jax.Array, y: jax.Array
-) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Propagate value, physical gradient, and physical Laplacian analytically."""
-    wavevectors = context.b_base * params["sigma"]
-    x_physical = x * context.config.half_length
-    y_physical = (y + 1.0) * context.config.height / 2.0
-    projection = wavevectors[:, 0] * x_physical + wavevectors[:, 1] * y_physical
-    cosine = jnp.cos(projection)
-    sine = jnp.sin(projection)
-    value = jnp.concatenate((cosine, sine))
-    projection_gradient = wavevectors.T
-    gradient = jnp.concatenate(
-        (
-            -sine[None, :] * projection_gradient,
-            cosine[None, :] * projection_gradient,
-        ),
-        axis=1,
-    )
-    frequency_squared = jnp.sum(projection_gradient**2, axis=0)
-    laplacian = jnp.concatenate(
-        (-cosine * frequency_squared, -sine * frequency_squared)
-    )
-
-    for layer in params["layers"][:-1]:
-        preactivation = value @ layer["W"] + layer["b"]
-        preactivation_gradient = gradient @ layer["W"]
-        preactivation_laplacian = laplacian @ layer["W"]
-        value = jax.nn.tanh(preactivation)
-        first = 1.0 - value**2
-        gradient = first[None, :] * preactivation_gradient
-        laplacian = first * (
-            preactivation_laplacian
-            - 2.0 * value * jnp.sum(preactivation_gradient**2, axis=0)
-        )
-
-    output = params["layers"][-1]
-    return (
-        value @ output["W"] + output["b"],
-        gradient @ output["W"],
-        laplacian @ output["W"],
-    )
-
-
-def classical_value_gradient_laplacian(
-    params: Mapping[str, Any], context: ForwardContext, x: jax.Array, y: jax.Array
-) -> tuple[jax.Array, jax.Array, jax.Array]:
-    def value_function(x_value: jax.Array, y_value: jax.Array) -> jax.Array:
-        return model_value(params, context, "classical_total", x_value, y_value)
-
-    value = value_function(x, y)
-    dx = jax.jacfwd(value_function, argnums=0)(x, y) / context.config.half_length
-    dy = (
-        jax.jacfwd(value_function, argnums=1)(x, y)
-        * 2.0
-        / context.config.height
-    )
-    dxx = (
-        jax.jacfwd(jax.jacfwd(value_function, argnums=0), argnums=0)(x, y)
-        / context.config.half_length**2
-    )
-    dyy = (
-        jax.jacfwd(jax.jacfwd(value_function, argnums=1), argnums=1)(x, y)
-        * (2.0 / context.config.height) ** 2
-    )
-    return value, jnp.stack((dx, dy)), dxx + dyy
-
-
-def value_gradient_laplacian(
-    params: Mapping[str, Any],
-    context: ForwardContext,
-    variant: str,
-    x: jax.Array,
-    y: jax.Array,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
-    if variant == "classical_total":
-        return classical_value_gradient_laplacian(params, context, x, y)
-    return adapted_value_gradient_laplacian(params, context, x, y)
-
 
 def true_squared_slowness(
     context: ForwardContext, x: jax.Array, y: jax.Array
@@ -782,11 +676,46 @@ def sample_mixed_rad_collocation_points(
     )
 
 
+ADWEIGHTS_COMPONENTS = ("pde", "neumann", "dtn")
+
+
+def adweights_from_lambdas(
+    config: AdWeightsConfig, lambdas: jax.Array | Sequence[float]
+) -> tuple[jax.Array, jax.Array]:
+    """Return raw inverse weights and custom-scaled effective weights."""
+    lambdas_array = jnp.asarray(lambdas, dtype=jnp.float32)
+    if lambdas_array.shape != (3,):
+        raise ValueError("Adaptive lambdas must have shape (3,)")
+    inverse_weights = 1.0 / (config.epsilon + lambdas_array)
+    effective_weights = (
+        jnp.asarray(config.custom_weights, dtype=jnp.float32) * inverse_weights
+    )
+    return inverse_weights, effective_weights
+
+
+def update_adweights_lambdas(
+    config: AdWeightsConfig,
+    lambdas: jax.Array | Sequence[float],
+    gradient_norms: jax.Array | Sequence[float],
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Apply the configured exponential update and derive both weight forms."""
+    lambdas_array = jnp.asarray(lambdas, dtype=jnp.float32)
+    norms_array = jnp.asarray(gradient_norms, dtype=jnp.float32)
+    if lambdas_array.shape != (3,) or norms_array.shape != (3,):
+        raise ValueError("Adaptive lambdas and gradient norms must have shape (3,)")
+    updated = (1.0 - config.alpha) * lambdas_array + config.alpha * norms_array
+    inverse_weights, effective_weights = adweights_from_lambdas(config, updated)
+    return updated, inverse_weights, effective_weights
+
+
 def loss_weights(config: ForwardConfig, variant: str) -> jax.Array:
+    if uses_adweights(variant):
+        adaptive = require_adweights_config(config, variant)
+        return adweights_from_lambdas(adaptive, adaptive.initial_lambdas)[1]
     values = (
-        config.classical_loss_weights
-        if variant == "classical_total"
-        else config.adapted_loss_weights
+        config.fourier_loss_weights
+        if uses_fourier_features(variant)
+        else config.classical_loss_weights
     )
     return jnp.asarray(values, dtype=jnp.float32)
 
@@ -821,7 +750,10 @@ def forward_loss(
     context: ForwardContext,
     variant: str,
     points: tuple[jax.Array, jax.Array, jax.Array, jax.Array],
+    weights: jax.Array | Sequence[float] | None = None,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
+
+    k0 = 2.0 * jnp.pi * context.config.frequency / context.config.c0
 
     _validate_variant(variant)
     x_pde, y_pde, x_neumann, y_dtn = points
@@ -887,23 +819,35 @@ def forward_loss(
         lambda x_value, y_value: pointwise_pde_residual(
             params, context, variant, x_value, y_value
         )
-    )(x_pde, y_pde)
+    )(x_pde, y_pde)/k0**2
     pde_loss = jnp.mean(residual**2)
     top = jax.vmap(lambda x_value: physical_derivative(x_value, 1.0, 1))(x_neumann)
     bottom = jax.vmap(lambda x_value: physical_derivative(x_value, -1.0, 1))(
         x_neumann
     )
-    neumann_loss = jnp.mean(top**2 + bottom**2)
+    neumann_loss = jnp.mean(top**2 + bottom**2)/k0**2
     left = dtn_loss(-1.0, -1.0)
     right = dtn_loss(1.0, 1.0)
-    boundary_loss = neumann_loss + left + right
-    weights = loss_weights(context.config, variant)
-    objective = weights[0] * pde_loss + weights[1] * boundary_loss
+    dtn_total = (left + right)/k0**2
+    boundary_loss = neumann_loss + dtn_total
+    weights = (
+        loss_weights(context.config, variant)
+        if weights is None
+        else jnp.asarray(weights, dtype=jnp.float32)
+    )
+    if weights.shape != (3,):
+        raise ValueError("Loss weights must have shape (3,)")
+    objective = (
+        weights[0] * pde_loss
+        + weights[1] * neumann_loss
+        + weights[2] * dtn_total
+    )
     return objective, {
         "pde": pde_loss,
         "bc": boundary_loss,
         "unweighted_total": pde_loss + boundary_loss,
         "neumann": neumann_loss,
+        "dtn": dtn_total,
         "dtn_left": left,
         "dtn_right": right,
     }
@@ -928,17 +872,29 @@ def gradient_alignment_stats(
     variant: str,
     points: tuple[jax.Array, jax.Array, jax.Array, jax.Array],
 ) -> dict[str, jax.Array]:
-    """Return raw PDE/BC gradient norms and their cosine similarity."""
+    """Return loss-component gradient norms and the PDE/BC cosine similarity."""
 
     def pde_objective(model_params):
         return forward_loss(model_params, context, variant, points)[1]["pde"]
+
+    def neumann_objective(model_params):
+        return forward_loss(model_params, context, variant, points)[1]["neumann"]
+
+    def dtn_objective(model_params):
+        return forward_loss(model_params, context, variant, points)[1]["dtn"]
 
     def bc_objective(model_params):
         return forward_loss(model_params, context, variant, points)[1]["bc"]
 
     pde_gradients = jax.grad(pde_objective)(params)
+    neumann_gradients = jax.grad(neumann_objective)(params)
+    dtn_gradients = jax.grad(dtn_objective)(params)
     bc_gradients = jax.grad(bc_objective)(params)
     pde_norm = jnp.sqrt(jnp.maximum(_tree_dot(pde_gradients, pde_gradients), 0.0))
+    neumann_norm = jnp.sqrt(
+        jnp.maximum(_tree_dot(neumann_gradients, neumann_gradients), 0.0)
+    )
+    dtn_norm = jnp.sqrt(jnp.maximum(_tree_dot(dtn_gradients, dtn_gradients), 0.0))
     bc_norm = jnp.sqrt(jnp.maximum(_tree_dot(bc_gradients, bc_gradients), 0.0))
     denominator = pde_norm * bc_norm
     raw_cosine = _tree_dot(pde_gradients, bc_gradients) / denominator
@@ -949,6 +905,8 @@ def gradient_alignment_stats(
     )
     return {
         "pde_gradient_l2_norm": pde_norm,
+        "neumann_gradient_l2_norm": neumann_norm,
+        "dtn_gradient_l2_norm": dtn_norm,
         "bc_gradient_l2_norm": bc_norm,
         "pde_bc_gradient_cosine": cosine,
     }
@@ -957,31 +915,17 @@ def gradient_alignment_stats(
 def make_adam_optimizer(
     params: Mapping[str, Any], config: ForwardConfig, variant: str, adam_steps: int
 ) -> optax.GradientTransformation:
-    if variant == "classical_total":
+    if not uses_fourier_features(variant):
         return optax.adam(config.classical_learning_rate)
 
-    field_schedule = optax.cosine_decay_schedule(
-        config.adapted_field_learning_rate,
-        decay_steps=max(adam_steps, 1),
-        alpha=config.adapted_field_cosine_alpha,
-    )
+    sigma_steps = sigma_train_step_count(config, variant, adam_steps)
     sigma_schedule = optax.cosine_decay_schedule(
-        config.adapted_sigma_learning_rate,
-        decay_steps=max(int(config.adapted_sigma_decay_fraction * adam_steps), 1),
-        alpha=config.adapted_sigma_cosine_alpha,
+        config.fourier_sigma_learning_rate,
+        decay_steps=max(sigma_steps - 1, 1),
+        alpha=config.fourier_sigma_cosine_alpha,
     )
-    field_optimizer = optax.chain(
-        optax.clip_by_global_norm(config.gradient_clip_norm),
-        optax.scale_by_adam(),
-        optax.scale_by_schedule(field_schedule),
-        optax.scale(-1.0),
-    )
-    sigma_optimizer = optax.chain(
-        optax.clip_by_global_norm(config.gradient_clip_norm),
-        optax.scale_by_adam(),
-        optax.scale_by_schedule(sigma_schedule),
-        optax.scale(-1.0),
-    )
+    field_optimizer = optax.adam(config.fourier_field_learning_rate)
+    sigma_optimizer = optax.adam(sigma_schedule)
     labels = jax.tree_util.tree_map(lambda _: "field", params)
     labels["sigma"] = jax.tree_util.tree_map(lambda _: "sigma", params["sigma"])
     return optax.multi_transform(
@@ -989,23 +933,77 @@ def make_adam_optimizer(
     )
 
 
+def sigma_train_step_count(config: ForwardConfig, variant: str, adam_steps: int) -> int:
+    if not uses_fourier_features(variant):
+        return 0
+    return max(1, int(config.fourier_sigma_decay_fraction * adam_steps))
+
+
+def _stop_sigma_gradient(params: Mapping[str, Any]) -> dict[str, Any]:
+    if "sigma" not in params:
+        return dict(params)
+    return {**params, "sigma": jax.lax.stop_gradient(params["sigma"])}
+
+
+def _zero_sigma_update(updates: Mapping[str, Any]) -> dict[str, Any]:
+    if "sigma" not in updates:
+        return dict(updates)
+    return {
+        **updates,
+        "sigma": jax.tree_util.tree_map(jnp.zeros_like, updates["sigma"]),
+    }
+
+
+def adweights_gradient_l2_norms(
+    params: Mapping[str, Any],
+    context: ForwardContext,
+    variant: str,
+    points: tuple[jax.Array, jax.Array, jax.Array, jax.Array],
+    *,
+    freeze_sigma: bool = False,
+) -> jax.Array:
+    """Return raw component-gradient norms over currently active parameters."""
+
+    def component_norm(component: str) -> jax.Array:
+        def objective(model_params):
+            if freeze_sigma:
+                model_params = _stop_sigma_gradient(model_params)
+            return forward_loss(model_params, context, variant, points)[1][component]
+
+        gradients = jax.grad(objective)(params)
+        return jnp.sqrt(jnp.maximum(_tree_dot(gradients, gradients), 0.0))
+
+    return jnp.stack(tuple(component_norm(name) for name in ADWEIGHTS_COMPONENTS))
+
+
 def make_adam_step(
     optimizer: optax.GradientTransformation,
     context: ForwardContext,
     variant: str,
     sizes: tuple[int, int, int],
+    *,
+    freeze_sigma: bool = False,
 ):
     @jax.jit
-    def step(params, state, collocation_key):
+    def compiled_step(params, state, collocation_key, weights):
         points = sample_collocation_points(collocation_key, sizes)
 
         def objective(model_params):
-            return forward_loss(model_params, context, variant, points)
+            if freeze_sigma:
+                model_params = _stop_sigma_gradient(model_params)
+            return forward_loss(model_params, context, variant, points, weights)
 
         (value, aux), gradients = jax.value_and_grad(objective, has_aux=True)(params)
         updates, state = optimizer.update(gradients, state, params)
+        if freeze_sigma:
+            updates = _zero_sigma_update(updates)
         params = optax.apply_updates(params, updates)
         return params, state, value, aux
+
+    def step(params, state, collocation_key, weights=None):
+        if weights is None:
+            weights = loss_weights(context.config, variant)
+        return compiled_step(params, state, collocation_key, weights)
 
     return step
 
@@ -1015,13 +1013,15 @@ def make_rad_adam_step(
     context: ForwardContext,
     variant: str,
     sizes: tuple[int, int, int],
+    *,
+    freeze_sigma: bool = False,
 ):
     """Create an Adam step mixing uniform and RAD points at fixed batch size."""
     if not is_rad_variant(variant):
         raise ValueError("make_rad_adam_step requires a RAD variant")
 
     @jax.jit
-    def step(params, state, collocation_key, candidate_distribution):
+    def compiled_step(params, state, collocation_key, candidate_distribution, weights):
         points = sample_mixed_rad_collocation_points(
             collocation_key,
             sizes,
@@ -1030,41 +1030,25 @@ def make_rad_adam_step(
         )
 
         def objective(model_params):
-            return forward_loss(model_params, context, variant, points)
+            if freeze_sigma:
+                model_params = _stop_sigma_gradient(model_params)
+            return forward_loss(model_params, context, variant, points, weights)
 
         (value, aux), gradients = jax.value_and_grad(objective, has_aux=True)(params)
         updates, state = optimizer.update(gradients, state, params)
+        if freeze_sigma:
+            updates = _zero_sigma_update(updates)
         params = optax.apply_updates(params, updates)
         return params, state, value, aux
 
-    return step
-
-
-def make_lbfgs_step(
-    context: ForwardContext,
-    variant: str,
-    points: tuple[jax.Array, jax.Array, jax.Array, jax.Array],
-):
-    optimizer = optax.lbfgs()
-
-    @jax.jit
-    def step(params, state):
-        def objective(model_params):
-            return forward_loss(model_params, context, variant, points)[0]
-
-        value, gradients = jax.value_and_grad(objective)(params)
-        updates, state = optimizer.update(
-            gradients,
-            state,
-            params,
-            value=value,
-            grad=gradients,
-            value_fn=objective,
+    def step(params, state, collocation_key, candidate_distribution, weights=None):
+        if weights is None:
+            weights = loss_weights(context.config, variant)
+        return compiled_step(
+            params, state, collocation_key, candidate_distribution, weights
         )
-        params = optax.apply_updates(params, updates)
-        return params, state, value
 
-    return optimizer, step
+    return step
 
 
 def analytic_modal_complex(
@@ -1439,15 +1423,18 @@ def run_training(
     variant: str,
     seed: int,
     adam_steps: int,
-    lbfgs_steps: int,
     output_root: Path | None = None,
 ) -> Path:
     """Execute one isolated run. Scientific campaigns call this in subprocesses."""
     _validate_variant(variant)
-    if seed < 0 or adam_steps < 0 or lbfgs_steps < 0:
+    if seed < 0 or adam_steps < 0:
         raise ValueError("seed and optimizer step counts must be non-negative")
-    if adam_steps + lbfgs_steps <= 0:
-        raise ValueError("At least one Adam or L-BFGS step is required")
+    if adam_steps <= 0:
+        raise ValueError("At least one Adam step is required")
+    adweights_enabled = uses_adweights(variant)
+    adweights_config = (
+        require_adweights_config(config, variant) if adweights_enabled else None
+    )
 
     effective = {
         "forward_config": config.manifest(),
@@ -1458,7 +1445,7 @@ def run_training(
         ),
         "seed": int(seed),
         "adam_steps": int(adam_steps),
-        "lbfgs_steps": int(lbfgs_steps),
+        "sigma_train_steps": sigma_train_step_count(config, variant, adam_steps),
     }
     run_id = configuration_id(effective)
     parent = Path(output_root) if output_root is not None else config.output_root / "runs"
@@ -1495,7 +1482,11 @@ def run_training(
     params, b_base = initialize_model(initialization_key, config, variant)
     context = _build_context(config, b_base)
     monitor_points = regular_collocation_points(config.collocation_monitor, context)
-    monitor = jax.jit(lambda model: forward_loss(model, context, variant, monitor_points))
+    monitor = jax.jit(
+        lambda model, weights: forward_loss(
+            model, context, variant, monitor_points, weights
+        )
+    )
     gradient_monitor = jax.jit(
         lambda model, batch_points: gradient_alignment_stats(
             model, context, variant, batch_points
@@ -1503,12 +1494,43 @@ def run_training(
     )
     predictor = make_physical_predictor(context, variant)
     rad_enabled = is_rad_variant(variant)
+    sigma_train_steps = sigma_train_step_count(config, variant, adam_steps)
+    if adweights_config is None:
+        current_lambdas = None
+        current_inverse_weights = None
+        current_effective_weights = loss_weights(config, variant)
+        adweights_gradient_evaluator = None
+        frozen_adweights_gradient_evaluator = None
+    else:
+        current_lambdas = jnp.asarray(
+            adweights_config.initial_lambdas, dtype=jnp.float32
+        )
+        current_inverse_weights, current_effective_weights = adweights_from_lambdas(
+            adweights_config, current_lambdas
+        )
+        adweights_gradient_evaluator = jax.jit(
+            lambda model, batch_points: adweights_gradient_l2_norms(
+                model, context, variant, batch_points
+            )
+        )
+        frozen_adweights_gradient_evaluator = jax.jit(
+            lambda model, batch_points: adweights_gradient_l2_norms(
+                model, context, variant, batch_points, freeze_sigma=True
+            )
+        )
 
     adam_optimizer = make_adam_optimizer(params, config, variant, adam_steps)
     adam_state = adam_optimizer.init(params)
     if rad_enabled:
         adam_step = make_rad_adam_step(
             adam_optimizer, context, variant, config.collocation_adam
+        )
+        frozen_adam_step = make_rad_adam_step(
+            adam_optimizer,
+            context,
+            variant,
+            config.collocation_adam,
+            freeze_sigma=True,
         )
         rad_rng = np.random.default_rng(np.random.SeedSequence([seed, 220710289]))
         rad_candidate_distribution = uniform_rad_candidate_distribution(
@@ -1529,13 +1551,16 @@ def run_training(
         adam_step = make_adam_step(
             adam_optimizer, context, variant, config.collocation_adam
         )
+        frozen_adam_step = make_adam_step(
+            adam_optimizer,
+            context,
+            variant,
+            config.collocation_adam,
+            freeze_sigma=True,
+        )
         rad_candidate_distribution = None
         rad_rng = None
         rad_residual_evaluator = None
-
-    lbfgs_points = regular_collocation_points(config.collocation_lbfgs, context)
-    lbfgs_optimizer, lbfgs_step = make_lbfgs_step(context, variant, lbfgs_points)
-    lbfgs_state = lbfgs_optimizer.init(params)
 
     # Compile optimizer steps with discarded outputs.  Compilation is excluded
     # from the measured optimizer time by construction.
@@ -1549,33 +1574,114 @@ def run_training(
                     adam_state,
                     compile_key,
                     rad_candidate_distribution,
+                    current_effective_weights,
                 )
             )
+            if uses_fourier_features(variant) and sigma_train_steps < adam_steps:
+                _block(
+                    frozen_adam_step(
+                        params,
+                        adam_state,
+                        jax.random.fold_in(compile_key, 1),
+                        rad_candidate_distribution,
+                        current_effective_weights,
+                    )
+                )
         else:
-            _block(adam_step(params, adam_state, compile_key))
-    if lbfgs_steps and rad_enabled:
-        assert rad_candidate_distribution is not None
-        _block(
-            bootstrap_rad_pde_points(
+            _block(
+                adam_step(
+                    params, adam_state, compile_key, current_effective_weights
+                )
+            )
+            if uses_fourier_features(variant) and sigma_train_steps < adam_steps:
+                _block(
+                    frozen_adam_step(
+                        params,
+                        adam_state,
+                        jax.random.fold_in(compile_key, 1),
+                        current_effective_weights,
+                    )
+                )
+
+    if adweights_gradient_evaluator is not None:
+        if rad_enabled:
+            assert rad_candidate_distribution is not None
+            compile_points = sample_mixed_rad_collocation_points(
                 compile_key,
+                config.collocation_adam,
                 rad_candidate_distribution,
                 config.rad_points,
             )
-        )
-    if lbfgs_steps and not rad_enabled:
-        _block(lbfgs_step(params, lbfgs_state))
+        else:
+            compile_points = sample_collocation_points(
+                compile_key, config.collocation_adam
+            )
+        _block(adweights_gradient_evaluator(params, compile_points))
+        if uses_fourier_features(variant) and sigma_train_steps < adam_steps:
+            assert frozen_adweights_gradient_evaluator is not None
+            _block(frozen_adweights_gradient_evaluator(params, compile_points))
 
     loss_rows: list[dict[str, Any]] = []
     fem_rows: list[dict[str, Any]] = []
     gradient_rows: list[dict[str, Any]] = []
     rad_rows: list[dict[str, Any]] = []
+    adweights_rows: list[dict[str, Any]] = []
     optimizer_seconds = 0.0
-    adam_seconds = 0.0
-    lbfgs_seconds = 0.0
     rad_resampling_seconds = 0.0
+    adweights_seconds = 0.0
+    adweights_update_count = 0
     best_monitor = float("inf")
+    best_monitor_metric = "unweighted_total" if adweights_enabled else "objective"
     best_params = _copy_params(params)
     best_location = {"phase": "initial", "local_step": 0, "global_step": 0}
+
+    def measured_training_seconds() -> float:
+        return optimizer_seconds + rad_resampling_seconds + adweights_seconds
+
+    def record_adweights_state(
+        *,
+        local_step: int,
+        update_index: int,
+        gradient_norms: Sequence[float] | None,
+        update_seconds: float,
+    ) -> None:
+        if (
+            adweights_config is None
+            or current_lambdas is None
+            or current_inverse_weights is None
+        ):
+            raise RuntimeError("Adaptive state requested for a static-weight run")
+        lambdas = np.asarray(jax.device_get(current_lambdas), dtype=float)
+        inverse = np.asarray(jax.device_get(current_inverse_weights), dtype=float)
+        effective = np.asarray(jax.device_get(current_effective_weights), dtype=float)
+        norms = None if gradient_norms is None else np.asarray(gradient_norms, dtype=float)
+        for component_index, component in enumerate(ADWEIGHTS_COMPONENTS):
+            adweights_rows.append(
+                {
+                    "record_type": "adweights_state",
+                    "variant": variant,
+                    "seed": seed,
+                    "phase": "initial" if update_index == 0 else "adam",
+                    "local_step": local_step,
+                    "global_step": local_step,
+                    "update_index": update_index,
+                    "component": component,
+                    "alpha": adweights_config.alpha,
+                    "epsilon": adweights_config.epsilon,
+                    "gradient_l2_norm": (
+                        None if norms is None else float(norms[component_index])
+                    ),
+                    "lambda": float(lambdas[component_index]),
+                    "inverse_weight": float(inverse[component_index]),
+                    "custom_weight": adweights_config.custom_weights[component_index],
+                    "effective_weight": float(effective[component_index]),
+                    "update_seconds": update_seconds,
+                    "cumulative_adweights_seconds": adweights_seconds,
+                    "optimizer_seconds": optimizer_seconds,
+                    "rad_resampling_seconds": rad_resampling_seconds,
+                    "training_seconds": measured_training_seconds(),
+                }
+            )
 
     def refresh_rad_distribution(
         phase: str,
@@ -1622,7 +1728,7 @@ def run_training(
 
     def record_loss(phase: str, local_step: int, global_step: int) -> None:
         nonlocal best_monitor, best_params, best_location
-        objective, components = monitor(params)
+        objective, components = monitor(params, current_effective_weights)
         _block(objective)
         row = {
             "record_type": "loss_monitor",
@@ -1633,12 +1739,14 @@ def run_training(
             "global_step": global_step,
             "optimizer_seconds": optimizer_seconds,
             "rad_resampling_seconds": rad_resampling_seconds,
-            "training_seconds": optimizer_seconds + rad_resampling_seconds,
+            "adweights_seconds": adweights_seconds,
+            "training_seconds": measured_training_seconds(),
             "objective": float(objective),
             "pde_loss": float(components["pde"]),
             "bc_loss": float(components["bc"]),
             "unweighted_total": float(components["unweighted_total"]),
             "neumann_loss": float(components["neumann"]),
+            "dtn_loss": float(components["dtn"]),
             "dtn_left_loss": float(components["dtn_left"]),
             "dtn_right_loss": float(components["dtn_right"]),
         }
@@ -1650,8 +1758,9 @@ def run_training(
         if not all(finite_values):
             raise FloatingPointError(f"Non-finite fixed-monitor loss at {phase} {local_step}")
         loss_rows.append(row)
-        if row["objective"] < best_monitor:
-            best_monitor = row["objective"]
+        monitor_value = float(row[best_monitor_metric])
+        if monitor_value < best_monitor:
+            best_monitor = monitor_value
             best_params = _copy_params(params)
             best_location = {
                 "phase": phase,
@@ -1680,7 +1789,8 @@ def run_training(
                 "global_step": global_step,
                 "optimizer_seconds": optimizer_seconds,
                 "rad_resampling_seconds": rad_resampling_seconds,
-                "training_seconds": optimizer_seconds + rad_resampling_seconds,
+                "adweights_seconds": adweights_seconds,
+                "training_seconds": measured_training_seconds(),
                 **asdict(metrics),
             }
         )
@@ -1706,10 +1816,14 @@ def run_training(
     ) -> None:
         stats = jax.device_get(gradient_monitor(params, points))
         pde_norm = float(stats["pde_gradient_l2_norm"])
+        neumann_norm = float(stats["neumann_gradient_l2_norm"])
+        dtn_norm = float(stats["dtn_gradient_l2_norm"])
         bc_norm = float(stats["bc_gradient_l2_norm"])
         cosine = float(stats["pde_bc_gradient_cosine"])
         if (
             not np.isfinite(pde_norm)
+            or not np.isfinite(neumann_norm)
+            or not np.isfinite(dtn_norm)
             or not np.isfinite(bc_norm)
             or (np.isnan(cosine) and pde_norm > 0.0 and bc_norm > 0.0)
             or (not np.isnan(cosine) and not np.isfinite(cosine))
@@ -1727,13 +1841,23 @@ def run_training(
                 "global_step": global_step,
                 "optimizer_seconds": optimizer_seconds,
                 "rad_resampling_seconds": rad_resampling_seconds,
-                "training_seconds": optimizer_seconds + rad_resampling_seconds,
+                "adweights_seconds": adweights_seconds,
+                "training_seconds": measured_training_seconds(),
                 "pde_gradient_l2_norm": pde_norm,
+                "neumann_gradient_l2_norm": neumann_norm,
+                "dtn_gradient_l2_norm": dtn_norm,
                 "bc_gradient_l2_norm": bc_norm,
                 "pde_bc_gradient_cosine": cosine,
             }
         )
 
+    if adweights_enabled:
+        record_adweights_state(
+            local_step=0,
+            update_index=0,
+            gradient_norms=None,
+            update_seconds=0.0,
+        )
     record_loss("initial", 0, 0)
     record_fem("initial", 0, 0)
 
@@ -1753,21 +1877,78 @@ def run_training(
         # RAD variants keep the same boundary cloud and the uniform prefix of the
         # paired baseline, then replace exactly config.rad_points PDE points.
         collocation_key = jax.random.fold_in(jax.random.key(seed), local_step)
+        freeze_sigma = (
+            uses_fourier_features(variant) and local_step > sigma_train_steps
+        )
+        step_function = (
+            adam_step
+            if not freeze_sigma
+            else frozen_adam_step
+        )
+        if (
+            adweights_config is not None
+            and (local_step - 1) % adweights_config.update_interval_adam == 0
+        ):
+            if adweights_gradient_evaluator is None:
+                raise RuntimeError("Missing adaptive gradient evaluator")
+            points_for_update = adam_gradient_points(collocation_key)
+            evaluator = (
+                frozen_adweights_gradient_evaluator
+                if freeze_sigma
+                else adweights_gradient_evaluator
+            )
+            if evaluator is None:
+                raise RuntimeError("Missing frozen adaptive gradient evaluator")
+            _block(params)
+            update_start = time.perf_counter()
+            gradient_norms_array = evaluator(params, points_for_update)
+            _block(gradient_norms_array)
+            gradient_norms = np.asarray(
+                jax.device_get(gradient_norms_array), dtype=float
+            )
+            if not np.all(np.isfinite(gradient_norms)) or np.any(gradient_norms < 0.0):
+                raise FloatingPointError(
+                    f"Non-finite adaptive gradient norms before Adam {local_step}"
+                )
+            if current_lambdas is None:
+                raise RuntimeError("Missing adaptive lambda state")
+            if local_step > 1:
+                (
+                    current_lambdas,
+                    current_inverse_weights,
+                    current_effective_weights,
+                ) = update_adweights_lambdas(
+                    adweights_config, current_lambdas, gradient_norms
+                )
+            _block(current_effective_weights)
+            update_elapsed = time.perf_counter() - update_start
+            adweights_seconds += update_elapsed
+            adweights_update_count += 1
+            record_adweights_state(
+                local_step=local_step,
+                update_index=adweights_update_count,
+                gradient_norms=gradient_norms,
+                update_seconds=update_elapsed,
+            )
         if rad_enabled:
             assert rad_candidate_distribution is not None
             (params, adam_state, _, _), elapsed = _optimizer_timed_call(
-                adam_step,
+                step_function,
                 params,
                 adam_state,
                 collocation_key,
                 rad_candidate_distribution,
+                current_effective_weights,
             )
         else:
             (params, adam_state, _, _), elapsed = _optimizer_timed_call(
-                adam_step, params, adam_state, collocation_key
+                step_function,
+                params,
+                adam_state,
+                collocation_key,
+                current_effective_weights,
             )
         optimizer_seconds += elapsed
-        adam_seconds += elapsed
         if _evaluation_due(
             local_step, config.gradient_eval_interval_adam, adam_steps
         ):
@@ -1786,61 +1967,33 @@ def run_training(
         ):
             record_fem("adam", local_step, local_step)
 
-    if lbfgs_steps:
-        # The forced final Adam (or initial) records are the transition records;
-        # do not duplicate the same global iteration under a second phase label.
-        if rad_enabled:
-            rad_candidate_distribution = refresh_rad_distribution(
-                "lbfgs", 0, adam_steps, config.rad_points
+    if current_lambdas is None or current_inverse_weights is None:
+        final_adweights_lambdas = None
+        final_adweights_inverse_weights = None
+        final_adweights_effective_weights = None
+    else:
+        final_adweights_lambdas = dict(
+            zip(
+                ADWEIGHTS_COMPONENTS,
+                np.asarray(jax.device_get(current_lambdas), dtype=float).tolist(),
             )
-            bootstrap_start = time.perf_counter()
-            rad_lbfgs_points = bootstrap_rad_pde_points(
-                jax.random.fold_in(jax.random.key(seed), adam_steps + 303),
-                rad_candidate_distribution,
-                config.rad_points,
+        )
+        final_adweights_inverse_weights = dict(
+            zip(
+                ADWEIGHTS_COMPONENTS,
+                np.asarray(
+                    jax.device_get(current_inverse_weights), dtype=float
+                ).tolist(),
             )
-            _block(rad_lbfgs_points)
-            bootstrap_elapsed = time.perf_counter() - bootstrap_start
-            rad_resampling_seconds += bootstrap_elapsed
-            rad_rows[-1]["resampling_seconds"] += bootstrap_elapsed
-            rad_rows[-1]["cumulative_resampling_seconds"] = (
-                rad_resampling_seconds
+        )
+        final_adweights_effective_weights = dict(
+            zip(
+                ADWEIGHTS_COMPONENTS,
+                np.asarray(
+                    jax.device_get(current_effective_weights), dtype=float
+                ).tolist(),
             )
-            n_pde, n_neumann, n_dtn = config.collocation_lbfgs
-            uniform_lbfgs_points = regular_collocation_points(
-                (n_pde - config.rad_points, n_neumann, n_dtn), context
-            )
-            lbfgs_points = (
-                jnp.concatenate((uniform_lbfgs_points[0], rad_lbfgs_points[0])),
-                jnp.concatenate((uniform_lbfgs_points[1], rad_lbfgs_points[1])),
-                uniform_lbfgs_points[2],
-                uniform_lbfgs_points[3],
-            )
-            lbfgs_optimizer, lbfgs_step = make_lbfgs_step(
-                context, variant, lbfgs_points
-            )
-            lbfgs_state = lbfgs_optimizer.init(params)
-            _block(lbfgs_step(params, lbfgs_state))
-        lbfgs_state = lbfgs_optimizer.init(params)
-        for local_step in range(1, lbfgs_steps + 1):
-            (params, lbfgs_state, _), elapsed = _optimizer_timed_call(
-                lbfgs_step, params, lbfgs_state
-            )
-            optimizer_seconds += elapsed
-            lbfgs_seconds += elapsed
-            global_step = adam_steps + local_step
-            if _evaluation_due(
-                local_step, config.gradient_eval_interval_lbfgs, lbfgs_steps
-            ):
-                record_gradient("lbfgs", local_step, global_step, lbfgs_points)
-            if _evaluation_due(
-                local_step, config.loss_eval_interval_lbfgs, lbfgs_steps
-            ):
-                record_loss("lbfgs", local_step, global_step)
-            if _evaluation_due(
-                local_step, config.fem_eval_interval_lbfgs, lbfgs_steps
-            ):
-                record_fem("lbfgs", local_step, global_step)
+        )
 
     checkpoint_metadata = {
         "run_id": run_id,
@@ -1858,7 +2011,12 @@ def run_training(
         "sampling_reference": RAD_REFERENCE if rad_enabled else None,
         "sampling_protocol": RAD_SAMPLING_PROTOCOL if rad_enabled else None,
         "best_monitor": best_monitor,
+        "best_monitor_metric": best_monitor_metric,
         "best_location": best_location,
+        "adweights_update_count": adweights_update_count,
+        "final_adweights_lambdas": final_adweights_lambdas,
+        "final_adweights_inverse_weights": final_adweights_inverse_weights,
+        "final_adweights_effective_weights": final_adweights_effective_weights,
     }
     save_checkpoint(
         run_directory / "checkpoint_final.npz", params, context, checkpoint_metadata
@@ -1874,17 +2032,18 @@ def run_training(
     _write_csv(run_directory / "gradient_history.csv", gradient_rows)
     if rad_rows:
         _write_csv(run_directory / "rad_resampling_history.csv", rad_rows)
+    if adweights_rows:
+        _write_csv(run_directory / "adweights_history.csv", adweights_rows)
     final_fem = fem_rows[-1]
     summary = {
         **checkpoint_metadata,
         "status": "complete",
         "adam_steps": adam_steps,
-        "lbfgs_steps": lbfgs_steps,
-        "adam_optimizer_seconds": adam_seconds,
-        "lbfgs_optimizer_seconds": lbfgs_seconds,
+        "sigma_train_steps": sigma_train_steps,
         "optimizer_seconds": optimizer_seconds,
         "rad_resampling_seconds": rad_resampling_seconds,
-        "training_seconds": optimizer_seconds + rad_resampling_seconds,
+        "adweights_seconds": adweights_seconds,
+        "training_seconds": measured_training_seconds(),
         "rad_resample_count": len(rad_rows),
         "rad_refresh_count": len(rad_rows),
         "final_l2_absolute": final_fem["l2_absolute"],
@@ -1894,6 +2053,7 @@ def run_training(
         "loss_records": len(loss_rows),
         "fem_records": len(fem_rows),
         "gradient_records": len(gradient_rows),
+        "adweights_records": len(adweights_rows),
     }
     _write_json_exclusive(run_directory / "summary.json", summary)
     print(f"Completed run: {run_directory}")
@@ -1925,10 +2085,9 @@ def run_campaign(
     variants: Sequence[str],
     seeds: Sequence[int],
     adam_steps: int,
-    lbfgs_steps: int,
     output_root: Path | None,
 ) -> Path:
-    if adam_steps < 0 or lbfgs_steps < 0 or adam_steps + lbfgs_steps <= 0:
+    if adam_steps < 0 or adam_steps <= 0:
         raise ValueError("Campaign optimizer budgets must be non-negative and nonzero")
     if not seeds or min(seeds) < 0 or len(set(seeds)) != len(seeds):
         raise ValueError("Campaign seeds must be unique non-negative integers")
@@ -1936,14 +2095,22 @@ def run_campaign(
         raise ValueError("Campaign variants must be a non-empty subset of VARIANTS")
     if len(set(variants)) != len(variants):
         raise ValueError("Campaign variants must be unique")
+    adaptive_variants = [variant for variant in variants if uses_adweights(variant)]
+    if adaptive_variants and config.adweights is None:
+        raise ValueError(
+            "Adaptive campaign variants require an 'adweights' JSON object; "
+            f"variants={adaptive_variants}"
+        )
+    rad_enabled = any(is_rad_variant(variant) for variant in variants)
     campaign_config = {
         "forward_config": config.manifest(),
         "variants": list(variants),
-        "rad_sampling_reference": RAD_REFERENCE,
-        "rad_sampling_protocol": RAD_SAMPLING_PROTOCOL,
+        "rad_sampling_reference": RAD_REFERENCE if rad_enabled else None,
+        "rad_sampling_protocol": (
+            RAD_SAMPLING_PROTOCOL if rad_enabled else None
+        ),
         "seeds": list(seeds),
         "adam_steps": adam_steps,
-        "lbfgs_steps": lbfgs_steps,
     }
     campaign_id = configuration_id(campaign_config)
     parent = Path(output_root) if output_root is not None else config.output_root
@@ -1968,8 +2135,6 @@ def run_campaign(
                 str(seed),
                 "--adam-steps",
                 str(adam_steps),
-                "--lbfgs-steps",
-                str(lbfgs_steps),
                 "--output-root",
                 str(runs_root),
             ]
@@ -1999,7 +2164,9 @@ def run_campaign(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    default_config = Path(__file__).with_name("forward_2circles_1200_m0.json")
+    default_config = Path(__file__).with_name(
+        "forward_circlebottomright_1200_m0.json"
+    )
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -2008,17 +2175,15 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--variant", choices=VARIANTS, required=True)
     run.add_argument("--seed", type=int, required=True)
     run.add_argument("--adam-steps", type=int, required=True)
-    run.add_argument("--lbfgs-steps", type=int, required=True)
     run.add_argument("--output-root", type=Path)
 
     campaign = subparsers.add_parser(
         "campaign", help="run all variants sequentially in isolated subprocesses"
     )
     campaign.add_argument("--config", type=Path, default=default_config)
-    campaign.add_argument("--variants", default=",".join(VARIANTS))
+    campaign.add_argument("--variants", default=",".join(BASE_VARIANTS))
     campaign.add_argument("--seeds", default="0")
     campaign.add_argument("--adam-steps", type=int, required=True)
-    campaign.add_argument("--lbfgs-steps", type=int, required=True)
     campaign.add_argument("--output-root", type=Path)
     return parser
 
@@ -2032,7 +2197,6 @@ def main(argv: Sequence[str] | None = None) -> None:
             variant=args.variant,
             seed=args.seed,
             adam_steps=args.adam_steps,
-            lbfgs_steps=args.lbfgs_steps,
             output_root=args.output_root,
         )
     else:
@@ -2042,7 +2206,6 @@ def main(argv: Sequence[str] | None = None) -> None:
             variants=_parse_variants(args.variants),
             seeds=_parse_seeds(args.seeds),
             adam_steps=args.adam_steps,
-            lbfgs_steps=args.lbfgs_steps,
             output_root=args.output_root,
         )
 

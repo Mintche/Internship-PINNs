@@ -8,16 +8,6 @@
 //   Bord droit          : 12
 //   Bord haut           : 13
 //   Bord bas            : 14
-//
-// Generate data with, for example:
-//   ./generate_pinn_data.x \
-//     --mesh data/test_us_2triangles_diffcontrast.msh \
-//     --defectname triangles_diffcontrast \
-//     --freqs 600,1200 \
-//     --modes 0,1,2,3 \
-//     --outputdir pinn_data \
-//     --c0 340 \
-//     --tag-contrasts 2:0.8,3:0.9
 
 Mesh.MshFileVersion = 2.2;
 SetFactory("OpenCASCADE");
@@ -50,8 +40,8 @@ DefineConstant[
 // -----------------------------------------------------------------------------
 // Mesh parameters
 // -----------------------------------------------------------------------------
-h_bulk = 0.04;
-h_defaut = 0.015;
+h_bulk = 0.01;
+h_defaut = 0.005;
 
 Mesh.CharacteristicLengthMin = h_defaut;
 Mesh.CharacteristicLengthMax = h_bulk;
