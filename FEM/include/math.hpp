@@ -15,7 +15,7 @@ template<typename T> T conjugate(const T& v) { return v; }
 template<typename T> std::complex<T> conjugate(const std::complex<T>& v) { return std::conj(v); }
 
 //---------------------------------------------------------------------------
-//  Opérations sur vector<T>
+//  Operations on vector<T>
 //---------------------------------------------------------------------------
 template<typename T> std::vector<T> operator+(const std::vector<T>& u, const std::vector<T>& v)
 {
@@ -109,17 +109,17 @@ public:
 
     FullMatrix(int n, int m) : n_rows(n), n_cols(m), coefs(static_cast<std::size_t>(n) * m, T(0)) {}
 
-    // Accès
+    // Access
 
     T& operator()(int i, int j) { return coefs[i * n_cols + j]; }
     const T& operator()(int i, int j) const { return coefs[i * n_cols + j]; }
 
-    // Opérateurs
+    // Operators
     
     std::vector<T> operator*(const std::vector<T>& x) const {
-        // Ajout d'une vérification de la taille du vecteur
+        // Check the vector size.
         if (x.size() != static_cast<std::size_t>(n_cols)){
-            throw std::invalid_argument("Erreur: Le nombre de colonnes de la matrice doit être égal à la taille du vecteur.");
+            throw std::invalid_argument("Error: The matrix column count must equal the vector size.");
         }
         std::vector<T> res(this->n_rows, T(0));
         for(int i = 0; i < n_rows; ++i) {
@@ -132,7 +132,7 @@ public:
 
     FullMatrix<T> operator*(const FullMatrix<T>& M) const {
         if (n_cols != M.n_rows) {
-            throw std::invalid_argument("Erreur: Dimensions incompatibles pour la multiplication matricielle.");
+            throw std::invalid_argument("Error: Incompatible dimensions for matrix multiplication.");
         }
         FullMatrix<T> res(n_rows, M.n_cols);
         for(int i = 0; i < n_rows; ++i) {
@@ -149,9 +149,9 @@ public:
     
 
     void operator+=(const FullMatrix<T>& M){
-        // vérification de la taille
+        // Check the dimensions.
         if (n_rows != M.n_rows || n_cols != M.n_cols){
-            throw std::invalid_argument("Erreur: Addition de matrices de tailles différentes.");
+            throw std::invalid_argument("Error: Cannot add matrices with different dimensions.");
         }
         for (size_t i = 0; i < coefs.size(); i++){
             coefs[i] += M.coefs[i];
@@ -159,9 +159,9 @@ public:
     }
 
     void operator-=(const FullMatrix<T>& M){
-        // vérification de la taille
+        // Check the dimensions.
         if (n_rows != M.n_rows || n_cols != M.n_cols){
-            throw std::invalid_argument("Erreur: Soustraction de matrices de tailles différentes.");
+            throw std::invalid_argument("Error: Cannot subtract matrices with different dimensions.");
         }
         for (size_t i = 0; i < coefs.size(); i++){
             coefs[i] -= M.coefs[i];
@@ -174,29 +174,29 @@ public:
         }
     }
 
-    // Remplissage avec une valeur
+    // Fill with a value.
     void fill(T val) {
         for (size_t i = 0; i < coefs.size(); i++){
             coefs[i] = val;
         }
     }
 
-    // Résolution via pivot de Gauss
+    // Solve with Gaussian pivoting.
 
-    // Factorisation LDL* (pour matrices hermitiennes) en place.
-    // La partie triangulaire inférieure stocke L (sans la diagonale unité)
-    // et la diagonale stocke D.
+    // In-place LDL* factorization for Hermitian matrices.
+    // The lower triangle stores L (without its unit diagonal),
+    // and the diagonal stores D.
 
     void factorize() {
         if (is_ldlt_factorized) return;
         if (n_rows != n_cols) {
-            throw std::logic_error("Erreur: La factorisation LDLT ne s'applique qu'aux matrices carrées.");
+            throw std::logic_error("Error: LDLT factorization requires a square matrix.");
         }
         
         int n = n_rows;
 
         for (int j = 0; j < n; ++j) {
-            // Calcul de D_jj
+            // Compute D_jj.
             T d_val = (*this)(j, j);
             for (int k = 0; k < j; ++k) {
                 // d_val -= L_jk * conj(L_jk) * D_kk
@@ -204,11 +204,11 @@ public:
             }
             
             if (std::abs(d_val) < 1e-14) {
-                 throw std::runtime_error("Erreur: Matrice singulière ou pivot nul dans la factorisation LDL*.");
+                 throw std::runtime_error("Error: Singular matrix or zero pivot in LDL* factorization.");
             }
             (*this)(j, j) = d_val;
 
-            // Calcul de la colonne j de L
+            // Compute column j of L.
             T inv_d_val = T(1.0) / d_val;
             for (int i = j + 1; i < n; ++i) {
                 T l_val = (*this)(i, j);
@@ -223,15 +223,15 @@ public:
 
     void solve(std::vector<T>& x, const std::vector<T>& b){
         if (is_ldlt_factorized) {
-            // Résolution avec la factorisation LDL* (A x = b -> L D L* x = b)
+            // Solve with the LDL* factorization (A x = b -> L D L* x = b).
             if (b.size() != static_cast<std::size_t>(n_rows)) {
-                throw std::invalid_argument("Erreur: La taille du vecteur b doit correspondre au nombre de lignes de la matrice.");
+                throw std::invalid_argument("Error: Vector b must match the matrix row count.");
             }
 
             int n = n_rows;
             x = b;
 
-            // 1. Descente : L z = b  (z est stocké dans x)
+            // 1. Forward substitution: L z = b (z is stored in x).
             for (int i = 0; i < n; ++i) {
                 T sum = T(0);
                 for (int j = 0; j < i; ++j) {
@@ -240,12 +240,12 @@ public:
                 x[i] -= sum;
             }
 
-            // 2. Diagonale : D y = z (y est stocké dans x)
+            // 2. Diagonal solve: D y = z (y is stored in x).
             for (int i = 0; i < n; ++i) {
                 x[i] /= (*this)(i, i);
             }
 
-            // 3. Remontée : L* x = y (x final est stocké dans x)
+            // 3. Back substitution: L* x = y (the final x is stored in x).
             for (int i = n - 1; i >= 0; --i) {
                 T sum = T(0);
                 for (int j = i + 1; j < n; ++j) {
@@ -256,12 +256,12 @@ public:
             return;
         }
 
-        // La résolution par pivot de Gauss ne s'applique qu'aux matrices carrées
+        // Gaussian pivoting requires a square matrix.
         if (n_rows != n_cols){
-            throw std::logic_error("Erreur: solve() ne peut être appelée que pour des matrices carrées.");
+            throw std::logic_error("Error: solve() requires a square matrix.");
         }
         if (b.size() != static_cast<std::size_t>(n_rows)) {
-            throw std::invalid_argument("Erreur: La taille du vecteur b doit correspondre au nombre de lignes de la matrice.");
+            throw std::invalid_argument("Error: Vector b must match the matrix row count.");
         }
 
         int n = n_rows;
@@ -270,11 +270,11 @@ public:
 
         for (int k = 0; k < n; ++k) {
             
-            // --- AJOUT PIVOT ---
+            // --- PIVOTING ---
             int pivot = k;
             auto max_val = std::abs(A(k,k));
             
-            // Recherche du meilleur pivot dans la colonne k
+            // Find the best pivot in column k.
             for(int i = k + 1; i < n; ++i) {
                 if(std::abs(A(i,k)) > max_val) {
                     max_val = std::abs(A(i,k));
@@ -282,32 +282,32 @@ public:
                 }
             }
             
-            // Si le pivot est nul, la matrice est singulière
+            // A zero pivot means that the matrix is singular.
             if (max_val < 1e-12) { 
-                // Lancer une exception pour une matrice singulière
-                throw std::runtime_error("Erreur: Matrice singulière ou presque singulière.");
+                // Raise an exception for a singular matrix.
+                throw std::runtime_error("Error: Singular or nearly singular matrix.");
             }
 
-            // Échange des lignes dans A
+            // Swap rows in A.
             if (pivot != k) {
-                for (int j = k; j < n; ++j) { // On peut commencer à j=k (avant c'est 0)
+                for (int j = k; j < n; ++j) { // Entries before j=k are zero.
                     std::swap(A(k,j), A(pivot,j));
                 }
-                // Échange dans le vecteur second membre x
+                // Swap entries in the right-hand-side vector x.
                 std::swap(x[k], x[pivot]);
             }
 
-            // Suite normale de l'élimination
+            // Continue the elimination.
             for (int i = k + 1; i < n; ++i) {
                 T factor = A(i, k) / A(k, k);
-                for (int j = k; j < n; ++j) { // Optimisation: commencer à j=k
+                for (int j = k; j < n; ++j) { // Start at j=k.
                     A(i, j) -= factor * A(k, j);
                 }
                 x[i] -= factor * x[k];
             }
         }
 
-        // Substitution arrière
+        // Back substitution.
         for (int i = n - 1; i >= 0; --i) {
             for (int j = i + 1; j < n; ++j) {
                 x[i] -= A(i, j) * x[j];
@@ -316,7 +316,7 @@ public:
         }
     }
 
-    // Transposée
+    // Transpose.
     FullMatrix<T> transpose() const {
         FullMatrix<T> res(n_cols, n_rows);
         for(int i = 0; i < n_rows; ++i) {
@@ -330,19 +330,19 @@ public:
     FullMatrix<T> adjoint() const;
 
 
-    // Inverse (calculée colonne par colonne via solve)
+    // Inverse (computed one column at a time with solve).
     FullMatrix<T> inverse() const {
-        if (n_rows != n_cols) throw std::logic_error("Erreur: Inversion d'une matrice non carrée.");
+        if (n_rows != n_cols) throw std::logic_error("Error: Cannot invert a non-square matrix.");
         FullMatrix<T> res(n_rows, n_cols);
         FullMatrix<T> tmp = *this; 
-        if (n_rows == n_cols) tmp.factorize(); // Accélère drastiquement l'inversion
+        if (n_rows == n_cols) tmp.factorize(); // Dramatically speeds up inversion.
         
         std::vector<T> b(n_rows, T(0)), x(n_rows);
         for(int j = 0; j < n_cols; ++j) {
-            b[j] = T(1); // Colonne j de la matrice identité
-            tmp.solve(x, b); // Résout A * x = e_j
+            b[j] = T(1); // Column j of the identity matrix.
+            tmp.solve(x, b); // Solve A * x = e_j.
             for(int i = 0; i < n_rows; ++i) res(i, j) = x[i];
-            b[j] = T(0); // Remise à zéro pour la prochaine itération
+            b[j] = T(0); // Reset for the next iteration.
         }
         return res;
     }
@@ -401,7 +401,7 @@ inline FullMatrix<complexe> FullMatrix<complexe>::adjoint() const {
 }
 
 //---------------------------------------------------------------------------
-//     Classe ProfileMatrix
+//     ProfileMatrix class
 //---------------------------------------------------------------------------
 
 template <typename T>
@@ -429,21 +429,21 @@ public:
         coefs.resize(total_size, T(0));
     }
 
-    // Accès
+    // Access
 
     T operator()(int i, int j) const {
-        if (i < j) return (*this)(j, i); // Symétrie
+        if (i < j) return (*this)(j, i); // Symmetry.
         if (j < static_cast<int>(p[i])) return T(0);
         return coefs[offsets[i] + j - p[i]];
     }
     
     T& operator()(int i, int j) {
         if (i < j) return (*this)(j, i);
-        if (j < static_cast<int>(p[i])) throw std::runtime_error("Hors profil");
+        if (j < static_cast<int>(p[i])) throw std::runtime_error("Outside matrix profile");
         return coefs[offsets[i] + j - p[i]];
     }
 
-    // Opérateurs
+    // Operators
 
     std::vector<T> operator*(const std::vector<T>& x) const {
         if (x.size() != static_cast<std::size_t>(n)) {
@@ -480,7 +480,7 @@ public:
         }
     }
 
-    // Factorisation LDL^T en place
+    // In-place LDL^T factorization.
     void factorize() {
         if(is_factorized) return;
         
@@ -514,34 +514,34 @@ public:
             diag[i] -= d_val;
             coefs[offsets[i] + i - pi] = diag[i];
             
-            if (std::abs(diag[i]) < 1e-14) throw std::runtime_error("Pivot nul dans LDLT");
+            if (std::abs(diag[i]) < 1e-14) throw std::runtime_error("Zero pivot in LDLT");
         }
         is_factorized = true;
     }
 
-    // Résolution rapide utilisant la factorisation existante
+    // Fast solve using the existing factorization.
     void solve(std::vector<T>& x, const std::vector<T>& b) {
-        if (!is_factorized) factorize(); // Auto-factorisation si oublié
-        if (b.size() != static_cast<std::size_t>(n)) throw std::invalid_argument("Taille invalide");
+        if (!is_factorized) factorize(); // Factorize automatically if needed.
+        if (b.size() != static_cast<std::size_t>(n)) throw std::invalid_argument("Invalid size");
         
         x = b;
         
-        // 1. Descente L z = b (L a des 1 sur la diagonale, implicites ou non, ici stockés différemment)
-        // Note: Dans LDL stocké en profil, L_ij est stocké à (i,j) pour i>j.
+        // 1. Forward substitution L z = b (L has an implicit unit diagonal).
+        // In profile LDL storage, L_ij is stored at (i,j) for i>j.
         for (int i = 0; i < n; ++i) {
             T sum = T(0);
             int pi = static_cast<int>(p[i]);
             for (int j = pi; j < i; ++j) 
                 sum += (*this)(i,j) * x[j];
-            x[i] -= sum; // L_ii est 1, donc pas de division
+            x[i] -= sum; // L_ii is 1, so no division is needed.
         }
 
-        // 2. Diagonale D y = z
+        // 2. Diagonal solve D y = z.
         for (int i = 0; i < n; ++i) {
             x[i] /= (*this)(i,i);
         }
 
-        // 3. Remontée L^T x = y
+        // 3. Back substitution L^T x = y.
         for (int i = n - 1; i >= 0; --i) {
             int pi = static_cast<int>(p[i]);
             for (int j = pi; j < i; ++j) {

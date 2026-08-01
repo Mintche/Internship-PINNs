@@ -22,11 +22,27 @@ class FEMNodalMaterialTest(unittest.TestCase):
         subprocess.run(["make", "-C", str(FEM_ROOT)], check=True, capture_output=True)
 
     def test_constant_nodal_speed_matches_homogeneous_tag_material(self) -> None:
-        reference = FEMFieldData(
-            REPOSITORY_ROOT / "FEM/pinn_data/fem_field_barhalf_ratio0p8.csv"
-        )
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
+            reference_dir = root / "reference"
+            reference_dir.mkdir()
+            subprocess.run(
+                (
+                    str(GENERATOR),
+                    "--mesh", str(FEM_ROOT / "data/test_us_barhalf_centree.msh"),
+                    "--defectname", "reference",
+                    "--freqs", "600",
+                    "--modes", "0",
+                    "--outputdir", str(reference_dir),
+                    "--c0", "340",
+                    "--contrast", "1.0",
+                    "--numberofdatapoints", "31",
+                ),
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            reference = FEMFieldData(reference_dir / "fem_field_reference_ratio1.csv")
             nodal_csv = root / "sound_speed.csv"
             with nodal_csv.open("w", newline="", encoding="utf-8") as stream:
                 writer = csv.writer(stream)

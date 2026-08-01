@@ -40,7 +40,7 @@ public:
     double xmin = 0.0, xmax = 0.0;
     double ymin = 0.0, ymax = 0.0;
     double Lx   = 0.0, Ly   = 0.0;
-    double h_max = 0.0;  // longueur caractéristique max (calculée)
+    double h_max = 0.0;  // computed maximum characteristic length
 
     double compute_h_max(bool store = true);
     void compute_bbox_and_dims();
@@ -63,7 +63,7 @@ public:
     //   EdgeRef: (Nbtri x 3)
     void write_matlab_mesh_m(const std::string& out_m_file) const;
 
-    // Export des triangles du défaut pour Python (format: x1 y1 x2 y2 x3 y3)
+    // Export defect triangles for Python (format: x1 y1 x2 y2 x3 y3).
     void write_defect_coords_txt(const std::string& filename) const;
 
     // Export nodal complex field to Matlab/Octave .m script.

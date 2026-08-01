@@ -75,25 +75,25 @@ void print_usage(const char* executable) {
         << " --mesh MESH --defectname NAME --freqs F1,F2 --modes M1,M2"
         << " --outputdir DIR --c0 VALUE MATERIAL [options]\n\n"
         << "Arguments:\n"
-        << "  --mesh PATH                  Maillage Gmsh v2 ASCII\n"
-        << "  --defectname NAME            Nom utilise dans les fichiers CSV\n"
-        << "  --freqs F1,F2                Frequences positives en Hz\n"
-        << "  --modes M1,M2                Indices de modes positifs ou nuls\n"
-        << "  --outputdir DIR              Dossier de sortie\n"
-        << "  --c0 VALUE                   Celerite du milieu sain\n"
-        << "  --contrast RATIO             Rapport c_defaut / c0 pour le tag 2 (ancien format)\n"
-        << "  --tag-contrasts T:R,T:R      Rapports c_tag / c0 par tag physique de surface\n"
-        << "  --nodal-sound-speed PATH     CSV node_id,x,y,c dans l'ordre P2 apres RCM\n"
-        << "  --incidence VALUES           -1 pour gauche, 1 pour droite, ou -1,1 (defaut: -1)\n"
-        << "  --numberofdatapoints N       N points uniformes par bord, N >= 2\n"
-        << "  --help                       Afficher cette aide\n\n"
-        << "Sans --numberofdatapoints, tous les degres de liberte P2 des ports sont exportes.\n\n"
-        << "Exemple:\n  " << executable
+        << "  --mesh PATH                  Gmsh v2 ASCII mesh\n"
+        << "  --defectname NAME            Name used in CSV file names\n"
+        << "  --freqs F1,F2                Positive frequencies in Hz\n"
+        << "  --modes M1,M2                Non-negative mode indices\n"
+        << "  --outputdir DIR              Output directory\n"
+        << "  --c0 VALUE                   Healthy-medium sound speed\n"
+        << "  --contrast RATIO             c_defect / c0 ratio for surface tag 2 (legacy format)\n"
+        << "  --tag-contrasts T:R,T:R      c_tag / c0 ratios by physical surface tag\n"
+        << "  --nodal-sound-speed PATH     node_id,x,y,c CSV in reordered P2 order\n"
+        << "  --incidence VALUES           -1 from the left, 1 from the right, or -1,1 (default: -1)\n"
+        << "  --numberofdatapoints N       N uniform points per port, N >= 2\n"
+        << "  --help                       Show this help\n\n"
+        << "Without --numberofdatapoints, all port P2 degrees of freedom are exported.\n\n"
+        << "Example:\n  " << executable
         << " --mesh data/test_us_barhalfup_centree.msh --defectname barhalfup"
-        << " --freqs 600,800 --modes 0,1,2 --outputdir ../waveguide_2d/data"
+        << " --freqs 600,800 --modes 0,1,2 --outputdir ../FEM/pinn_data"
         << " --c0 340 --contrast 0.8 --incidence -1,1 --numberofdatapoints 31\n  " << executable
         << " --mesh data/two_zone.msh --defectname barhalf_sym"
-        << " --freqs 600,800 --modes 0,1,2 --outputdir ../waveguide_2d/data"
+        << " --freqs 600,800 --modes 0,1,2 --outputdir ../FEM/pinn_data"
         << " --c0 340 --tag-contrasts 2:0.8,3:0.9 --numberofdatapoints 31\n";
 }
 
@@ -111,10 +111,10 @@ double parse_double(const string& text, const string& option) {
     try {
         result = stod(value, &consumed);
     } catch (const exception&) {
-        throw invalid_argument("Valeur invalide pour " + option + ": " + text);
+        throw invalid_argument("Invalid value for " + option + ": " + text);
     }
     if (consumed != value.size() || !isfinite(result)) {
-        throw invalid_argument("Valeur invalide pour " + option + ": " + text);
+        throw invalid_argument("Invalid value for " + option + ": " + text);
     }
     return result;
 }
@@ -126,11 +126,11 @@ int parse_int(const string& text, const string& option) {
     try {
         result = stoll(value, &consumed);
     } catch (const exception&) {
-        throw invalid_argument("Valeur invalide pour " + option + ": " + text);
+        throw invalid_argument("Invalid value for " + option + ": " + text);
     }
     if (consumed != value.size() || result < numeric_limits<int>::min() ||
         result > numeric_limits<int>::max()) {
-        throw invalid_argument("Valeur invalide pour " + option + ": " + text);
+        throw invalid_argument("Invalid value for " + option + ": " + text);
     }
     return static_cast<int>(result);
 }
@@ -140,16 +140,16 @@ vector<T> parse_list(const string& text, Converter converter, const string& opti
     vector<T> values;
     string token;
     const string list_text = trim(text);
-    if (list_text.empty()) throw invalid_argument("La liste " + option + " est vide");
-    if (list_text.back() == ',') throw invalid_argument("Valeur vide dans " + option);
+    if (list_text.empty()) throw invalid_argument("List " + option + " is empty");
+    if (list_text.back() == ',') throw invalid_argument("Empty value in " + option);
 
     stringstream stream(list_text);
     while (getline(stream, token, ',')) {
         token = trim(token);
-        if (token.empty()) throw invalid_argument("Valeur vide dans " + option);
+        if (token.empty()) throw invalid_argument("Empty value in " + option);
         values.push_back(converter(token));
     }
-    if (values.empty()) throw invalid_argument("La liste " + option + " est vide");
+    if (values.empty()) throw invalid_argument("List " + option + " is empty");
     return values;
 }
 
@@ -161,7 +161,7 @@ string sanitize_name(string name) {
                            character == '-' || character == '_';
         if (!valid) character = '_';
     }
-    if (name.empty()) throw invalid_argument("--defectname ne peut pas etre vide");
+    if (name.empty()) throw invalid_argument("--defectname cannot be empty");
     return name;
 }
 
@@ -182,29 +182,29 @@ vector<TagContrast> parse_tag_contrasts(const string& text, const string& option
     stringstream stream(text);
     while (getline(stream, token, ',')) {
         token = trim(token);
-        if (token.empty()) throw invalid_argument("Valeur vide dans " + option);
+        if (token.empty()) throw invalid_argument("Empty value in " + option);
 
         const size_t separator = token.find(':');
         if (separator == string::npos || separator == 0 ||
             separator == token.size() - 1 || token.find(':', separator + 1) != string::npos) {
-            throw invalid_argument("Format attendu pour " + option + ": tag:rapport,tag:rapport");
+            throw invalid_argument("Expected format for " + option + ": tag:ratio,tag:ratio");
         }
 
         const int tag = parse_int(token.substr(0, separator), option);
         const double contrast = parse_double(token.substr(separator + 1), option);
-        if (tag <= 0) throw invalid_argument("Les tags de " + option + " doivent etre strictement positifs");
+        if (tag <= 0) throw invalid_argument("Tags in " + option + " must be strictly positive");
         if (tag == 1) {
-            throw invalid_argument("Le tag 1 est reserve au milieu sain et utilise --c0");
+            throw invalid_argument("Tag 1 is reserved for the healthy medium and uses --c0");
         }
         if (!(contrast > 0.0)) {
-            throw invalid_argument("Les rapports de " + option + " doivent etre strictement positifs");
+            throw invalid_argument("Ratios in " + option + " must be strictly positive");
         }
         if (!seen_tags.insert(tag).second) {
-            throw invalid_argument("Tag duplique dans " + option + ": " + to_string(tag));
+            throw invalid_argument("Duplicate tag in " + option + ": " + to_string(tag));
         }
         contrasts.push_back({tag, contrast});
     }
-    if (contrasts.empty()) throw invalid_argument("La liste " + option + " est vide");
+    if (contrasts.empty()) throw invalid_argument("List " + option + " is empty");
     sort(contrasts.begin(), contrasts.end(), [](const TagContrast& a, const TagContrast& b) {
         return a.tag < b.tag;
     });
@@ -218,10 +218,10 @@ vector<int> parse_incidences(const string& text, const string& option) {
     set<int> seen;
     for (int incidence : incidences) {
         if (incidence != -1 && incidence != 1) {
-            throw invalid_argument("--incidence accepte uniquement -1 ou 1");
+            throw invalid_argument("--incidence accepts only -1 or 1");
         }
         if (!seen.insert(incidence).second) {
-            throw invalid_argument("Incidence dupliquee dans --incidence: " +
+            throw invalid_argument("Duplicate incidence in --incidence: " +
                                    to_string(incidence));
         }
     }
@@ -241,11 +241,11 @@ vector<int> material_tags(const Configuration& config) {
 vector<double> load_nodal_sound_speed(const filesystem::path& path,
                                       const MeshP2& mesh) {
     ifstream input(path);
-    if (!input) throw runtime_error("Impossible d'ouvrir " + path.string());
+    if (!input) throw runtime_error("Unable to open " + path.string());
     string line;
     if (!getline(input, line) || trim(line) != "node_id,x,y,c") {
         throw runtime_error(
-            "Le CSV nodal doit commencer par l'en-tete node_id,x,y,c");
+            "The nodal CSV must start with the header node_id,x,y,c");
     }
 
     vector<double> values(mesh.ndof(), numeric_limits<double>::quiet_NaN());
@@ -262,23 +262,23 @@ vector<double> load_nodal_sound_speed(const filesystem::path& path,
         double speed = 0.0;
         string extra;
         if (!(stream >> node_id >> x >> y >> speed) || (stream >> extra)) {
-            throw runtime_error("Ligne nodale invalide: " + line);
+            throw runtime_error("Invalid nodal line: " + line);
         }
         if (node_id < 0 || static_cast<size_t>(node_id) >= mesh.ndof()) {
-            throw runtime_error("node_id nodal hors maillage: " + to_string(node_id));
+            throw runtime_error("Nodal node_id is outside the mesh: " + to_string(node_id));
         }
         if (seen[node_id]) {
-            throw runtime_error("node_id nodal duplique: " + to_string(node_id));
+            throw runtime_error("Duplicate nodal node_id: " + to_string(node_id));
         }
         const auto& node = mesh.nodes[node_id];
         const double coordinate_tolerance = 1e-9 * max({1.0, mesh.Lx, mesh.Ly});
         if (abs(x - node.x) > coordinate_tolerance || abs(y - node.y) > coordinate_tolerance) {
             throw runtime_error(
-                "Coordonnees incompatibles pour le node_id " + to_string(node_id));
+                "Coordinates do not match node_id " + to_string(node_id));
         }
         if (!(speed > 0.0) || !isfinite(speed)) {
             throw runtime_error(
-                "Celerite nodale non positive ou non finie au node_id " +
+                "Nodal sound speed is non-positive or non-finite at node_id " +
                 to_string(node_id));
         }
         values[node_id] = speed;
@@ -287,8 +287,8 @@ vector<double> load_nodal_sound_speed(const filesystem::path& path,
     }
     if (row_count != mesh.ndof()) {
         throw runtime_error(
-            "Le CSV nodal contient " + to_string(row_count) + " lignes pour " +
-            to_string(mesh.ndof()) + " ddl");
+            "The nodal CSV contains " + to_string(row_count) + " rows for " +
+            to_string(mesh.ndof()) + " degrees of freedom");
     }
     return values;
 }
@@ -311,7 +311,7 @@ string data_suffix(const Configuration& config) {
 Configuration parse_arguments(int argc, char** argv) {
     if (argc < 2) {
         print_usage(argv[0]);
-        throw invalid_argument("Arguments manquants");
+        throw invalid_argument("Missing arguments");
     }
 
     Configuration config;
@@ -326,7 +326,7 @@ Configuration parse_arguments(int argc, char** argv) {
     bool has_nodal_sound_speed = false;
 
     auto value_after = [&](int& index, const string& option) -> string {
-        if (index + 1 >= argc) throw invalid_argument("Valeur manquante apres " + option);
+        if (index + 1 >= argc) throw invalid_argument("Missing value after " + option);
         return argv[++index];
     };
 
@@ -370,39 +370,39 @@ Configuration parse_arguments(int argc, char** argv) {
             config.incidences = parse_incidences(value_after(i, option), option);
         } else if (option == "--numberofdatapoints") {
             const int count = parse_int(value_after(i, option), option);
-            if (count < 2) throw invalid_argument("--numberofdatapoints doit etre >= 2");
+            if (count < 2) throw invalid_argument("--numberofdatapoints must be >= 2");
             config.number_of_data_points = static_cast<size_t>(count);
         } else {
-            throw invalid_argument("Option inconnue: " + option);
+            throw invalid_argument("Unknown option: " + option);
         }
     }
 
-    if (!has_mesh) throw invalid_argument("--mesh est obligatoire");
-    if (!has_defect_name) throw invalid_argument("--defectname est obligatoire");
-    if (!has_frequencies) throw invalid_argument("--freqs est obligatoire");
-    if (!has_modes) throw invalid_argument("--modes est obligatoire");
-    if (!has_output_dir) throw invalid_argument("--outputdir est obligatoire");
-    if (!has_c0) throw invalid_argument("--c0 est obligatoire");
+    if (!has_mesh) throw invalid_argument("--mesh is required");
+    if (!has_defect_name) throw invalid_argument("--defectname is required");
+    if (!has_frequencies) throw invalid_argument("--freqs is required");
+    if (!has_modes) throw invalid_argument("--modes is required");
+    if (!has_output_dir) throw invalid_argument("--outputdir is required");
+    if (!has_c0) throw invalid_argument("--c0 is required");
     const int material_option_count = static_cast<int>(has_contrast) +
                                       static_cast<int>(has_tag_contrasts) +
                                       static_cast<int>(has_nodal_sound_speed);
     if (material_option_count != 1) {
         throw invalid_argument(
-            "Fournir exactement un de --contrast ou --tag-contrasts, "
-            "ou utiliser --nodal-sound-speed exclusivement");
+            "Provide exactly one of --contrast or --tag-contrasts, "
+            "or use --nodal-sound-speed exclusively");
     }
-    if (!(config.c0 > 0.0)) throw invalid_argument("--c0 doit etre strictement positif");
+    if (!(config.c0 > 0.0)) throw invalid_argument("--c0 must be strictly positive");
     if (has_contrast && !(*config.legacy_contrast_ratio > 0.0)) {
-        throw invalid_argument("--contrast doit etre un rapport strictement positif");
+        throw invalid_argument("--contrast must be a strictly positive ratio");
     }
     if (has_contrast) {
         config.tag_contrasts = {{defect_tag, *config.legacy_contrast_ratio}};
     }
     for (double frequency : config.frequencies) {
-        if (!(frequency > 0.0)) throw invalid_argument("Toutes les frequences doivent etre positives");
+        if (!(frequency > 0.0)) throw invalid_argument("All frequencies must be positive");
     }
     for (int mode : config.modes) {
-        if (mode < 0) throw invalid_argument("Les indices de mode doivent etre positifs ou nuls");
+        if (mode < 0) throw invalid_argument("Mode indices must be non-negative");
     }
 
     sort(config.frequencies.begin(), config.frequencies.end());
@@ -415,7 +415,7 @@ Configuration parse_arguments(int argc, char** argv) {
 
 ofstream open_output(const filesystem::path& path) {
     ofstream output(path);
-    if (!output) throw runtime_error("Impossible de creer " + path.string());
+    if (!output) throw runtime_error("Unable to create " + path.string());
     output << setprecision(17);
     return output;
 }
@@ -443,12 +443,12 @@ BoundaryPort collect_boundary_port(const MeshP2& mesh, int boundary_tag, double 
             const auto& pm = mesh.nodes[midpoint];
             if (abs(p0.x - expected_x) > tolerance || abs(p1.x - expected_x) > tolerance ||
                 abs(pm.x - expected_x) > tolerance) {
-                throw runtime_error("Le port tague " + to_string(boundary_tag) +
-                                    " n'est pas vertical a l'extremite du maillage");
+                throw runtime_error("Port tag " + to_string(boundary_tag) +
+                                    " is not vertical at the mesh boundary");
             }
             if (abs(p1.y - p0.y) <= tolerance) {
-                throw runtime_error("Une arete du port tague " + to_string(boundary_tag) +
-                                    " a une hauteur nulle");
+                throw runtime_error("An edge of port tag " + to_string(boundary_tag) +
+                                    " has zero height");
             }
             port.edges.push_back({first, second, midpoint});
             unique_nodes.insert(first);
@@ -458,7 +458,7 @@ BoundaryPort collect_boundary_port(const MeshP2& mesh, int boundary_tag, double 
     }
 
     if (port.edges.empty()) {
-        throw runtime_error("Aucune arete trouvee pour le tag de port " +
+        throw runtime_error("No edge found for port tag " +
                             to_string(boundary_tag));
     }
 
@@ -517,8 +517,8 @@ vector<BoundaryEvaluation> prepare_boundary_evaluations(
         }
 
         if (!found) {
-            throw runtime_error("Impossible d'interpoler le point y=" + to_string(y) +
-                                " sur le port x=" + to_string(port.x));
+            throw runtime_error("Unable to interpolate point y=" + to_string(y) +
+                                " on port x=" + to_string(port.x));
         }
     }
     return evaluations;
@@ -591,7 +591,7 @@ void export_lower_matrix(const filesystem::path& path, const ProfileMatrix<compl
             const double real_value = real(value);
             const double imag_tolerance = 1e-13 * max(1.0, abs(real_value));
             if (abs(imag(value)) > imag_tolerance) {
-                throw runtime_error("Une matrice geometrique contient une partie imaginaire non nulle");
+                throw runtime_error("A geometric matrix contains a non-zero imaginary part");
             }
             output << row << ',' << column << ',' << real_value << '\n';
         }
@@ -604,25 +604,25 @@ void warn_if_polluted(double frequency, const string& label, double k, double h)
     const double kh_fourth = kh_squared * kh_squared;
     if (kh_squared + k * kh_fourth < pollution_eps) return;
 
-    cerr << "Attention: pollution numerique possible pour " << label
-         << " a f=" << frequency << " Hz: condition (kh)^2+k(kh)^4 < "
-         << pollution_eps << " non verifiee, (kh)^2=" << kh_squared
-         << ", k(kh)^4=" << k*kh_fourth << ". Simulation poursuivie.\n";
+    cerr << "Warning: numerical pollution may affect " << label
+         << " at f=" << frequency << " Hz: condition (kh)^2+k(kh)^4 < "
+         << pollution_eps << " is not satisfied, (kh)^2=" << kh_squared
+         << ", k(kh)^4=" << k*kh_fourth << ". Continuing simulation.\n";
 }
 
 void validate_waveguide_geometry(const MeshP2& mesh, const BoundaryPort& left,
                                  const BoundaryPort& right) {
     if (!(mesh.Lx > 0.0 && mesh.Ly > 0.0)) {
-        throw runtime_error("Le maillage doit avoir des dimensions strictement positives");
+        throw runtime_error("The mesh dimensions must be strictly positive");
     }
     const double scale = max({1.0, abs(mesh.Lx), abs(mesh.Ly)});
     const double tolerance = 1e-10 * scale;
     if (abs(mesh.xmin + mesh.xmax) > tolerance) {
-        throw runtime_error("Le guide doit etre centre avec des ports en x=-L et x=+L");
+        throw runtime_error("The waveguide must be centered with ports at x=-L and x=+L");
     }
     if (abs(left.ymin - mesh.ymin) > tolerance || abs(left.ymax - mesh.ymax) > tolerance ||
         abs(right.ymin - mesh.ymin) > tolerance || abs(right.ymax - mesh.ymax) > tolerance) {
-        throw runtime_error("Les ports doivent couvrir toute la hauteur du guide");
+        throw runtime_error("The ports must cover the full waveguide height");
     }
 }
 
@@ -653,7 +653,7 @@ int main(int argc, char** argv) {
         const auto right_evaluations =
             prepare_boundary_evaluations(mesh, right_port, config.number_of_data_points);
 
-        cout << "Maillage: " << mesh.ndof() << " ddl P2, " << mesh.triangles.size()
+        cout << "Mesh: " << mesh.ndof() << " P2 degrees of freedom, " << mesh.triangles.size()
              << " triangles, ports " << left_evaluations.size() << "/"
              << right_evaluations.size() << " points, h_max=" << h_max << ".\n";
 
@@ -693,14 +693,14 @@ int main(int argc, char** argv) {
                 max(static_cast<int>(floor(mesh.Ly * k0 / pi)) + 5,
                     highest_requested_mode + 1);
 
-            warn_if_polluted(frequency, "milieu sain", k0, h_max);
+            warn_if_polluted(frequency, "healthy medium", k0, h_max);
             if (nodal_sound_speed.has_value()) {
                 const double min_speed =
                     *min_element(nodal_sound_speed->begin(), nodal_sound_speed->end());
                 const double material_k = omega / min_speed;
                 const double duplicate_tolerance = 1e-12 * max(1.0, abs(k0));
                 if (abs(material_k - k0) > duplicate_tolerance) {
-                    warn_if_polluted(frequency, "materiau nodal", material_k, h_max);
+                        warn_if_polluted(frequency, "nodal material", material_k, h_max);
                 }
             } else {
                 for (const auto& tag_contrast : config.tag_contrasts) {
@@ -716,8 +716,8 @@ int main(int argc, char** argv) {
                 }
             }
 
-            cout << "Resolution f=" << frequency << " Hz, k0=" << k0
-                 << ", " << number_of_dtn_modes << " modes DtN...\n";
+            cout << "Solving f=" << frequency << " Hz, k0=" << k0
+                 << ", " << number_of_dtn_modes << " DtN modes...\n";
 
             ProfileMatrix<complexe> system = stiffness;
             if (nodal_sound_speed.has_value()) {
@@ -743,7 +743,7 @@ int main(int argc, char** argv) {
             for (int mode : config.modes) {
                 const complexe beta = Fem::compute_beta(k0, mesh.Ly, mode);
                 if (abs(imag(beta)) > 1e-12) {
-                    cerr << "Attention: le mode incident " << mode << " est evanescent a "
+                    cerr << "Warning: incident mode " << mode << " is evanescent at "
                          << frequency << " Hz.\n";
                 }
 
@@ -768,10 +768,10 @@ int main(int argc, char** argv) {
             }
         }
 
-        cout << "Donnees FEM/PINN generees dans " << config.output_dir << '\n';
+        cout << "FEM/PINN data written to " << config.output_dir << '\n';
         return 0;
     } catch (const exception& error) {
-        cerr << "Erreur: " << error.what() << '\n';
+        cerr << "Error: " << error.what() << '\n';
         return 1;
     }
 }

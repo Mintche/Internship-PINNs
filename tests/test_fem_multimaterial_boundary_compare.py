@@ -16,12 +16,12 @@ from tools.compare_boundary_fields import (
     create_comparison_figure,
     incident_wave,
 )
-from tools.compare_pinn_fem import compute_misfit_metrics
 from tools.data_loader import (
     FEMFieldData,
     WaveguideBoundaryData,
     load_symmetric_coo_matrix,
 )
+from tools.fem_metrics import compute_misfit_metrics
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -32,9 +32,9 @@ GENERATOR = FEM_DIR / "generate_pinn_data.x"
 def _write_boundary_csv(path, *, frequency, k0, mode, x, y, values):
     with Path(path).open("w", newline="") as stream:
         writer = csv.writer(stream)
-        writer.writerow(["f", "k0", "mode", "x", "y", "Re_U", "Im_U"])
+        writer.writerow(["incidence", "f", "k0", "mode", "x", "y", "Re_U", "Im_U"])
         for yi, value in zip(y, values):
-            writer.writerow([frequency, k0, mode, x, yi, value.real, value.imag])
+            writer.writerow([-1, frequency, k0, mode, x, yi, value.real, value.imag])
 
 
 def _write_boundary_pair(
@@ -247,7 +247,7 @@ class FEMMultiMaterialGeneratorTests(unittest.TestCase):
                 text=True,
             )
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("exactement un de --contrast ou --tag-contrasts", result.stderr)
+        self.assertIn("exactly one of --contrast or --tag-contrasts", result.stderr)
 
     def test_homogeneous_contrast_reproduces_incident_modes(self):
         """The complete FEM/DtN export must reduce to the analytic incident field."""

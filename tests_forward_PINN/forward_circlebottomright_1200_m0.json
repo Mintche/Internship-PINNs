@@ -41,8 +41,8 @@
   "gradient_eval_interval_adam": 1000,
   "fem_prediction_batch_size": 8192,
   "reference_kind": "fem",
-  "fem_field": "val_fem/fem_field_circlebottomrightforward.csv",
-  "mass_matrix": "val_fem/Mass_matrix_circlebottomrightforward.csv",
-  "stiffness_matrix": "val_fem/Stiff_matrix_circlebottomrightforward.csv",
+  "fem_field": "FEM/pinn_data/fem_field_circlebottomrightforward.csv",
+  "mass_matrix": "FEM/pinn_data/Mass_matrix_circlebottomrightforward.csv",
+  "stiffness_matrix": "FEM/pinn_data/Stiff_matrix_circlebottomrightforward.csv",
   "output_root": "tests_forward_PINN/results"
 }

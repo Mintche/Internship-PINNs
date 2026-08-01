@@ -12,12 +12,8 @@ __pycache__/
 
 /notebooks
 
-#Temp files
-/pinn_waveguide_2d/predictions/
-/pinn_waveguide_2d/data/
-
-/pinn_waveguide_2d/cache/
-
 /*.md
 
+# Generated experiment outputs
+/inverse_PINN/results/
 /val_fem/
