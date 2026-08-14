@@ -5,6 +5,7 @@ import json
 import pytest
 
 from inverse_PINN.config import InverseConfig
+from inverse_PINN.training import _data_factor
 from inverse_PINN.variants import ALL_VARIANTS, parse_variant
 from tests.inverse_pinn_test_utils import make_inverse_config
 
@@ -50,3 +51,15 @@ def test_evanescent_incident_mode_is_rejected(tmp_path):
     with pytest.raises(ValueError, match="evanescent"):
         InverseConfig.from_json(path)
 
+
+def test_data_loss_ramp_uses_a_fixed_number_of_steps(tmp_path):
+    path = make_inverse_config(tmp_path)
+    raw = json.loads(path.read_text())
+    raw["optimization"]["data_transition_steps"] = 3
+    path.write_text(json.dumps(raw))
+    config = InverseConfig.from_json(path)
+
+    assert _data_factor(config, 1) == pytest.approx(0.1)
+    assert _data_factor(config, 2) == pytest.approx(0.55)
+    assert _data_factor(config, 3) == pytest.approx(1.0)
+    assert _data_factor(config, 30) == pytest.approx(1.0)

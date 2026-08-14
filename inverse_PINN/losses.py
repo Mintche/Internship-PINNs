@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping, Sequence
 
 import jax
@@ -17,6 +17,7 @@ from .models import (
     field_value_gradient_laplacian,
     material_physical_gradient,
     material_value,
+    unpack_field_parameters,
 )
 from .sampling import CollocationPoints
 from .variants import VariantSpec
@@ -308,6 +309,64 @@ def pressure_objective(
         "unweighted_total": sum(components[name] for name in FIELD_COMPONENTS),
     }
     return objective, components
+
+
+def packed_pressure_objective(
+    packed_field_params: Mapping[str, Any],
+    material_params: Mapping[str, Any],
+    physics: PhysicsContext,
+    contexts: Sequence[CaseContext],
+    b_bases: jax.Array,
+    variant: VariantSpec,
+    points: CollocationPoints,
+    weights: jax.Array | Sequence[Sequence[float]],
+    *,
+    include_data: bool = True,
+    homogeneous_material: bool = False,
+    freeze_sigma: bool = False,
+) -> tuple[jax.Array, dict[str, jax.Array]]:
+    """Evaluate one mean objective without exposing per-acquisition losses."""
+    contexts = tuple(contexts)
+    field_params = unpack_field_parameters(packed_field_params)
+    weights = jnp.asarray(weights, dtype=jnp.float32)
+    if weights.shape != (len(contexts), len(FIELD_COMPONENTS)):
+        raise ValueError("Packed pressure weights have an invalid shape")
+    if b_bases.shape[0] != len(contexts):
+        raise ValueError("Packed Fourier bases have an invalid leading dimension")
+
+    objectives = []
+    components = []
+    for params, context, b_base, case_weights in zip(
+        field_params, contexts, b_bases, weights
+    ):
+        if freeze_sigma:
+            params = {
+                **params,
+                "sigma": jax.lax.stop_gradient(params["sigma"]),
+            }
+        objective, values = pressure_objective(
+            params,
+            material_params,
+            physics,
+            replace(context, b_base=b_base),
+            variant,
+            points,
+            case_weights,
+            include_data=include_data,
+            homogeneous_material=homogeneous_material,
+        )
+        objectives.append(objective)
+        components.append(values)
+
+    means = {
+        name: jnp.mean(jnp.stack(tuple(values[name] for values in components)))
+        for name in (
+            "pde", "neumann", "dtn", "dtn_left", "dtn_right", "data",
+            "unweighted_total",
+        )
+    }
+    means["objective"] = jnp.mean(jnp.stack(tuple(objectives)))
+    return means["objective"], means
 
 
 def material_tv(

@@ -16,4 +16,5 @@ __pycache__/
 
 # Generated experiment outputs
 /inverse_PINN/results/
+/inverse_PINN/cache/
 /val_fem/

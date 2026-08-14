@@ -96,6 +96,40 @@ def initialize_material_model(
     return {"layers": layers}
 
 
+def pack_field_parameters(
+    parameters: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Stack equal-architecture pressure networks along an acquisition axis."""
+    parameters = tuple(parameters)
+    if not parameters:
+        raise ValueError("At least one pressure network is required")
+    reference = jax.tree_util.tree_structure(parameters[0])
+    if any(jax.tree_util.tree_structure(item) != reference for item in parameters[1:]):
+        raise ValueError("All packed pressure networks must share one architecture")
+    try:
+        return jax.tree_util.tree_map(
+            lambda *leaves: jnp.stack(leaves, axis=0), *parameters
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError("Pressure-network parameter shapes are incompatible") from error
+
+
+def unpack_field_parameters(
+    packed_parameters: Mapping[str, Any],
+) -> tuple[dict[str, Any], ...]:
+    """Return acquisition views from a packed pressure-parameter pytree."""
+    leaves = jax.tree_util.tree_leaves(packed_parameters)
+    if not leaves or leaves[0].ndim == 0:
+        raise ValueError("Invalid packed pressure parameters")
+    count = int(leaves[0].shape[0])
+    if count <= 0 or any(leaf.ndim == 0 or leaf.shape[0] != count for leaf in leaves):
+        raise ValueError("Packed pressure leaves must share a positive leading axis")
+    return tuple(
+        jax.tree_util.tree_map(lambda leaf, index=index: leaf[index], packed_parameters)
+        for index in range(count)
+    )
+
+
 def _standard_layers(layers: Sequence[Params], values: jax.Array) -> jax.Array:
     for layer in layers[:-1]:
         values = jax.nn.tanh(values @ layer["W"] + layer["b"])

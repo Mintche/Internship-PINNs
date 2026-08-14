@@ -15,7 +15,7 @@ from tests.inverse_pinn_test_utils import make_inverse_config
 
 
 REQUIRED = {
-    "pressure_loss_history.csv",
+    "pressure_common_loss_history.csv",
     "material_loss_history.csv",
     "pressure_gradient_history.csv",
     "material_snapshot_diagnostics.csv",
@@ -39,11 +39,16 @@ REQUIRED = {
         "fourier_scattered",
     ],
 )
-def test_total_and_scattered_smoke_artifacts_and_snapshot_atomicity(tmp_path, variant):
+def test_total_and_scattered_smoke_artifacts_and_snapshot_atomicity(
+    tmp_path, variant, capsys
+):
     config = InverseConfig.from_json(
         make_inverse_config(tmp_path / variant, warmup_steps=1, inverse_steps=1)
     )
     run = run_training(config, variant, 0)
+    progress = capsys.readouterr().out
+    for label in ("global=", "pde=", "boundary=", "data="):
+        assert label in progress
     package = next((run / "packages").iterdir())
     assert REQUIRED <= {path.name for path in package.iterdir()}
     summary = json.loads((package / "summary.json").read_text())
@@ -59,6 +64,7 @@ def test_total_and_scattered_smoke_artifacts_and_snapshot_atomicity(tmp_path, va
     material_loss_rows = list(
         csv.DictReader((package / "material_loss_history.csv").open())
     )
+    assert all(int(row["case_count"]) == 1 for row in material_loss_rows)
     aggregate_rows = [
         row for row in csv.DictReader(
             (package / "material_snapshot_diagnostics.csv").open()
@@ -73,13 +79,20 @@ def test_total_and_scattered_smoke_artifacts_and_snapshot_atomicity(tmp_path, va
         assert material_loss_rows[0]["weighted_tv"] == ""
         assert aggregate_rows[0]["tv"] == ""
         assert aggregate_rows[0]["tv_gradient_l2_norm"] == ""
+    common_rows = list(
+        csv.DictReader((package / "pressure_common_loss_history.csv").open())
+    )
+    assert common_rows
+    assert all(int(row["case_count"]) == 1 for row in common_rows)
+    assert not (package / "pressure_loss_history.csv").exists()
     with pytest.raises(FileExistsError):
         run_training(config, variant, 0)
 
     if "total" in variant:
         outputs = plot_campaign(run, cosines=True)
         pdfs = list(outputs[0].glob("*.pdf"))
-        assert len(pdfs) == 8
+        assert len(pdfs) == 9
+        assert (outputs[0] / "pressure_common_loss.pdf").is_file()
         assert all(path.stat().st_size > 100 for path in pdfs)
 
 
@@ -94,12 +107,44 @@ def test_alternating_lbfgs_miniature_and_best_checkpoint(tmp_path):
     package = next((run / "packages").iterdir())
     phases = {
         row["phase"]
-        for row in csv.DictReader((package / "pressure_loss_history.csv").open())
+        for row in csv.DictReader(
+            (package / "pressure_common_loss_history.csv").open()
+        )
     }
     assert "inverse_lbfgs_field_cycle1" in phases
     assert "inverse_lbfgs_material_cycle1" in phases
     assert (package / "pressure_weights_best.npz").is_file()
     assert (package / "slowness_weights_best.npz").is_file()
+
+
+def test_packed_pressure_objective_tracks_two_active_networks(tmp_path):
+    config = InverseConfig.from_json(
+        make_inverse_config(
+            tmp_path / "packed",
+            frequencies=(1000.0, 1200.0),
+            package_frequencies=((1000.0, 1200.0),),
+            warmup_steps=0,
+            inverse_steps=1,
+            snapshot_fractions=(),
+        )
+    )
+    run = run_training(config, "fourier_total", 7)
+    package = next((run / "packages").iterdir())
+    common = list(
+        csv.DictReader((package / "pressure_common_loss_history.csv").open())
+    )
+    assert len(common) == 2
+    assert {int(row["case_count"]) for row in common} == {2}
+    for common_row in common:
+        assert float(common_row["static_objective"]) == pytest.approx(
+            sum(
+                weight * float(common_row[component])
+                for weight, component in zip(
+                    config.loss.field_weights,
+                    ("pde", "neumann", "dtn", "data"),
+                )
+            )
+        )
 
 
 @pytest.mark.parametrize(
@@ -123,12 +168,17 @@ def test_curriculum_pretrains_only_new_cases_and_keeps_seen_frozen(
     calls = []
 
     def fake_warmup(**kwargs):
-        calls.append((kwargs["package_index"], kwargs["case"].id))
-        return kwargs["field_model"], 0.0, 0.0
+        calls.append(
+            (kwargs["package_index"], tuple(case.id for case in kwargs["cases"]))
+        )
+        return dict(kwargs["field_models"]), 0.0, 0.0
 
     monkeypatch.setattr("inverse_PINN.training._run_warmup", fake_warmup)
     run = run_training(config, variant, 2)
-    assert calls == expected_warmups
+    assert calls == [
+        (package_index, (case_id,))
+        for package_index, case_id in expected_warmups
+    ]
     last_package = sorted((run / "packages").iterdir())[-1]
     models, _, _ = load_pressure_checkpoint(last_package / "pressure_weights_best.npz")
     assert len(models) == 2

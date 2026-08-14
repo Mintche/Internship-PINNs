@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -17,6 +18,7 @@ from .config import Case, InverseConfig
 from .data import load_inverse_dataset, truth_sound_speed
 from .losses import build_case_context, build_physics_context, physical_pressure_prediction
 from .models import material_sound_speed
+from .runtime import configure_jax_compilation_cache
 from .variants import parse_variant
 
 
@@ -39,8 +41,8 @@ def _run_directories(root: Path) -> list[Path]:
 def _batch_pressure(params, physics, context, variant, x, y, batch_size):
     x, y = np.asarray(x).ravel(), np.asarray(y).ravel()
     function = jax.jit(
-        lambda xv, yv: physical_pressure_prediction(
-            params, physics, context, variant, xv, yv
+        lambda candidate, b_base, xv, yv: physical_pressure_prediction(
+            candidate, physics, replace(context, b_base=b_base), variant, xv, yv
         )
     )
     chunks = []
@@ -48,6 +50,8 @@ def _batch_pressure(params, physics, context, variant, x, y, batch_size):
         chunks.append(
             np.asarray(
                 function(
+                    params,
+                    context.b_base,
                     jnp.asarray(x[start : start + batch_size], dtype=jnp.float32),
                     jnp.asarray(y[start : start + batch_size], dtype=jnp.float32),
                 )
@@ -61,7 +65,11 @@ def _batch_celerity(params, config, x, y):
     xn = np.asarray(x).ravel() / config.geometry.half_length
     yn = 2.0 * np.asarray(y).ravel() / config.geometry.height - 1.0
     function = jax.jit(
-        jax.vmap(lambda xv, yv: material_sound_speed(params, config.geometry, xv, yv))
+        lambda candidate, xv, yv: jax.vmap(
+            lambda x_value, y_value: material_sound_speed(
+                candidate, config.geometry, x_value, y_value
+            )
+        )(xv, yv)
     )
     chunks = []
     size = config.logging.prediction_batch_size
@@ -69,6 +77,7 @@ def _batch_celerity(params, config, x, y):
         chunks.append(
             np.asarray(
                 function(
+                    params,
                     jnp.asarray(xn[start : start + size], dtype=jnp.float32),
                     jnp.asarray(yn[start : start + size], dtype=jnp.float32),
                 )
@@ -151,6 +160,42 @@ def _pcolormesh(axis, x, y, values, *, title, cmap, vmin=None, vmax=None):
     return artist
 
 
+def _save_pressure_common_loss_figure(figures: Path, history_path: Path) -> None:
+    if not history_path.is_file() or history_path.stat().st_size == 0:
+        return
+    frame = pd.read_csv(history_path)
+    if frame.empty:
+        return
+    plt = _style()
+    figure, axis = plt.subplots(figsize=(8.0, 4.2), constrained_layout=True)
+    x = pd.to_numeric(frame["evaluation_index"], errors="coerce").to_numpy()
+    styles = {
+        "current_objective": ("common objective", 2.0),
+        "static_objective": ("static monitor objective", 2.0),
+        "pde": ("mean PDE", 1.2),
+        "neumann": ("mean Neumann", 1.2),
+        "dtn": ("mean DtN", 1.2),
+        "data": ("mean data", 1.2),
+    }
+    for column, (label, width) in styles.items():
+        values = pd.to_numeric(frame[column], errors="coerce").to_numpy(dtype=float)
+        values = np.where(values > 0.0, values, np.nan)
+        if np.isfinite(values).any():
+            axis.semilogy(
+                x, values, label=label, linewidth=width, rasterized=True
+            )
+    phases = frame["phase"].astype(str).to_numpy()
+    for index in np.flatnonzero(phases[1:] != phases[:-1]) + 1:
+        axis.axvline(x[index], color="0.75", linewidth=0.8, linestyle="--")
+    axis.set_title("Common pressure loss (mean over active acquisitions)")
+    axis.set_xlabel("monitor evaluation")
+    axis.set_ylabel("loss")
+    axis.grid(True, which="both", alpha=0.2)
+    axis.legend(fontsize=8, ncol=2)
+    figure.savefig(figures / "pressure_common_loss.pdf")
+    plt.close(figure)
+
+
 def _save_material_figures(figures, config, params, metrics, snapshots_path, cosine_path, cosines):
     plt = _style()
     with np.load(snapshots_path, allow_pickle=False) as archive:
@@ -226,6 +271,7 @@ def _save_material_figures(figures, config, params, metrics, snapshots_path, cos
 
 
 def plot_campaign(root: Path, *, cosines: bool = False) -> list[Path]:
+    configure_jax_compilation_cache()
     outputs = []
     for run_directory in _run_directories(Path(root)):
         manifest = _load_json(run_directory / "manifest.json")
@@ -258,6 +304,9 @@ def plot_campaign(root: Path, *, cosines: bool = False) -> list[Path]:
             metric_frame = pd.read_csv(package_directory / "pressure_metrics.csv").set_index("case_id")
             figures = package_directory / "figures"
             figures.mkdir(exist_ok=True)
+            _save_pressure_common_loss_figure(
+                figures, package_directory / "pressure_common_loss_history.csv"
+            )
             for case in active:
                 fem = dataset.fem_cases[case]
                 prediction = _batch_pressure(

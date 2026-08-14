@@ -153,11 +153,14 @@ def make_inverse_config(
         "optimization": {
             "field_learning_rate": 1e-3,
             "material_learning_rate": 1e-3,
+            "cosine_decay_start": 10_000,
+            "consine_decay_stop": 20_000,
+            "cosine_decay_alpha": 0.1,
             "sigma_learning_rate": 1e-2,
             "sigma_decay_fraction": 0.5,
             "sigma_cosine_alpha": 1e-3,
             "data_initial_factor": 0.1,
-            "data_transition_fraction": 1.0,
+            "data_transition_steps": 10_000,
         },
         "sampling": {
             "adam": [4, 2, 2],
@@ -182,4 +185,3 @@ def make_inverse_config(
     path = root / "config.json"
     path.write_text(json.dumps(config), encoding="utf-8")
     return path
-

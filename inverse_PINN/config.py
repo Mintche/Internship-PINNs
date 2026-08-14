@@ -211,11 +211,14 @@ class LossConfig:
 class OptimizationConfig:
     field_learning_rate: float
     material_learning_rate: float
+    cosine_decay_start: int
+    consine_decay_stop: int
+    cosine_decay_alpha: float
     sigma_learning_rate: float
     sigma_decay_fraction: float
     sigma_cosine_alpha: float
     data_initial_factor: float
-    data_transition_fraction: float
+    data_transition_steps: int
 
 
 @dataclass(frozen=True)
@@ -457,22 +460,51 @@ def _parse_loss(value: Any) -> LossConfig:
 
 def _parse_optimization(value: Any) -> OptimizationConfig:
     raw = _mapping(value, "optimization")
-    expected = {"field_learning_rate", "material_learning_rate", "sigma_learning_rate", "sigma_decay_fraction", "sigma_cosine_alpha", "data_initial_factor", "data_transition_fraction"}
+    expected = {
+        "field_learning_rate",
+        "material_learning_rate",
+        "cosine_decay_start",
+        "consine_decay_stop",
+        "cosine_decay_alpha",
+        "sigma_learning_rate",
+        "sigma_decay_fraction",
+        "sigma_cosine_alpha",
+        "data_initial_factor",
+        "data_transition_steps",
+    }
     _keys(raw, expected, "optimization")
     result = OptimizationConfig(
         field_learning_rate=_positive(raw["field_learning_rate"], "optimization.field_learning_rate"),
         material_learning_rate=_positive(raw["material_learning_rate"], "optimization.material_learning_rate"),
+        cosine_decay_start=_positive_int(
+            raw["cosine_decay_start"],
+            "optimization.cosine_decay_start",
+            allow_zero=True,
+        ),
+        consine_decay_stop=_positive_int(
+            raw["consine_decay_stop"], "optimization.consine_decay_stop"
+        ),
+        cosine_decay_alpha=_finite(
+            raw["cosine_decay_alpha"], "optimization.cosine_decay_alpha"
+        ),
         sigma_learning_rate=_positive(raw["sigma_learning_rate"], "optimization.sigma_learning_rate"),
         sigma_decay_fraction=_non_negative(raw["sigma_decay_fraction"], "optimization.sigma_decay_fraction"),
         sigma_cosine_alpha=_finite(raw["sigma_cosine_alpha"], "optimization.sigma_cosine_alpha"),
         data_initial_factor=_non_negative(raw["data_initial_factor"], "optimization.data_initial_factor"),
-        data_transition_fraction=_positive(raw["data_transition_fraction"], "optimization.data_transition_fraction"),
+        data_transition_steps=_positive_int(raw["data_transition_steps"], "optimization.data_transition_steps"),
     )
-    for name in ("sigma_decay_fraction", "data_initial_factor", "data_transition_fraction"):
+    for name in ("sigma_decay_fraction", "data_initial_factor"):
         if getattr(result, name) > 1.0:
             raise ValueError(f"optimization.{name} must lie in (0, 1]")
     if not 0.0 <= result.sigma_cosine_alpha <= 1.0:
         raise ValueError("optimization.sigma_cosine_alpha must lie in [0, 1]")
+    if result.consine_decay_stop <= result.cosine_decay_start:
+        raise ValueError(
+            "optimization.consine_decay_stop must be greater than "
+            "optimization.cosine_decay_start"
+        )
+    if not 0.0 <= result.cosine_decay_alpha <= 1.0:
+        raise ValueError("optimization.cosine_decay_alpha must lie in [0, 1]")
     return result
 
 

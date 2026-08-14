@@ -3,7 +3,7 @@
     "height": 0.6,
     "half_length": 1.0,
     "c0": 340.0,
-    "celerity_ratio_bounds": [0.6, 1.01],
+    "celerity_ratio_bounds": [0.6, 1.4],
 "truth_regions": [
   {
     "shape": "rectangle",
@@ -50,11 +50,14 @@
   "optimization": {
     "field_learning_rate": 0.001,
     "material_learning_rate": 0.001,
+    "cosine_decay_start": 10000,
+    "consine_decay_stop": 20000,
+    "cosine_decay_alpha": 0.1,
     "sigma_learning_rate": 0.01,
     "sigma_decay_fraction": 0.5,
     "sigma_cosine_alpha": 0.001,
     "data_initial_factor": 0.1,
-    "data_transition_fraction": 1.0
+    "data_transition_steps": 10000
   },
   "sampling": {
     "adam": [4096, 256, 256],
@@ -77,15 +80,15 @@
     {
       "cases": {
         "-1": {
-          "600": [0,1,2]
+          "700": [0,1,2]
         }
       },
       "warmup": {
-        "adam_steps": 10000,
+        "adam_steps": 5000,
         "lbfgs_steps": 0
       },
       "inverse": {
-        "adam_steps": 50000,
+        "adam_steps": 25000,
         "lbfgs_cycles": 0,
         "lbfgs_field_steps": 0,
         "lbfgs_material_steps": 0

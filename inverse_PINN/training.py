@@ -8,7 +8,7 @@ training duration.
 from __future__ import annotations
 
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -38,20 +38,23 @@ from .losses import (
     material_case_gradient_norms,
     material_objective,
     material_snapshot_statistics,
+    packed_pressure_objective,
     physical_pressure_prediction,
     pressure_gradient_statistics,
     pressure_metrics,
-    pressure_objective,
 )
 from .models import (
     FieldModel,
     initialize_field_model,
     initialize_material_model,
     material_sound_speed,
+    pack_field_parameters,
+    unpack_field_parameters,
 )
 from .optimizers import (
     make_field_adam,
     make_inverse_adam_step,
+    make_material_adam,
     make_material_lbfgs_step,
     make_pressure_lbfgs_step,
     make_warmup_adam_step,
@@ -65,17 +68,18 @@ from .sampling import (
     stable_seed,
     uniform_collocation_points,
 )
+from .runtime import configure_jax_compilation_cache
 from .variants import VariantSpec, parse_variant
 
 
-PRESSURE_LOSS_COLUMNS = (
-    "phase", "optimizer", "step", "case_id", "incidence", "frequency", "mode",
-    "pde", "neumann", "dtn", "dtn_left", "dtn_right", "data",
-    "objective", "unweighted_total", "selection_objective",
+PRESSURE_COMMON_LOSS_COLUMNS = (
+    "evaluation_index", "phase", "optimizer", "step", "case_count",
+    "pde", "neumann", "dtn", "data", "current_objective",
+    "static_objective", "unweighted_total", "data_factor",
 )
 MATERIAL_LOSS_COLUMNS = (
-    "phase", "optimizer", "step", "case_id", "incidence", "frequency", "mode",
-    "pde", "pde_objective", "tv", "weighted_tv", "objective",
+    "phase", "optimizer", "step", "case_count", "pde_objective", "tv",
+    "weighted_tv", "objective",
 )
 PRESSURE_GRADIENT_COLUMNS = (
     "phase", "step", "case_id", "incidence", "frequency", "mode",
@@ -150,14 +154,24 @@ def _material_weights(
     return jnp.ones((count,), dtype=jnp.float32)
 
 
-def _data_factor(config: InverseConfig, step: int, adam_steps: int) -> float:
+def _data_factor(config: InverseConfig, step: int) -> float:
     initial = config.optimization.data_initial_factor
-    transition = max(1, int(config.optimization.data_transition_fraction * adam_steps))
+    transition = config.optimization.data_transition_steps
     if transition == 1:
         progress = 1.0
     else:
         progress = min(max((step - 1) / (transition - 1), 0.0), 1.0)
     return initial + (1.0 - initial) * progress
+
+
+def _pressure_loss_text(components: Mapping[str, float]) -> str:
+    boundary = float(components["neumann"]) + float(components["dtn"])
+    return (
+        f"global={float(components['current_objective']):.3e} "
+        f"pde={float(components['pde']):.3e} "
+        f"boundary={boundary:.3e} "
+        f"data={float(components['data']):.3e}"
+    )
 
 
 def _initial_field_adweight(config: InverseConfig) -> AdaptiveState:
@@ -204,118 +218,177 @@ def _append_adweight_rows(
         )
 
 
-def _append_sigma_row(
-    rows: list[dict[str, Any]], phase: str, step: int, case: Case, params: Mapping[str, Any], frozen: bool
+def _append_packed_sigma_rows(
+    rows: list[dict[str, Any]],
+    phase: str,
+    step: int,
+    cases: Sequence[Case],
+    packed_params: Mapping[str, Any],
+    frozen: bool,
 ) -> None:
-    sigma = np.asarray(params["sigma"])
-    rows.append(
-        {
-            "phase": phase,
-            "step": step,
-            "case_id": case.id,
-            "incidence": case.incidence,
-            "frequency": case.frequency,
-            "mode": case.mode,
-            "sigma_x": float(sigma[0]),
-            "sigma_y": float(sigma[1]),
-            "frozen": int(frozen),
-        }
-    )
+    sigma_values = np.asarray(packed_params["sigma"])
+    for case, sigma in zip(cases, sigma_values):
+        rows.append(
+            {
+                "phase": phase,
+                "step": step,
+                "case_id": case.id,
+                "incidence": case.incidence,
+                "frequency": case.frequency,
+                "mode": case.mode,
+                "sigma_x": float(sigma[0]),
+                "sigma_y": float(sigma[1]),
+                "frozen": int(frozen),
+            }
+        )
 
 
-def _evaluate_pressure(
-    field_params: Sequence[Mapping[str, Any]],
-    material_params: Mapping[str, Any],
+def _make_pressure_monitor(
     physics,
     contexts: Sequence[CaseContext],
     variant: VariantSpec,
     points: CollocationPoints,
-    weights: jax.Array,
+    static_weights: jax.Array,
     *,
     include_data: bool = True,
     homogeneous_material: bool = False,
-) -> tuple[float, list[dict[str, float]]]:
-    evaluated = []
-    for params, context in zip(field_params, contexts):
-        objective, components = pressure_objective(
-            params,
+):
+    contexts = tuple(contexts)
+    static_weights = jnp.asarray(static_weights, dtype=jnp.float32)
+
+    @jax.jit
+    def monitor(
+        packed_field_params, material_params, current_weights, b_bases
+    ):
+        current_objective, components = packed_pressure_objective(
+            packed_field_params,
             material_params,
             physics,
-            context,
+            contexts,
+            b_bases,
             variant,
             points,
-            weights,
+            current_weights,
             include_data=include_data,
             homogeneous_material=homogeneous_material,
         )
-        _ready(objective)
-        evaluated.append({name: _float(value) for name, value in components.items()})
-    selection = float(np.mean([item["objective"] for item in evaluated]))
-    return selection, evaluated
-
-
-def _append_pressure_loss_rows(
-    rows: list[dict[str, Any]],
-    *,
-    phase: str,
-    optimizer: str,
-    step: int,
-    contexts: Sequence[CaseContext],
-    components: Sequence[Mapping[str, float]],
-    selection: float,
-) -> None:
-    for context, values in zip(contexts, components):
-        case = context.case
-        rows.append(
-            {
-                "phase": phase,
-                "optimizer": optimizer,
-                "step": step,
-                "case_id": case.id,
-                "incidence": case.incidence,
-                "frequency": case.frequency,
-                "mode": case.mode,
-                **{name: values[name] for name in (
-                    "pde", "neumann", "dtn", "dtn_left", "dtn_right", "data",
-                    "objective", "unweighted_total",
-                )},
-                "selection_objective": selection,
-            }
+        static_objective = sum(
+            static_weights[index] * components[name]
+            for index, name in enumerate(FIELD_COMPONENTS)
         )
+        return {
+            **components,
+            "current_objective": current_objective,
+            "static_objective": static_objective,
+        }
+
+    return monitor
 
 
-def _append_material_loss_rows(
+def _evaluate_pressure_monitor(
+    monitor,
+    packed_field_params,
+    material_params,
+    current_weights,
+    b_bases,
+) -> dict[str, float]:
+    values = monitor(
+        packed_field_params,
+        material_params,
+        jnp.stack(tuple(current_weights)),
+        b_bases,
+    )
+    _ready(values)
+    return {name: _float(value) for name, value in values.items()}
+
+
+def _make_material_monitor(
+    physics,
+    contexts: Sequence[CaseContext],
+    variant: VariantSpec,
+    points: CollocationPoints,
+    *,
+    tv_weight: float,
+    tv_epsilon_squared: float,
+):
+    contexts = tuple(contexts)
+
+    @jax.jit
+    def monitor(material_params, packed_field_params, case_weights, b_bases):
+        dynamic_contexts = tuple(
+            replace(context, b_base=b_base)
+            for context, b_base in zip(contexts, b_bases)
+        )
+        _, components = material_objective(
+            material_params,
+            unpack_field_parameters(packed_field_params),
+            physics,
+            dynamic_contexts,
+            variant,
+            points,
+            case_weights,
+            tv_weight=tv_weight,
+            tv_epsilon_squared=tv_epsilon_squared,
+        )
+        return {
+            name: components[name]
+            for name in ("pde_objective", "tv", "weighted_tv", "objective")
+        }
+
+    return monitor
+
+
+def _append_pressure_common_loss_row(
     rows: list[dict[str, Any]],
     *,
     phase: str,
     optimizer: str,
     step: int,
-    contexts: Sequence[CaseContext],
+    case_count: int,
+    components: Mapping[str, float],
+    data_factor: float,
+) -> None:
+    rows.append(
+        {
+            "evaluation_index": len(rows),
+            "phase": phase,
+            "optimizer": optimizer,
+            "step": step,
+            "case_count": case_count,
+            **{
+                name: float(components[name])
+                for name in (
+                    "pde", "neumann", "dtn", "data", "unweighted_total",
+                    "current_objective", "static_objective",
+                )
+            },
+            "data_factor": float(data_factor),
+        }
+    )
+
+
+def _append_material_loss_row(
+    rows: list[dict[str, Any]],
+    *,
+    phase: str,
+    optimizer: str,
+    step: int,
+    case_count: int,
     components: Mapping[str, Any],
     tv_enabled: bool,
 ) -> None:
-    pdes = np.asarray(components["case_pdes"])
-    common = {
-        "pde_objective": _float(components["pde_objective"]),
-        "tv": _float(components["tv"]) if tv_enabled else "",
-        "weighted_tv": _float(components["weighted_tv"]) if tv_enabled else "",
-        "objective": _float(components["objective"]),
-    }
-    for context, pde in zip(contexts, pdes):
-        case = context.case
-        rows.append(
-            {
-                "phase": phase,
-                "optimizer": optimizer,
-                "step": step,
-                "case_id": case.id,
-                "incidence": case.incidence,
-                "frequency": case.frequency,
-                "mode": case.mode,
-                "pde": float(pde),
-                **common,
-            }
-        )
+    rows.append(
+        {
+            "phase": phase,
+            "optimizer": optimizer,
+            "step": step,
+            "case_count": case_count,
+            "pde_objective": _float(components["pde_objective"]),
+            "tv": _float(components["tv"]) if tv_enabled else "",
+            "weighted_tv": _float(components["weighted_tv"]) if tv_enabled else "",
+            "objective": _float(components["objective"]),
+        }
+    )
 
 
 def _snapshot_grid(config: InverseConfig) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -334,10 +407,15 @@ def _predict_celerity(
     y_normalized = 2.0 * np.asarray(y).ravel() / config.geometry.height - 1.0
     chunks = []
     function = jax.jit(
-        jax.vmap(lambda xv, yv: material_sound_speed(material_params, config.geometry, xv, yv))
+        lambda candidate, xv, yv: jax.vmap(
+            lambda x_value, y_value: material_sound_speed(
+                candidate, config.geometry, x_value, y_value
+            )
+        )(xv, yv)
     )
     for start in range(0, x_normalized.size, batch_size):
         values = function(
+            material_params,
             jnp.asarray(x_normalized[start : start + batch_size], dtype=jnp.float32),
             jnp.asarray(y_normalized[start : start + batch_size], dtype=jnp.float32),
         )
@@ -357,13 +435,15 @@ def _predict_pressure(
     x = np.asarray(x).ravel()
     y = np.asarray(y).ravel()
     function = jax.jit(
-        lambda xv, yv: physical_pressure_prediction(
-            params, physics, context, variant, xv, yv
+        lambda candidate, b_base, xv, yv: physical_pressure_prediction(
+            candidate, physics, replace(context, b_base=b_base), variant, xv, yv
         )
     )
     chunks = []
     for start in range(0, x.size, batch_size):
         values = function(
+            params,
+            context.b_base,
             jnp.asarray(x[start : start + batch_size], dtype=jnp.float32),
             jnp.asarray(y[start : start + batch_size], dtype=jnp.float32),
         )
@@ -373,179 +453,257 @@ def _predict_pressure(
 
 def _run_warmup(
     *,
-    case: Case,
-    field_model: FieldModel,
+    cases: Sequence[Case],
+    field_models: Mapping[Case, FieldModel],
     material_params: Mapping[str, Any],
     physics,
-    context: CaseContext,
+    contexts: Sequence[CaseContext],
     config: InverseConfig,
     variant: VariantSpec,
     package_index: int,
     homogeneous_material: bool,
-    pressure_rows: list[dict[str, Any]],
+    pressure_common_rows: list[dict[str, Any]],
     pressure_gradient_rows: list[dict[str, Any]],
     adweight_rows: list[dict[str, Any]],
     sigma_rows: list[dict[str, Any]],
-) -> tuple[FieldModel, float, float]:
+) -> tuple[dict[Case, FieldModel], float, float]:
+    cases = tuple(cases)
+    contexts = tuple(contexts)
+    if not cases or len(cases) != len(contexts):
+        raise ValueError("Packed warmup requires aligned non-empty cases and contexts")
     budget = config.training_packages[package_index].warmup
-    params = field_model.params
+    packed_params = pack_field_parameters(
+        tuple(field_models[case].params for case in cases)
+    )
+    b_bases = jnp.stack(tuple(field_models[case].b_base for case in cases))
     training_seconds = 0.0
     compilation_seconds = 0.0
-    adaptive = _initial_field_adweight(config) if variant.field_adweights else None
+    adaptive = {
+        case: _initial_field_adweight(config) for case in cases
+    } if variant.field_adweights else {}
     final_static = jnp.asarray(config.loss.field_weights, dtype=jnp.float32).at[3].set(0.0)
+    monitor_points = regular_collocation_points(
+        config.sampling.monitor,
+        half_length=config.geometry.half_length,
+        height=config.geometry.height,
+    )
+
+    def current_weights() -> tuple[jax.Array, ...]:
+        return tuple(
+            _warmup_weights(config, variant, adaptive.get(case)) for case in cases
+        )
+
+    pressure_monitor = _make_pressure_monitor(
+        physics,
+        contexts,
+        variant,
+        monitor_points,
+        final_static,
+        include_data=False,
+        homogeneous_material=homogeneous_material,
+    )
 
     if budget.adam_steps:
-        optimizer = make_field_adam(params, config.optimization, budget.adam_steps)
-        state = optimizer.init(params)
+        optimizer = make_field_adam(
+            packed_params, config.optimization, budget.adam_steps
+        )
+        state = optimizer.init(packed_params)
         train_steps = sigma_train_steps(config.optimization, budget.adam_steps)
         unfrozen_step = make_warmup_adam_step(
-            optimizer, physics, context, variant,
+            optimizer, physics, contexts, variant, config.sampling.adam,
             homogeneous_material=homogeneous_material, freeze_sigma=False,
         )
         frozen_step = make_warmup_adam_step(
-            optimizer, physics, context, variant,
+            optimizer, physics, contexts, variant, config.sampling.adam,
             homogeneous_material=homogeneous_material, freeze_sigma=True,
         )
-        compile_points = uniform_collocation_points(
-            jax.random.key(stable_seed("compile", package_index, case.id)), config.sampling.adam
+        compile_key = jax.random.key(
+            stable_seed("compile", package_index, "warmup", len(cases))
         )
         compile_started = time.perf_counter()
         compiled = unfrozen_step(
-            params, material_params, state, compile_points,
-            _warmup_weights(config, variant, adaptive),
+            packed_params, material_params, state, compile_key,
+            jnp.stack(current_weights()), b_bases,
         )
         _ready(compiled)
         if train_steps < budget.adam_steps:
             compiled = frozen_step(
-                params, material_params, state, compile_points,
-                _warmup_weights(config, variant, adaptive),
-            )
-            _ready(compiled)
+                packed_params, material_params, state, compile_key,
+                jnp.stack(current_weights()), b_bases,
+        )
+        _ready(compiled)
         compilation_seconds += time.perf_counter() - compile_started
 
+        training_block_started = time.perf_counter()
         for step in range(1, budget.adam_steps + 1):
-            iteration_started = time.perf_counter()
-            points = uniform_collocation_points(
-                jax.random.key(stable_seed(package_index, case.id, "warmup", step)),
-                config.sampling.adam,
+            collocation_key = jax.random.key(
+                stable_seed(package_index, "packed_warmup", step)
             )
+            points = None
             frozen = step > train_steps
-            weights = _warmup_weights(config, variant, adaptive)
             if (
                 variant.field_adweights
                 and (step - 1) % config.loss.field_adweights.update_interval_adam == 0
             ):
-                statistics = pressure_gradient_statistics(
-                    params, material_params, physics, context, variant, points, weights,
-                    freeze_sigma=frozen,
+                points = uniform_collocation_points(
+                    collocation_key, config.sampling.adam
                 )
-                norms = jnp.asarray(
-                    [statistics[f"{name}_gradient_l2_norm"] for name in FIELD_COMPONENTS]
-                )
-                assert adaptive is not None
-                if step > 1:
-                    adaptive = update_state(
-                        adaptive, norms,
-                        epsilon=config.loss.field_adweights.epsilon,
-                        alpha=config.loss.field_adweights.alpha,
-                        custom_weights=config.loss.field_adweights.custom_weights,
+                unpacked_params = unpack_field_parameters(packed_params)
+                for case, context, params in zip(cases, contexts, unpacked_params):
+                    weights = _warmup_weights(config, variant, adaptive[case])
+                    statistics = pressure_gradient_statistics(
+                        params, material_params, physics, context, variant,
+                        points, weights, freeze_sigma=frozen,
                     )
-                weights = _warmup_weights(config, variant, adaptive)
-                _append_adweight_rows(
-                    adweight_rows, phase="warmup_adam", step=step, scope="pressure",
-                    state=adaptive, labels=FIELD_COMPONENTS, case_id=case.id,
-                )
+                    norms = jnp.asarray(
+                        [statistics[f"{name}_gradient_l2_norm"] for name in FIELD_COMPONENTS]
+                    )
+                    if step > 1:
+                        options = config.loss.field_adweights
+                        adaptive[case] = update_state(
+                            adaptive[case], norms, epsilon=options.epsilon,
+                            alpha=options.alpha,
+                            custom_weights=options.custom_weights,
+                        )
+                    _append_adweight_rows(
+                        adweight_rows, phase="warmup_adam", step=step,
+                        scope="pressure", state=adaptive[case],
+                        labels=FIELD_COMPONENTS, case_id=case.id,
+                    )
+            weights = current_weights()
             function = frozen_step if frozen else unfrozen_step
-            params, state, _, _ = function(params, material_params, state, points, weights)
-            _ready(params)
-            training_seconds += time.perf_counter() - iteration_started
-
+            packed_params, state, _ = function(
+                packed_params, material_params, state, collocation_key,
+                jnp.stack(weights), b_bases,
+            )
             print_event = step % config.logging.print_interval_adam == 0 or step == budget.adam_steps
             monitor_event = (
                 step == 1 or step == budget.adam_steps
                 or step % config.logging.loss_interval_adam == 0 or print_event
             )
+            sigma_event = (
+                step == 1 or step == budget.adam_steps
+                or step % config.logging.sigma_interval_adam == 0
+            )
+            gradient_event = (
+                step % config.logging.pressure_gradient_interval_adam == 0
+                or step == budget.adam_steps
+            )
+            if monitor_event or sigma_event or gradient_event:
+                _ready(packed_params)
+                training_seconds += time.perf_counter() - training_block_started
             if monitor_event:
-                selection, values = _evaluate_pressure(
-                    (params,), material_params, physics, (context,), variant,
-                    regular_collocation_points(
-                        config.sampling.monitor,
-                        half_length=config.geometry.half_length,
-                        height=config.geometry.height,
-                    ),
-                    final_static, include_data=False,
-                    homogeneous_material=homogeneous_material,
+                values = _evaluate_pressure_monitor(
+                    pressure_monitor, packed_params, material_params,
+                    weights, b_bases,
                 )
-                _append_pressure_loss_rows(
-                    pressure_rows, phase="warmup_adam", optimizer="adam", step=step,
-                    contexts=(context,), components=values, selection=selection,
+                _append_pressure_common_loss_row(
+                    pressure_common_rows, phase="warmup_adam", optimizer="adam",
+                    step=step, case_count=len(cases), components=values,
+                    data_factor=0.0,
                 )
                 if print_event:
                     print(
                         f"[{variant.name} pkg{package_index + 1:02d} warmup "
-                        f"{case.id} Adam {step}/{budget.adam_steps}] "
-                        f"loss={selection:.3e} weights={np.asarray(weights).tolist()} "
-                        f"sigma={np.asarray(params['sigma']).tolist()}",
+                        f"packed Adam {step}/{budget.adam_steps}] "
+                        f"{_pressure_loss_text(values)}",
                         flush=True,
                     )
-            if step == 1 or step == budget.adam_steps or step % config.logging.sigma_interval_adam == 0:
-                _append_sigma_row(sigma_rows, "warmup_adam", step, case, params, frozen)
-            if step % config.logging.pressure_gradient_interval_adam == 0 or step == budget.adam_steps:
-                statistics = pressure_gradient_statistics(
-                    params, material_params, physics, context, variant, points, weights,
-                    freeze_sigma=frozen,
+            if sigma_event:
+                _append_packed_sigma_rows(
+                    sigma_rows, "warmup_adam", step, cases, packed_params, frozen
                 )
-                pressure_gradient_rows.append(
-                    {
-                        "phase": "warmup_adam", "step": step, "case_id": case.id,
-                        "incidence": case.incidence, "frequency": case.frequency,
-                        "mode": case.mode,
-                        **{name: _float(value) for name, value in statistics.items()},
-                        "sigma_frozen": int(frozen),
-                    }
-                )
+            if gradient_event:
+                if points is None:
+                    points = uniform_collocation_points(
+                        collocation_key, config.sampling.adam
+                    )
+                unpacked_params = unpack_field_parameters(packed_params)
+                for case, context, params, case_weights in zip(
+                    cases, contexts, unpacked_params, weights
+                ):
+                    statistics = pressure_gradient_statistics(
+                        params, material_params, physics, context, variant,
+                        points, case_weights, freeze_sigma=frozen,
+                    )
+                    pressure_gradient_rows.append(
+                        {
+                            "phase": "warmup_adam", "step": step,
+                            "case_id": case.id, "incidence": case.incidence,
+                            "frequency": case.frequency, "mode": case.mode,
+                            **{name: _float(value) for name, value in statistics.items()},
+                            "sigma_frozen": int(frozen),
+                        }
+                    )
+            if monitor_event or sigma_event or gradient_event:
+                training_block_started = time.perf_counter()
 
     if budget.lbfgs_steps:
         points = sobol_collocation_points(
             config.sampling.lbfgs,
             scramble=config.sampling.sobol_scramble,
-            seed=stable_seed(package_index, case.id, "warmup_lbfgs", config.sampling.sobol_seed_offset),
+            seed=stable_seed(
+                package_index, "packed_warmup_lbfgs",
+                config.sampling.sobol_seed_offset,
+            ),
         )
-        frozen_weights = _warmup_weights(config, variant, adaptive)
+        frozen_weights = current_weights()
         optimizer = optax.lbfgs()
-        packed = (params,)
-        state = optimizer.init(packed)
+        state = optimizer.init(packed_params)
         step_function = make_pressure_lbfgs_step(
-            optimizer, material_params, physics, (context,), variant, points,
-            (frozen_weights,), include_data=False,
+            optimizer, physics, contexts, variant, points,
+            frozen_weights, include_data=False,
+            homogeneous_material=homogeneous_material,
+        )
+        pressure_monitor = _make_pressure_monitor(
+            physics,
+            contexts,
+            variant,
+            monitor_points,
+            final_static,
+            include_data=False,
             homogeneous_material=homogeneous_material,
         )
         compile_started = time.perf_counter()
-        compiled = step_function(packed, state)
+        compiled = step_function(
+            packed_params, state, material_params, b_bases
+        )
         _ready(compiled)
         compilation_seconds += time.perf_counter() - compile_started
+        training_block_started = time.perf_counter()
         for step in range(1, budget.lbfgs_steps + 1):
-            started = time.perf_counter()
-            packed, state, _ = step_function(packed, state)
-            _ready(packed)
-            training_seconds += time.perf_counter() - started
-            if step == 1 or step == budget.lbfgs_steps or step % config.logging.loss_interval_lbfgs == 0:
-                selection, values = _evaluate_pressure(
-                    packed, material_params, physics, (context,), variant,
-                    regular_collocation_points(
-                        config.sampling.monitor,
-                        half_length=config.geometry.half_length,
-                        height=config.geometry.height,
-                    ),
-                    final_static, include_data=False,
-                    homogeneous_material=homogeneous_material,
+            packed_params, state, _ = step_function(
+                packed_params, state, material_params, b_bases
+            )
+            monitor_event = (
+                step == 1 or step == budget.lbfgs_steps
+                or step % config.logging.loss_interval_lbfgs == 0
+            )
+            if monitor_event:
+                _ready(packed_params)
+                training_seconds += time.perf_counter() - training_block_started
+                values = _evaluate_pressure_monitor(
+                    pressure_monitor, packed_params, material_params,
+                    frozen_weights, b_bases,
                 )
-                _append_pressure_loss_rows(
-                    pressure_rows, phase="warmup_lbfgs", optimizer="lbfgs", step=step,
-                    contexts=(context,), components=values, selection=selection,
+                _append_pressure_common_loss_row(
+                    pressure_common_rows, phase="warmup_lbfgs",
+                    optimizer="lbfgs", step=step, components=values,
+                    case_count=len(cases), data_factor=0.0,
                 )
-        params = packed[0]
-    return FieldModel(params, field_model.b_base), training_seconds, compilation_seconds
+                print(
+                    f"[{variant.name} pkg{package_index + 1:02d} warmup "
+                    f"packed L-BFGS {step}/{budget.lbfgs_steps}] "
+                    f"{_pressure_loss_text(values)}",
+                    flush=True,
+                )
+                training_block_started = time.perf_counter()
+    unpacked_params = unpack_field_parameters(packed_params)
+    result = {
+        case: FieldModel(params, field_models[case].b_base)
+        for case, params in zip(cases, unpacked_params)
+    }
+    return result, training_seconds, compilation_seconds
 
 
 def _final_metrics(
@@ -593,6 +751,7 @@ def run_training(
     output_parent: Path | None = None,
 ) -> Path:
     """Run one variant/seed and return its newly-created directory."""
+    cache_directory = configure_jax_compilation_cache()
     variant = parse_variant(variant_name)
     seed = int(seed)
     dataset = load_inverse_dataset(config)
@@ -608,12 +767,16 @@ def run_training(
         if not config.geometry.celerity_ratio_bounds[0] <= region.speed_ratio <= config.geometry.celerity_ratio_bounds[1]
     ]
     manifest = {
-        "format_version": 1,
+        "format_version": 2,
         "config": config.manifest(),
         "config_digest": short_digest(config.manifest()),
         "variant": asdict(variant),
         "seed": seed,
         "environment": environment_manifest(),
+        "jax_compilation_cache": {
+            "directory": str(cache_directory),
+            "persistent": True,
+        },
         "warnings": (
             [f"Truth speed ratios outside admissible bounds: {warning_ratios}"]
             if warning_ratios else []
@@ -654,7 +817,7 @@ def run_training(
         active = tuple(package.cases)
         active_contexts = tuple(contexts[case] for case in active)
         new_cases = tuple(case for case in active if case not in seen)
-        pressure_rows: list[dict[str, Any]] = []
+        pressure_common_rows: list[dict[str, Any]] = []
         material_rows: list[dict[str, Any]] = []
         pressure_gradient_rows: list[dict[str, Any]] = []
         material_diagnostic_rows: list[dict[str, Any]] = []
@@ -669,27 +832,30 @@ def run_training(
 
         do_first_total_warmup = package_index == 0 and not variant.scattered
         do_previous_map_pretrain = package_index > 0
-        if do_first_total_warmup or do_previous_map_pretrain:
-            for case in new_cases:
-                models[case], elapsed, compiled = _run_warmup(
-                    case=case,
-                    field_model=models[case],
-                    material_params=material_params,
-                    physics=physics,
-                    context=contexts[case],
-                    config=config,
-                    variant=variant,
-                    package_index=package_index,
-                    homogeneous_material=do_first_total_warmup,
-                    pressure_rows=pressure_rows,
-                    pressure_gradient_rows=pressure_gradient_rows,
-                    adweight_rows=adweight_rows,
-                    sigma_rows=sigma_rows,
-                )
-                training_seconds += elapsed
-                compilation_seconds += compiled
+        if new_cases and (do_first_total_warmup or do_previous_map_pretrain):
+            warmed_models, elapsed, compiled = _run_warmup(
+                cases=new_cases,
+                field_models={case: models[case] for case in new_cases},
+                material_params=material_params,
+                physics=physics,
+                contexts=tuple(contexts[case] for case in new_cases),
+                config=config,
+                variant=variant,
+                package_index=package_index,
+                homogeneous_material=do_first_total_warmup,
+                pressure_common_rows=pressure_common_rows,
+                pressure_gradient_rows=pressure_gradient_rows,
+                adweight_rows=adweight_rows,
+                sigma_rows=sigma_rows,
+            )
+            models.update(warmed_models)
+            training_seconds += elapsed
+            compilation_seconds += compiled
 
-        field_params = tuple(models[case].params for case in active)
+        packed_field_params = pack_field_parameters(
+            tuple(models[case].params for case in active)
+        )
+        b_bases = jnp.stack(tuple(models[case].b_base for case in active))
         field_adaptive = {
             case: _initial_field_adweight(config) for case in active
         } if variant.field_adweights else {}
@@ -698,20 +864,34 @@ def run_training(
             if variant.material_adweights else None
         )
         adam_steps = package.inverse.adam_steps
-        best_selection, best_components = _evaluate_pressure(
-            field_params, material_params, physics, active_contexts, variant,
-            monitor_points, final_static_weights,
+        initial_data_factor = (
+            config.optimization.data_initial_factor if adam_steps else 1.0
         )
-        _append_pressure_loss_rows(
-            pressure_rows, phase="inverse_initial", optimizer="none", step=0,
-            contexts=active_contexts, components=best_components,
-            selection=best_selection,
-        )
-        for case, params in zip(active, field_params):
-            _append_sigma_row(
-                sigma_rows, "inverse_initial", 0, case, params,
-                frozen=adam_steps == 0,
+        initial_field_weights = tuple(
+            _field_weights(
+                config, variant, field_adaptive.get(case), initial_data_factor
             )
+            for case in active
+        )
+        pressure_monitor = _make_pressure_monitor(
+            physics, active_contexts, variant, monitor_points,
+            final_static_weights,
+        )
+        best_components = _evaluate_pressure_monitor(
+            pressure_monitor, packed_field_params, material_params,
+            initial_field_weights, b_bases,
+        )
+        best_selection = best_components["static_objective"]
+        _append_pressure_common_loss_row(
+            pressure_common_rows, phase="inverse_initial", optimizer="none",
+            step=0, case_count=len(active), components=best_components,
+            data_factor=initial_data_factor,
+        )
+        _append_packed_sigma_rows(
+            sigma_rows, "inverse_initial", 0, active, packed_field_params,
+            frozen=adam_steps == 0,
+        )
+        for case in active:
             if variant.field_adweights:
                 _append_adweight_rows(
                     adweight_rows, phase="inverse_initial", step=0,
@@ -725,35 +905,37 @@ def run_training(
                 scope="material", state=material_adaptive,
                 labels=[case.id for case in active], case_id="",
             )
-        best_fields = _copy_tree(field_params)
+        best_fields = _copy_tree(packed_field_params)
         best_material = _copy_tree(material_params)
 
         tv_weight = config.loss.tv.weight if variant.total_variation else 0.0
+        material_monitor = _make_material_monitor(
+            physics, active_contexts, variant, monitor_points,
+            tv_weight=tv_weight,
+            tv_epsilon_squared=config.loss.tv.epsilon_squared,
+        )
         if adam_steps:
-            field_optimizers = tuple(
-                make_field_adam(params, config.optimization, adam_steps)
-                for params in field_params
+            field_optimizer = make_field_adam(
+                packed_field_params, config.optimization, adam_steps
             )
-            field_states = tuple(
-                optimizer.init(params)
-                for optimizer, params in zip(field_optimizers, field_params)
-            )
-            material_optimizer = optax.adam(config.optimization.material_learning_rate)
+            field_state = field_optimizer.init(packed_field_params)
+            material_optimizer = make_material_adam(config.optimization)
             material_state = material_optimizer.init(material_params)
             sigma_steps = sigma_train_steps(config.optimization, adam_steps)
             unfrozen_step = make_inverse_adam_step(
-                field_optimizers, material_optimizer, physics, active_contexts, variant,
+                field_optimizer, material_optimizer, physics, active_contexts,
+                variant, config.sampling.adam,
                 freeze_sigma=False, tv_weight=tv_weight,
                 tv_epsilon_squared=config.loss.tv.epsilon_squared,
             )
             frozen_step = make_inverse_adam_step(
-                field_optimizers, material_optimizer, physics, active_contexts, variant,
+                field_optimizer, material_optimizer, physics, active_contexts,
+                variant, config.sampling.adam,
                 freeze_sigma=True, tv_weight=tv_weight,
                 tv_epsilon_squared=config.loss.tv.epsilon_squared,
             )
-            compile_points = uniform_collocation_points(
-                jax.random.key(stable_seed("compile", package_index, "inverse")),
-                config.sampling.adam,
+            compile_key = jax.random.key(
+                stable_seed("compile", package_index, "inverse")
             )
             compile_field_weights = tuple(
                 _field_weights(config, variant, field_adaptive.get(case), config.optimization.data_initial_factor)
@@ -764,16 +946,18 @@ def run_training(
             )
             compile_started = time.perf_counter()
             compiled = unfrozen_step(
-                field_params, material_params, field_states, material_state,
-                compile_points, compile_field_weights, compile_material_weights,
-                config.optimization.data_initial_factor,
+                packed_field_params, material_params, field_state, material_state,
+                compile_key, jnp.stack(compile_field_weights),
+                compile_material_weights,
+                config.optimization.data_initial_factor, b_bases,
             )
             _ready(compiled)
             if sigma_steps < adam_steps:
                 compiled = frozen_step(
-                    field_params, material_params, field_states, material_state,
-                    compile_points, compile_field_weights, compile_material_weights,
-                    config.optimization.data_initial_factor,
+                    packed_field_params, material_params, field_state,
+                    material_state, compile_key,
+                    jnp.stack(compile_field_weights), compile_material_weights,
+                    config.optimization.data_initial_factor, b_bases,
                 )
                 _ready(compiled)
             compilation_seconds += time.perf_counter() - compile_started
@@ -781,19 +965,33 @@ def run_training(
                 adam_steps, config.logging.material_snapshot_fractions
             )
 
+            training_block_started = time.perf_counter()
             for step in range(1, adam_steps + 1):
-                iteration_started = time.perf_counter()
-                points = uniform_collocation_points(
-                    jax.random.key(stable_seed(seed, package_index, "inverse", step)),
-                    config.sampling.adam,
+                collocation_key = jax.random.key(
+                    stable_seed(seed, package_index, "inverse", step)
                 )
+                points = None
                 frozen = step > sigma_steps
-                data_factor = _data_factor(config, step, adam_steps)
-
-                if (
+                data_factor = _data_factor(config, step)
+                field_adweight_event = (
                     variant.field_adweights
-                    and (step - 1) % config.loss.field_adweights.update_interval_adam == 0
-                ):
+                    and (step - 1)
+                    % config.loss.field_adweights.update_interval_adam == 0
+                )
+                material_adweight_event = (
+                    variant.material_adweights
+                    and (step - 1)
+                    % config.loss.material_adweights.update_interval_adam == 0
+                )
+                field_params = None
+                if field_adweight_event or material_adweight_event:
+                    field_params = unpack_field_parameters(packed_field_params)
+
+                if field_adweight_event:
+                    assert field_params is not None
+                    points = uniform_collocation_points(
+                        collocation_key, config.sampling.adam
+                    )
                     for index, (case, context) in enumerate(zip(active, active_contexts)):
                         current_weights = _field_weights(
                             config, variant, field_adaptive[case], data_factor
@@ -817,11 +1015,13 @@ def run_training(
                             labels=FIELD_COMPONENTS, case_id=case.id,
                         )
 
-                if (
-                    variant.material_adweights
-                    and (step - 1) % config.loss.material_adweights.update_interval_adam == 0
-                ):
+                if material_adweight_event:
                     assert material_adaptive is not None
+                    assert field_params is not None
+                    if points is None:
+                        points = uniform_collocation_points(
+                            collocation_key, config.sampling.adam
+                        )
                     norms = material_case_gradient_norms(
                         material_params, field_params, physics, active_contexts,
                         variant, points,
@@ -848,52 +1048,71 @@ def run_training(
                 )
                 function = frozen_step if frozen else unfrozen_step
                 (
-                    field_params, material_params, field_states, material_state,
-                    _, _, _, _,
+                    packed_field_params, material_params, field_state, material_state,
+                    _, _,
                 ) = function(
-                    field_params, material_params, field_states, material_state,
-                    points, field_weights, material_weights, data_factor,
+                    packed_field_params, material_params, field_state,
+                    material_state, collocation_key, jnp.stack(field_weights),
+                    material_weights, data_factor, b_bases,
                 )
-                _ready((field_params, material_params))
-                training_seconds += time.perf_counter() - iteration_started
 
                 print_event = step % config.logging.print_interval_adam == 0 or step == adam_steps
                 monitor_event = (
                     step == 1 or step == adam_steps
                     or step % config.logging.loss_interval_adam == 0 or print_event
                 )
+                sigma_event = (
+                    step == 1 or step == adam_steps
+                    or step % config.logging.sigma_interval_adam == 0
+                )
+                gradient_event = (
+                    step % config.logging.pressure_gradient_interval_adam == 0
+                    or step == adam_steps
+                )
+                snapshot_event = step in configured_snapshots
+                if monitor_event or sigma_event or gradient_event or snapshot_event:
+                    _ready((packed_field_params, material_params))
+                    training_seconds += (
+                        time.perf_counter() - training_block_started
+                    )
                 if monitor_event:
-                    selection, components = _evaluate_pressure(
-                        field_params, material_params, physics, active_contexts,
-                        variant, monitor_points, final_static_weights,
+                    components = _evaluate_pressure_monitor(
+                        pressure_monitor, packed_field_params, material_params,
+                        field_weights, b_bases,
                     )
-                    _append_pressure_loss_rows(
-                        pressure_rows, phase="inverse_adam", optimizer="adam",
-                        step=step, contexts=active_contexts, components=components,
-                        selection=selection,
+                    _append_pressure_common_loss_row(
+                        pressure_common_rows, phase="inverse_adam",
+                        optimizer="adam", step=step, components=components,
+                        case_count=len(active), data_factor=data_factor,
                     )
-                    _, material_components = material_objective(
-                        material_params, field_params, physics, active_contexts,
-                        variant, monitor_points, material_weights,
-                        tv_weight=tv_weight,
-                        tv_epsilon_squared=config.loss.tv.epsilon_squared,
+                    material_components = material_monitor(
+                        material_params, packed_field_params,
+                        material_weights, b_bases,
                     )
-                    _append_material_loss_rows(
+                    _ready(material_components)
+                    _append_material_loss_row(
                         material_rows, phase="inverse_adam", optimizer="adam",
-                        step=step, contexts=active_contexts,
+                        step=step, case_count=len(active),
                         components=material_components,
                         tv_enabled=tv_weight != 0.0,
                     )
-                    if selection < best_selection:
-                        best_selection = selection
-                        best_fields = _copy_tree(field_params)
+                    if components["static_objective"] < best_selection:
+                        best_selection = components["static_objective"]
+                        best_fields = _copy_tree(packed_field_params)
                         best_material = _copy_tree(material_params)
 
-                if step == 1 or step == adam_steps or step % config.logging.sigma_interval_adam == 0:
-                    for case, params in zip(active, field_params):
-                        _append_sigma_row(sigma_rows, "inverse_adam", step, case, params, frozen)
+                if sigma_event:
+                    _append_packed_sigma_rows(
+                        sigma_rows, "inverse_adam", step, active,
+                        packed_field_params, frozen,
+                    )
 
-                if step % config.logging.pressure_gradient_interval_adam == 0 or step == adam_steps:
+                if gradient_event:
+                    if points is None:
+                        points = uniform_collocation_points(
+                            collocation_key, config.sampling.adam
+                        )
+                    field_params = unpack_field_parameters(packed_field_params)
                     for case, context, params, weights in zip(
                         active, active_contexts, field_params, field_weights
                     ):
@@ -911,12 +1130,13 @@ def run_training(
                             }
                         )
 
-                if step in configured_snapshots:
+                if snapshot_event:
                     fraction = configured_snapshots[step]
                     _, _, x_grid, y_grid = _snapshot_grid(config)
                     snapshots.append(_predict_celerity(material_params, config, x_grid, y_grid))
                     snapshot_step_values.append(step)
                     snapshot_fraction_values.append(fraction)
+                    field_params = unpack_field_parameters(packed_field_params)
                     diagnostics = material_snapshot_statistics(
                         material_params, field_params, physics, active_contexts,
                         variant, monitor_points, material_weights,
@@ -968,27 +1188,17 @@ def run_training(
                             )
 
                 if print_event:
-                    current = pressure_rows[-len(active):] if monitor_event else []
-                    if current:
-                        losses = ", ".join(
-                            f"{row['case_id']}={row['objective']:.3e}" for row in current
-                        )
-                        field_weight_text = "; ".join(
-                            f"{case.id}:{np.asarray(weights).tolist()}"
-                            for case, weights in zip(active, field_weights)
-                        )
-                        sigma_text = "; ".join(
-                            f"{case.id}:{np.asarray(params['sigma']).tolist()}"
-                            for case, params in zip(active, field_params)
-                        )
-                        print(
-                            f"[{variant.name} pkg{package_index + 1:02d} Adam {step}/{adam_steps}] "
-                            f"pressure({losses}) best={best_selection:.3e} data={data_factor:.3f} "
-                            f"field_weights=({field_weight_text}) "
-                            f"material_weights={np.asarray(material_weights).tolist()} "
-                            f"sigma=({sigma_text})",
-                            flush=True,
-                        )
+                    print(
+                        f"[{variant.name} pkg{package_index + 1:02d} "
+                        f"packed Adam {step}/{adam_steps}] "
+                        f"{_pressure_loss_text(components)} "
+                        f"monitor={components['static_objective']:.3e} "
+                        f"material={_float(material_components['objective']):.3e} "
+                        f"best={best_selection:.3e} data_factor={data_factor:.3f}",
+                        flush=True,
+                    )
+                if monitor_event or sigma_event or gradient_event or snapshot_event:
+                    training_block_started = time.perf_counter()
 
         frozen_field_weights = tuple(
             _field_weights(config, variant, field_adaptive.get(case), 1.0)
@@ -1006,86 +1216,127 @@ def run_training(
         for cycle in range(1, package.inverse.lbfgs_cycles + 1):
             if package.inverse.lbfgs_field_steps:
                 optimizer = optax.lbfgs()
-                state = optimizer.init(field_params)
+                state = optimizer.init(packed_field_params)
                 function = make_pressure_lbfgs_step(
-                    optimizer, material_params, physics, active_contexts, variant,
+                    optimizer, physics, active_contexts, variant,
                     lbfgs_points, frozen_field_weights, include_data=True,
                 )
                 compile_started = time.perf_counter()
-                compiled = function(field_params, state)
+                compiled = function(
+                    packed_field_params, state, material_params, b_bases
+                )
                 _ready(compiled)
                 compilation_seconds += time.perf_counter() - compile_started
+                training_block_started = time.perf_counter()
                 for block_step in range(1, package.inverse.lbfgs_field_steps + 1):
                     global_lbfgs_step += 1
-                    started = time.perf_counter()
-                    field_params, state, _ = function(field_params, state)
-                    _ready(field_params)
-                    training_seconds += time.perf_counter() - started
-                    if block_step == package.inverse.lbfgs_field_steps or block_step % config.logging.loss_interval_lbfgs == 0:
-                        selection, components = _evaluate_pressure(
-                            field_params, material_params, physics, active_contexts,
-                            variant, monitor_points, final_static_weights,
+                    packed_field_params, state, _ = function(
+                        packed_field_params, state, material_params, b_bases
+                    )
+                    monitor_event = (
+                        block_step == package.inverse.lbfgs_field_steps
+                        or block_step % config.logging.loss_interval_lbfgs == 0
+                    )
+                    if monitor_event:
+                        _ready(packed_field_params)
+                        training_seconds += (
+                            time.perf_counter() - training_block_started
                         )
-                        _append_pressure_loss_rows(
-                            pressure_rows, phase=f"inverse_lbfgs_field_cycle{cycle}",
+                        components = _evaluate_pressure_monitor(
+                            pressure_monitor, packed_field_params,
+                            material_params, frozen_field_weights, b_bases,
+                        )
+                        _append_pressure_common_loss_row(
+                            pressure_common_rows,
+                            phase=f"inverse_lbfgs_field_cycle{cycle}",
                             optimizer="lbfgs", step=global_lbfgs_step,
-                            contexts=active_contexts, components=components,
-                            selection=selection,
+                            components=components, case_count=len(active),
+                            data_factor=1.0,
                         )
-                        if selection < best_selection:
-                            best_selection = selection
-                            best_fields = _copy_tree(field_params)
+                        if components["static_objective"] < best_selection:
+                            best_selection = components["static_objective"]
+                            best_fields = _copy_tree(packed_field_params)
                             best_material = _copy_tree(material_params)
+                        print(
+                            f"[{variant.name} pkg{package_index + 1:02d} "
+                            f"pressure L-BFGS cycle {cycle} "
+                            f"{block_step}/{package.inverse.lbfgs_field_steps}] "
+                            f"{_pressure_loss_text(components)} "
+                            f"best={best_selection:.3e}",
+                            flush=True,
+                        )
+                        training_block_started = time.perf_counter()
 
             if package.inverse.lbfgs_material_steps:
                 optimizer = optax.lbfgs()
                 state = optimizer.init(material_params)
                 function = make_material_lbfgs_step(
-                    optimizer, field_params, physics, active_contexts, variant,
+                    optimizer, physics, active_contexts, variant,
                     lbfgs_points, frozen_material_weights,
                     tv_weight=tv_weight,
                     tv_epsilon_squared=config.loss.tv.epsilon_squared,
                 )
                 compile_started = time.perf_counter()
-                compiled = function(material_params, state)
+                compiled = function(
+                    material_params, state, packed_field_params, b_bases
+                )
                 _ready(compiled)
                 compilation_seconds += time.perf_counter() - compile_started
+                training_block_started = time.perf_counter()
                 for block_step in range(1, package.inverse.lbfgs_material_steps + 1):
                     global_lbfgs_step += 1
-                    started = time.perf_counter()
-                    material_params, state, _ = function(material_params, state)
-                    _ready(material_params)
-                    training_seconds += time.perf_counter() - started
-                    if block_step == package.inverse.lbfgs_material_steps or block_step % config.logging.loss_interval_lbfgs == 0:
-                        selection, components = _evaluate_pressure(
-                            field_params, material_params, physics, active_contexts,
-                            variant, monitor_points, final_static_weights,
+                    material_params, state, _ = function(
+                        material_params, state, packed_field_params, b_bases
+                    )
+                    monitor_event = (
+                        block_step == package.inverse.lbfgs_material_steps
+                        or block_step % config.logging.loss_interval_lbfgs == 0
+                    )
+                    if monitor_event:
+                        _ready(material_params)
+                        training_seconds += (
+                            time.perf_counter() - training_block_started
                         )
-                        _append_pressure_loss_rows(
-                            pressure_rows, phase=f"inverse_lbfgs_material_cycle{cycle}",
+                        components = _evaluate_pressure_monitor(
+                            pressure_monitor, packed_field_params,
+                            material_params, frozen_field_weights, b_bases,
+                        )
+                        _append_pressure_common_loss_row(
+                            pressure_common_rows,
+                            phase=f"inverse_lbfgs_material_cycle{cycle}",
                             optimizer="lbfgs", step=global_lbfgs_step,
-                            contexts=active_contexts, components=components,
-                            selection=selection,
+                            components=components, case_count=len(active),
+                            data_factor=1.0,
                         )
-                        _, material_components = material_objective(
-                            material_params, field_params, physics, active_contexts,
-                            variant, monitor_points, frozen_material_weights,
-                            tv_weight=tv_weight,
-                            tv_epsilon_squared=config.loss.tv.epsilon_squared,
+                        material_components = material_monitor(
+                            material_params, packed_field_params,
+                            frozen_material_weights, b_bases,
                         )
-                        _append_material_loss_rows(
+                        _ready(material_components)
+                        _append_material_loss_row(
                             material_rows,
                             phase=f"inverse_lbfgs_material_cycle{cycle}",
                             optimizer="lbfgs", step=global_lbfgs_step,
-                            contexts=active_contexts, components=material_components,
+                            case_count=len(active), components=material_components,
                             tv_enabled=tv_weight != 0.0,
                         )
-                        if selection < best_selection:
-                            best_selection = selection
-                            best_fields = _copy_tree(field_params)
+                        if components["static_objective"] < best_selection:
+                            best_selection = components["static_objective"]
+                            best_fields = _copy_tree(packed_field_params)
                             best_material = _copy_tree(material_params)
+                        print(
+                            f"[{variant.name} pkg{package_index + 1:02d} "
+                            f"material L-BFGS cycle {cycle} "
+                            f"{block_step}/{package.inverse.lbfgs_material_steps}] "
+                            f"{_pressure_loss_text(components)} "
+                            f"material={_float(material_components['objective']):.3e} "
+                            f"best={best_selection:.3e}",
+                            flush=True,
+                        )
+                        training_block_started = time.perf_counter()
 
-        field_params = best_fields
+        packed_field_params = best_fields
+        field_params = unpack_field_parameters(packed_field_params)
         material_params = best_material
         for case, params in zip(active, field_params):
             models[case] = FieldModel(params, models[case].b_base)
@@ -1119,7 +1370,11 @@ def run_training(
             package_directory, active, models, contexts, material_params, physics,
             variant, config, dataset,
         )
-        write_csv(package_directory / "pressure_loss_history.csv", pressure_rows, PRESSURE_LOSS_COLUMNS)
+        write_csv(
+            package_directory / "pressure_common_loss_history.csv",
+            pressure_common_rows,
+            PRESSURE_COMMON_LOSS_COLUMNS,
+        )
         write_csv(package_directory / "material_loss_history.csv", material_rows, MATERIAL_LOSS_COLUMNS)
         write_csv(package_directory / "pressure_gradient_history.csv", pressure_gradient_rows, PRESSURE_GRADIENT_COLUMNS)
         write_csv(package_directory / "material_snapshot_diagnostics.csv", material_diagnostic_rows, MATERIAL_DIAGNOSTIC_COLUMNS)
@@ -1140,6 +1395,7 @@ def run_training(
             "new_cases": [case.manifest() for case in new_cases],
             "seen_cases": [case.manifest() for case in sorted(seen)],
             "best_pressure_monitor_loss": best_selection,
+            "pressure_common_evaluations": len(pressure_common_rows),
             "snapshot_steps": snapshot_step_values,
             "snapshot_fractions": snapshot_fraction_values,
             "training_seconds": training_seconds,

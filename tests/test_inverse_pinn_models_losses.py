@@ -24,6 +24,8 @@ from inverse_PINN.models import (
     initialize_material_model,
     material_physical_gradient,
     material_value,
+    pack_field_parameters,
+    unpack_field_parameters,
 )
 from inverse_PINN.sampling import CollocationPoints
 from inverse_PINN.variants import parse_variant
@@ -77,6 +79,26 @@ def test_initialization_is_deterministic_and_formulation_independent():
         [2 * np.pi * CASE.frequency / GEOMETRY.c0, np.pi / GEOMETRY.height],
     )
     assert np.max(np.abs(np.asarray(total.params["layers"][-1]["W"]))) < 0.2
+
+
+def test_field_parameters_pack_and_unpack_round_trip():
+    variant = parse_variant("fourier_total")
+    models = ModelConfig(3, (5,), (4,))
+    originals = tuple(
+        initialize_field_model(
+            jax.random.key(seed), models, GEOMETRY, CASE, variant
+        ).params
+        for seed in (11, 12)
+    )
+    packed = pack_field_parameters(originals)
+    assert np.asarray(packed["sigma"]).shape == (2, 2)
+    restored = unpack_field_parameters(packed)
+    for original, recovered in zip(originals, restored):
+        for left, right in zip(
+            jax.tree_util.tree_leaves(original),
+            jax.tree_util.tree_leaves(recovered),
+        ):
+            np.testing.assert_array_equal(left, right)
 
 
 def test_material_starts_at_background_is_bounded_and_has_physical_gradient():
