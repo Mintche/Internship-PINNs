@@ -1,13 +1,8 @@
-// Guide d'onde rectangulaire avec deux defauts circulaires.
-//
-// Les six parametres cx1, cy1, r1, cx2, cy2 et r2 peuvent etre
-// modifies ci-dessous ou depuis la fenetre "Parameters" de Gmsh.
-// Les deux defauts utilisent le meme tag physique (2), comme attendu
-// par le solveur FEM du projet.
 //
 // Physical tags :
 //   Surface MILIEU  : 1
-//   Surfaces DEFAUT : 2
+//   Surfaces DEFAUT1 : 2
+//   Surfaces DEFAUT2 : 3
 //   Bord gauche     : 11
 //   Bord droit      : 12
 //   Bord haut       : 13
@@ -25,14 +20,14 @@ Ly = 0.6; // domaine en y : [0, Ly]
 DefineConstant[
   cx1 = {-0.30, Min -Lx/2, Max Lx/2, Step 0.01,
          Name "Defaut 1/Centre x"},
-  cy1 = { 0.30, Min 0, Max Ly, Step 0.01,
+  cy1 = { 0.40, Min 0, Max Ly, Step 0.01,
          Name "Defaut 1/Centre y"},
   r1  = { 0.10, Min 0.001, Max Ly/2, Step 0.005,
          Name "Defaut 1/Rayon"},
 
   cx2 = { 0.30, Min -Lx/2, Max Lx/2, Step 0.01,
          Name "Defaut 2/Centre x"},
-  cy2 = { 0.30, Min 0, Max Ly, Step 0.01,
+  cy2 = { 0.20, Min 0, Max Ly, Step 0.01,
          Name "Defaut 2/Centre y"},
   r2  = { 0.10, Min 0.001, Max Ly/2, Step 0.005,
          Name "Defaut 2/Rayon"}
@@ -44,8 +39,8 @@ DefineConstant[
 // -----------------------------------------------------------------------------
 // Parametres de maillage
 // -----------------------------------------------------------------------------
-h_bulk   = 0.04;
-h_defaut = 0.015;
+h_bulk   = 0.01;
+h_defaut = 0.005;
 
 Mesh.CharacteristicLengthMin = h_defaut;
 Mesh.CharacteristicLengthMax = h_bulk;
@@ -117,7 +112,8 @@ Background Field = 5;
 // Groupes physiques
 // -----------------------------------------------------------------------------
 Physical Surface(1) = {sMil[]};
-Physical Surface(2) = {sDef1[], sDef2[]};
+Physical Surface(2) = {sDef1[]};
+Physical Surface(3) = {sDef2[]};
 
 cLeft[] = Curve In BoundingBox {
   -Lx/2-eps, -eps, -eps, -Lx/2+eps, Ly+eps, eps

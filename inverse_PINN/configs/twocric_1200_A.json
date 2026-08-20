@@ -1,0 +1,109 @@
+{
+  "geometry": {
+    "height": 0.6,
+    "half_length": 1.0,
+    "c0": 340.0,
+    "celerity_ratio_bounds": [0.6, 1.4],
+"truth_regions": [
+  {
+    "shape": "circle",
+    "center": [-0.3, 0.4],
+    "radius": 0.1,
+    "speed_ratio": 0.8
+  },
+  {
+    "shape": "circle",
+    "center": [0.3, 0.2],
+    "radius": 0.1,
+    "speed_ratio": 1.2
+  }
+]
+  },
+  "data": {
+    "boundary_left": "FEM/pinn_data/pinn_boundary_left_twocirc.csv",
+    "boundary_right": "FEM/pinn_data/pinn_boundary_right_twocirc.csv",
+    "fem_field": "FEM/pinn_data/fem_field_twocirc.csv",
+    "mass_matrix": "FEM/pinn_data/Mass_matrix_twocirc.csv",
+    "stiffness_matrix": "FEM/pinn_data/Stiff_matrix_twocirc.csv",
+    "mesh_nodes": "FEM/pinn_data/mesh_nodes_twocirc.csv",
+    "mesh_triangles": "FEM/pinn_data/mesh_triangles_twocirc.csv"
+  },
+  "models": {
+    "fourier_features": 64,
+    "field_hidden_layers": [128, 128, 128],
+    "material_hidden_layers": [64, 64]
+  },
+  "loss": {
+    "field_weights": [1000.0, 1000.0, 10.0, 1000.0],
+    "field_adweights": {
+      "epsilon": 0.00001,
+      "alpha": 0.1,
+      "initial_lambdas": [0.001, 0.0001, 0.1, 1.0],
+      "custom_weights": [1.0, 1.0, 1.0, 1.0],
+      "update_interval_adam": 500
+    },
+    "material_adweights": {
+      "epsilon": 0.0001,
+      "alpha": 0.1,
+      "initial_lambda": 0.01,
+      "custom_weight": 1.0,
+      "update_interval_adam": 500
+    },
+    "tv": {
+      "weight": 0.0001,
+      "epsilon_squared": 1e-12
+    }
+  },
+  "optimization": {
+    "field_learning_rate": 0.001,
+    "material_learning_rate": 0.001,
+    "cosine_decay_start": 10000,
+    "consine_decay_stop": 20000,
+    "cosine_decay_alpha": 0.1,
+    "sigma_learning_rate": 0.01,
+    "sigma_decay_fraction": 0.5,
+    "sigma_cosine_alpha": 0.001,
+    "data_initial_factor": 0.1,
+    "data_transition_steps": 10000
+  },
+  "sampling": {
+    "adam": [4096, 256, 256],
+    "monitor": [4096, 256, 256],
+    "lbfgs": [8192, 512, 512],
+    "sobol_scramble": true,
+    "sobol_seed_offset": 1000
+  },
+  "logging": {
+    "loss_interval_adam": 500,
+    "loss_interval_lbfgs": 200,
+    "pressure_gradient_interval_adam": 500,
+    "sigma_interval_adam": 500,
+    "print_interval_adam": 500,
+    "material_snapshot_fractions": [0.3, 0.5, 0.8, 1.0],
+    "snapshot_grid": [256,80],
+    "prediction_batch_size": 8192
+  },
+  "training_packages": [
+    {
+      "cases": {
+        "-1": {
+          "1200": [0,1,2,3]
+        },
+        "1": {
+          "1200": [0,1,2,3]
+        }
+      },
+      "warmup": {
+        "adam_steps": 5000,
+        "lbfgs_steps": 0
+      },
+      "inverse": {
+        "adam_steps": 40000,
+        "lbfgs_cycles": 0,
+        "lbfgs_field_steps": 0,
+        "lbfgs_material_steps": 0
+      }
+    }
+  ],
+  "output_root": "inverse_PINN/results"
+}

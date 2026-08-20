@@ -8,6 +8,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -26,15 +27,24 @@ namespace {
 constexpr int defect_tag = 2;
 constexpr int left_tag = 11;
 constexpr int right_tag = 12;
+constexpr double pollution_eps = 0.01;
+
+struct TagContrast {
+    int tag = 0;
+    double contrast = 1.0;
+};
 
 struct Configuration {
     filesystem::path mesh_file;
     filesystem::path output_dir;
     string defect_name;
     double c0 = 0.0;
-    double contrast_ratio = 0.0;
+    optional<double> legacy_contrast_ratio;
+    vector<TagContrast> tag_contrasts;
+    optional<filesystem::path> nodal_sound_speed_file;
     vector<double> frequencies;
     vector<int> modes;
+    vector<int> incidences{-1};
     optional<size_t> number_of_data_points;
 };
 
@@ -63,22 +73,28 @@ void print_usage(const char* executable) {
     cout
         << "Usage:\n  " << executable
         << " --mesh MESH --defectname NAME --freqs F1,F2 --modes M1,M2"
-        << " --outputdir DIR --c0 VALUE --contrast RATIO [options]\n\n"
+        << " --outputdir DIR --c0 VALUE MATERIAL [options]\n\n"
         << "Arguments:\n"
-        << "  --mesh PATH                  Maillage Gmsh v2 ASCII\n"
-        << "  --defectname NAME            Nom utilise dans les fichiers CSV\n"
-        << "  --freqs F1,F2                Frequences positives en Hz\n"
-        << "  --modes M1,M2                Indices de modes positifs ou nuls\n"
-        << "  --outputdir DIR              Dossier de sortie\n"
-        << "  --c0 VALUE                   Celerite du milieu sain\n"
-        << "  --contrast RATIO             Rapport c_defaut / c0\n"
-        << "  --numberofdatapoints N       N points uniformes par bord, N >= 2\n"
-        << "  --help                       Afficher cette aide\n\n"
-        << "Sans --numberofdatapoints, tous les degres de liberte P2 des ports sont exportes.\n\n"
-        << "Exemple:\n  " << executable
+        << "  --mesh PATH                  Gmsh v2 ASCII mesh\n"
+        << "  --defectname NAME            Name used in CSV file names\n"
+        << "  --freqs F1,F2                Positive frequencies in Hz\n"
+        << "  --modes M1,M2                Non-negative mode indices\n"
+        << "  --outputdir DIR              Output directory\n"
+        << "  --c0 VALUE                   Healthy-medium sound speed\n"
+        << "  --contrast RATIO             c_defect / c0 ratio for surface tag 2 (legacy format)\n"
+        << "  --tag-contrasts T:R,T:R      c_tag / c0 ratios by physical surface tag\n"
+        << "  --nodal-sound-speed PATH     node_id,x,y,c CSV in reordered P2 order\n"
+        << "  --incidence VALUES           -1 from the left, 1 from the right, or -1,1 (default: -1)\n"
+        << "  --numberofdatapoints N       N uniform points per port, N >= 2\n"
+        << "  --help                       Show this help\n\n"
+        << "Without --numberofdatapoints, all port P2 degrees of freedom are exported.\n\n"
+        << "Example:\n  " << executable
         << " --mesh data/test_us_barhalfup_centree.msh --defectname barhalfup"
-        << " --freqs 600,800 --modes 0,1,2 --outputdir ../waveguide_2d/data"
-        << " --c0 340 --contrast 0.8 --numberofdatapoints 31\n";
+        << " --freqs 600,800 --modes 0,1,2 --outputdir ../FEM/pinn_data"
+        << " --c0 340 --contrast 0.8 --incidence -1,1 --numberofdatapoints 31\n  " << executable
+        << " --mesh data/two_zone.msh --defectname barhalf_sym"
+        << " --freqs 600,800 --modes 0,1,2 --outputdir ../FEM/pinn_data"
+        << " --c0 340 --tag-contrasts 2:0.8,3:0.9 --numberofdatapoints 31\n";
 }
 
 string trim(string value) {
@@ -95,10 +111,10 @@ double parse_double(const string& text, const string& option) {
     try {
         result = stod(value, &consumed);
     } catch (const exception&) {
-        throw invalid_argument("Valeur invalide pour " + option + ": " + text);
+        throw invalid_argument("Invalid value for " + option + ": " + text);
     }
     if (consumed != value.size() || !isfinite(result)) {
-        throw invalid_argument("Valeur invalide pour " + option + ": " + text);
+        throw invalid_argument("Invalid value for " + option + ": " + text);
     }
     return result;
 }
@@ -110,11 +126,11 @@ int parse_int(const string& text, const string& option) {
     try {
         result = stoll(value, &consumed);
     } catch (const exception&) {
-        throw invalid_argument("Valeur invalide pour " + option + ": " + text);
+        throw invalid_argument("Invalid value for " + option + ": " + text);
     }
     if (consumed != value.size() || result < numeric_limits<int>::min() ||
         result > numeric_limits<int>::max()) {
-        throw invalid_argument("Valeur invalide pour " + option + ": " + text);
+        throw invalid_argument("Invalid value for " + option + ": " + text);
     }
     return static_cast<int>(result);
 }
@@ -123,13 +139,17 @@ template <typename T, typename Converter>
 vector<T> parse_list(const string& text, Converter converter, const string& option) {
     vector<T> values;
     string token;
-    stringstream stream(text);
+    const string list_text = trim(text);
+    if (list_text.empty()) throw invalid_argument("List " + option + " is empty");
+    if (list_text.back() == ',') throw invalid_argument("Empty value in " + option);
+
+    stringstream stream(list_text);
     while (getline(stream, token, ',')) {
         token = trim(token);
-        if (token.empty()) throw invalid_argument("Valeur vide dans " + option);
+        if (token.empty()) throw invalid_argument("Empty value in " + option);
         values.push_back(converter(token));
     }
-    if (values.empty()) throw invalid_argument("La liste " + option + " est vide");
+    if (values.empty()) throw invalid_argument("List " + option + " is empty");
     return values;
 }
 
@@ -141,7 +161,7 @@ string sanitize_name(string name) {
                            character == '-' || character == '_';
         if (!valid) character = '_';
     }
-    if (name.empty()) throw invalid_argument("--defectname ne peut pas etre vide");
+    if (name.empty()) throw invalid_argument("--defectname cannot be empty");
     return name;
 }
 
@@ -155,10 +175,143 @@ string ratio_label(double ratio) {
     return "ratio" + token;
 }
 
+vector<TagContrast> parse_tag_contrasts(const string& text, const string& option) {
+    vector<TagContrast> contrasts;
+    set<int> seen_tags;
+    string token;
+    stringstream stream(text);
+    while (getline(stream, token, ',')) {
+        token = trim(token);
+        if (token.empty()) throw invalid_argument("Empty value in " + option);
+
+        const size_t separator = token.find(':');
+        if (separator == string::npos || separator == 0 ||
+            separator == token.size() - 1 || token.find(':', separator + 1) != string::npos) {
+            throw invalid_argument("Expected format for " + option + ": tag:ratio,tag:ratio");
+        }
+
+        const int tag = parse_int(token.substr(0, separator), option);
+        const double contrast = parse_double(token.substr(separator + 1), option);
+        if (tag <= 0) throw invalid_argument("Tags in " + option + " must be strictly positive");
+        if (tag == 1) {
+            throw invalid_argument("Tag 1 is reserved for the healthy medium and uses --c0");
+        }
+        if (!(contrast > 0.0)) {
+            throw invalid_argument("Ratios in " + option + " must be strictly positive");
+        }
+        if (!seen_tags.insert(tag).second) {
+            throw invalid_argument("Duplicate tag in " + option + ": " + to_string(tag));
+        }
+        contrasts.push_back({tag, contrast});
+    }
+    if (contrasts.empty()) throw invalid_argument("List " + option + " is empty");
+    sort(contrasts.begin(), contrasts.end(), [](const TagContrast& a, const TagContrast& b) {
+        return a.tag < b.tag;
+    });
+    return contrasts;
+}
+
+vector<int> parse_incidences(const string& text, const string& option) {
+    vector<int> incidences = parse_list<int>(
+        text,
+        [&](const string& value) { return parse_int(value, option); }, option);
+    set<int> seen;
+    for (int incidence : incidences) {
+        if (incidence != -1 && incidence != 1) {
+            throw invalid_argument("--incidence accepts only -1 or 1");
+        }
+        if (!seen.insert(incidence).second) {
+            throw invalid_argument("Duplicate incidence in --incidence: " +
+                                   to_string(incidence));
+        }
+    }
+    sort(incidences.begin(), incidences.end());
+    return incidences;
+}
+
+vector<int> material_tags(const Configuration& config) {
+    vector<int> tags;
+    tags.reserve(config.tag_contrasts.size());
+    for (const auto& tag_contrast : config.tag_contrasts) {
+        tags.push_back(tag_contrast.tag);
+    }
+    return tags;
+}
+
+vector<double> load_nodal_sound_speed(const filesystem::path& path,
+                                      const MeshP2& mesh) {
+    ifstream input(path);
+    if (!input) throw runtime_error("Unable to open " + path.string());
+    string line;
+    if (!getline(input, line) || trim(line) != "node_id,x,y,c") {
+        throw runtime_error(
+            "The nodal CSV must start with the header node_id,x,y,c");
+    }
+
+    vector<double> values(mesh.ndof(), numeric_limits<double>::quiet_NaN());
+    vector<bool> seen(mesh.ndof(), false);
+    size_t row_count = 0;
+    while (getline(input, line)) {
+        line = trim(line);
+        if (line.empty()) continue;
+        replace(line.begin(), line.end(), ',', ' ');
+        stringstream stream(line);
+        int node_id = -1;
+        double x = 0.0;
+        double y = 0.0;
+        double speed = 0.0;
+        string extra;
+        if (!(stream >> node_id >> x >> y >> speed) || (stream >> extra)) {
+            throw runtime_error("Invalid nodal line: " + line);
+        }
+        if (node_id < 0 || static_cast<size_t>(node_id) >= mesh.ndof()) {
+            throw runtime_error("Nodal node_id is outside the mesh: " + to_string(node_id));
+        }
+        if (seen[node_id]) {
+            throw runtime_error("Duplicate nodal node_id: " + to_string(node_id));
+        }
+        const auto& node = mesh.nodes[node_id];
+        const double coordinate_tolerance = 1e-9 * max({1.0, mesh.Lx, mesh.Ly});
+        if (abs(x - node.x) > coordinate_tolerance || abs(y - node.y) > coordinate_tolerance) {
+            throw runtime_error(
+                "Coordinates do not match node_id " + to_string(node_id));
+        }
+        if (!(speed > 0.0) || !isfinite(speed)) {
+            throw runtime_error(
+                "Nodal sound speed is non-positive or non-finite at node_id " +
+                to_string(node_id));
+        }
+        values[node_id] = speed;
+        seen[node_id] = true;
+        ++row_count;
+    }
+    if (row_count != mesh.ndof()) {
+        throw runtime_error(
+            "The nodal CSV contains " + to_string(row_count) + " rows for " +
+            to_string(mesh.ndof()) + " degrees of freedom");
+    }
+    return values;
+}
+
+map<int, double> tag_contrast_map(const Configuration& config) {
+    map<int, double> contrasts;
+    for (const auto& tag_contrast : config.tag_contrasts) {
+        contrasts[tag_contrast.tag] = tag_contrast.contrast;
+    }
+    return contrasts;
+}
+
+string data_suffix(const Configuration& config) {
+    if (config.legacy_contrast_ratio.has_value()) {
+        return config.defect_name + "_" + ratio_label(*config.legacy_contrast_ratio);
+    }
+    return config.defect_name;
+}
+
 Configuration parse_arguments(int argc, char** argv) {
     if (argc < 2) {
         print_usage(argv[0]);
-        throw invalid_argument("Arguments manquants");
+        throw invalid_argument("Missing arguments");
     }
 
     Configuration config;
@@ -169,9 +322,11 @@ Configuration parse_arguments(int argc, char** argv) {
     bool has_output_dir = false;
     bool has_c0 = false;
     bool has_contrast = false;
+    bool has_tag_contrasts = false;
+    bool has_nodal_sound_speed = false;
 
     auto value_after = [&](int& index, const string& option) -> string {
-        if (index + 1 >= argc) throw invalid_argument("Valeur manquante apres " + option);
+        if (index + 1 >= argc) throw invalid_argument("Missing value after " + option);
         return argv[++index];
     };
 
@@ -203,33 +358,51 @@ Configuration parse_arguments(int argc, char** argv) {
             config.c0 = parse_double(value_after(i, option), option);
             has_c0 = true;
         } else if (option == "--contrast") {
-            config.contrast_ratio = parse_double(value_after(i, option), option);
+            config.legacy_contrast_ratio = parse_double(value_after(i, option), option);
             has_contrast = true;
+        } else if (option == "--tag-contrasts") {
+            config.tag_contrasts = parse_tag_contrasts(value_after(i, option), option);
+            has_tag_contrasts = true;
+        } else if (option == "--nodal-sound-speed") {
+            config.nodal_sound_speed_file = value_after(i, option);
+            has_nodal_sound_speed = true;
+        } else if (option == "--incidence") {
+            config.incidences = parse_incidences(value_after(i, option), option);
         } else if (option == "--numberofdatapoints") {
             const int count = parse_int(value_after(i, option), option);
-            if (count < 2) throw invalid_argument("--numberofdatapoints doit etre >= 2");
+            if (count < 2) throw invalid_argument("--numberofdatapoints must be >= 2");
             config.number_of_data_points = static_cast<size_t>(count);
         } else {
-            throw invalid_argument("Option inconnue: " + option);
+            throw invalid_argument("Unknown option: " + option);
         }
     }
 
-    if (!has_mesh) throw invalid_argument("--mesh est obligatoire");
-    if (!has_defect_name) throw invalid_argument("--defectname est obligatoire");
-    if (!has_frequencies) throw invalid_argument("--freqs est obligatoire");
-    if (!has_modes) throw invalid_argument("--modes est obligatoire");
-    if (!has_output_dir) throw invalid_argument("--outputdir est obligatoire");
-    if (!has_c0) throw invalid_argument("--c0 est obligatoire");
-    if (!has_contrast) throw invalid_argument("--contrast est obligatoire");
-    if (!(config.c0 > 0.0)) throw invalid_argument("--c0 doit etre strictement positif");
-    if (!(config.contrast_ratio > 0.0)) {
-        throw invalid_argument("--contrast doit etre un rapport strictement positif");
+    if (!has_mesh) throw invalid_argument("--mesh is required");
+    if (!has_defect_name) throw invalid_argument("--defectname is required");
+    if (!has_frequencies) throw invalid_argument("--freqs is required");
+    if (!has_modes) throw invalid_argument("--modes is required");
+    if (!has_output_dir) throw invalid_argument("--outputdir is required");
+    if (!has_c0) throw invalid_argument("--c0 is required");
+    const int material_option_count = static_cast<int>(has_contrast) +
+                                      static_cast<int>(has_tag_contrasts) +
+                                      static_cast<int>(has_nodal_sound_speed);
+    if (material_option_count != 1) {
+        throw invalid_argument(
+            "Provide exactly one of --contrast or --tag-contrasts, "
+            "or use --nodal-sound-speed exclusively");
+    }
+    if (!(config.c0 > 0.0)) throw invalid_argument("--c0 must be strictly positive");
+    if (has_contrast && !(*config.legacy_contrast_ratio > 0.0)) {
+        throw invalid_argument("--contrast must be a strictly positive ratio");
+    }
+    if (has_contrast) {
+        config.tag_contrasts = {{defect_tag, *config.legacy_contrast_ratio}};
     }
     for (double frequency : config.frequencies) {
-        if (!(frequency > 0.0)) throw invalid_argument("Toutes les frequences doivent etre positives");
+        if (!(frequency > 0.0)) throw invalid_argument("All frequencies must be positive");
     }
     for (int mode : config.modes) {
-        if (mode < 0) throw invalid_argument("Les indices de mode doivent etre positifs ou nuls");
+        if (mode < 0) throw invalid_argument("Mode indices must be non-negative");
     }
 
     sort(config.frequencies.begin(), config.frequencies.end());
@@ -242,7 +415,7 @@ Configuration parse_arguments(int argc, char** argv) {
 
 ofstream open_output(const filesystem::path& path) {
     ofstream output(path);
-    if (!output) throw runtime_error("Impossible de creer " + path.string());
+    if (!output) throw runtime_error("Unable to create " + path.string());
     output << setprecision(17);
     return output;
 }
@@ -270,12 +443,12 @@ BoundaryPort collect_boundary_port(const MeshP2& mesh, int boundary_tag, double 
             const auto& pm = mesh.nodes[midpoint];
             if (abs(p0.x - expected_x) > tolerance || abs(p1.x - expected_x) > tolerance ||
                 abs(pm.x - expected_x) > tolerance) {
-                throw runtime_error("Le port tague " + to_string(boundary_tag) +
-                                    " n'est pas vertical a l'extremite du maillage");
+                throw runtime_error("Port tag " + to_string(boundary_tag) +
+                                    " is not vertical at the mesh boundary");
             }
             if (abs(p1.y - p0.y) <= tolerance) {
-                throw runtime_error("Une arete du port tague " + to_string(boundary_tag) +
-                                    " a une hauteur nulle");
+                throw runtime_error("An edge of port tag " + to_string(boundary_tag) +
+                                    " has zero height");
             }
             port.edges.push_back({first, second, midpoint});
             unique_nodes.insert(first);
@@ -285,7 +458,7 @@ BoundaryPort collect_boundary_port(const MeshP2& mesh, int boundary_tag, double 
     }
 
     if (port.edges.empty()) {
-        throw runtime_error("Aucune arete trouvee pour le tag de port " +
+        throw runtime_error("No edge found for port tag " +
                             to_string(boundary_tag));
     }
 
@@ -344,8 +517,8 @@ vector<BoundaryEvaluation> prepare_boundary_evaluations(
         }
 
         if (!found) {
-            throw runtime_error("Impossible d'interpoler le point y=" + to_string(y) +
-                                " sur le port x=" + to_string(port.x));
+            throw runtime_error("Unable to interpolate point y=" + to_string(y) +
+                                " on port x=" + to_string(port.x));
         }
     }
     return evaluations;
@@ -361,20 +534,49 @@ complexe evaluate_boundary(const vector<complexe>& field,
 }
 
 void export_boundary(ofstream& output, const vector<BoundaryEvaluation>& evaluations,
-                     const vector<complexe>& field, double frequency, double k0, int mode) {
+                     const vector<complexe>& field, int incidence, double frequency,
+                     double k0, int mode) {
     for (const auto& evaluation : evaluations) {
         const complexe value = evaluate_boundary(field, evaluation);
-        output << frequency << ',' << k0 << ',' << mode << ',' << evaluation.x << ','
-               << evaluation.y << ',' << real(value) << ',' << imag(value) << '\n';
+        output << incidence << ',' << frequency << ',' << k0 << ',' << mode << ','
+               << evaluation.x << ',' << evaluation.y << ',' << real(value) << ','
+               << imag(value) << '\n';
     }
 }
 
 void export_field(ofstream& output, const MeshP2& mesh, const vector<complexe>& field,
-                  double frequency, double k0, int mode) {
+                  int incidence, double frequency, double k0, int mode) {
     for (const auto& node : mesh.nodes) {
-        output << frequency << ',' << k0 << ',' << mode << ',' << node.id << ','
-               << node.x << ',' << node.y << ',' << real(field[node.id]) << ','
-               << imag(field[node.id]) << '\n';
+        output << incidence << ',' << frequency << ',' << k0 << ',' << mode << ','
+               << node.id << ',' << node.x << ',' << node.y << ','
+               << real(field[node.id]) << ',' << imag(field[node.id]) << '\n';
+    }
+}
+
+void export_mesh_rcm(const filesystem::path& output_dir, const string& defect_name,
+                     const MeshP2& mesh) {
+    auto node_output =
+        open_output(output_dir / ("mesh_nodes_" + defect_name + ".csv"));
+    node_output << "node_id,x,y,ref\n";
+    for (const auto& node : mesh.nodes) {
+        node_output << node.id << ',' << node.x << ',' << node.y << ','
+                    << node.ref << '\n';
+    }
+
+    auto triangle_output =
+        open_output(output_dir / ("mesh_triangles_" + defect_name + ".csv"));
+    triangle_output
+        << "triangle_id,n0,n1,n2,n3,n4,n5,ref,is_defect,edge_ref0,edge_ref1,edge_ref2\n";
+    for (size_t triangle_id = 0; triangle_id < mesh.triangles.size(); ++triangle_id) {
+        const auto& triangle = mesh.triangles[triangle_id];
+        triangle_output << triangle_id;
+        for (int node_id : triangle.node_ids) {
+            triangle_output << ',' << node_id;
+        }
+        triangle_output << ',' << triangle.ref << ',' << (triangle.is_defect ? 1 : 0)
+                        << ',' << triangle.edge_ref[0] << ','
+                        << triangle.edge_ref[1] << ',' << triangle.edge_ref[2]
+                        << '\n';
     }
 }
 
@@ -389,26 +591,38 @@ void export_lower_matrix(const filesystem::path& path, const ProfileMatrix<compl
             const double real_value = real(value);
             const double imag_tolerance = 1e-13 * max(1.0, abs(real_value));
             if (abs(imag(value)) > imag_tolerance) {
-                throw runtime_error("Une matrice geometrique contient une partie imaginaire non nulle");
+                throw runtime_error("A geometric matrix contains a non-zero imaginary part");
             }
             output << row << ',' << column << ',' << real_value << '\n';
         }
     }
 }
 
+void warn_if_polluted(double frequency, const string& label, double k, double h) {
+    const double kh = k * h;
+    const double kh_squared = kh * kh;
+    const double kh_fourth = kh_squared * kh_squared;
+    if (kh_squared + k * kh_fourth < pollution_eps) return;
+
+    cerr << "Warning: numerical pollution may affect " << label
+         << " at f=" << frequency << " Hz: condition (kh)^2+k(kh)^4 < "
+         << pollution_eps << " is not satisfied, (kh)^2=" << kh_squared
+         << ", k(kh)^4=" << k*kh_fourth << ". Continuing simulation.\n";
+}
+
 void validate_waveguide_geometry(const MeshP2& mesh, const BoundaryPort& left,
                                  const BoundaryPort& right) {
     if (!(mesh.Lx > 0.0 && mesh.Ly > 0.0)) {
-        throw runtime_error("Le maillage doit avoir des dimensions strictement positives");
+        throw runtime_error("The mesh dimensions must be strictly positive");
     }
     const double scale = max({1.0, abs(mesh.Lx), abs(mesh.Ly)});
     const double tolerance = 1e-10 * scale;
     if (abs(mesh.xmin + mesh.xmax) > tolerance) {
-        throw runtime_error("Le guide doit etre centre avec des ports en x=-L et x=+L");
+        throw runtime_error("The waveguide must be centered with ports at x=-L and x=+L");
     }
     if (abs(left.ymin - mesh.ymin) > tolerance || abs(left.ymax - mesh.ymax) > tolerance ||
         abs(right.ymin - mesh.ymin) > tolerance || abs(right.ymax - mesh.ymax) > tolerance) {
-        throw runtime_error("Les ports doivent couvrir toute la hauteur du guide");
+        throw runtime_error("The ports must cover the full waveguide height");
     }
 }
 
@@ -420,8 +634,15 @@ int main(int argc, char** argv) {
         filesystem::create_directories(config.output_dir);
 
         MeshP2 mesh;
-        mesh.read_msh_v2_ascii(config.mesh_file.string(), {defect_tag});
+        mesh.read_msh_v2_ascii(config.mesh_file.string(), material_tags(config));
         Fem::reorder_mesh_rcm(mesh);
+        const double h_max = mesh.compute_h_max();
+        export_mesh_rcm(config.output_dir, config.defect_name, mesh);
+        const optional<vector<double>> nodal_sound_speed =
+            config.nodal_sound_speed_file.has_value()
+                ? optional<vector<double>>(
+                      load_nodal_sound_speed(*config.nodal_sound_speed_file, mesh))
+                : nullopt;
 
         const BoundaryPort left_port = collect_boundary_port(mesh, left_tag, mesh.xmin);
         const BoundaryPort right_port = collect_boundary_port(mesh, right_tag, mesh.xmax);
@@ -432,9 +653,9 @@ int main(int argc, char** argv) {
         const auto right_evaluations =
             prepare_boundary_evaluations(mesh, right_port, config.number_of_data_points);
 
-        cout << "Maillage: " << mesh.ndof() << " ddl P2, " << mesh.triangles.size()
+        cout << "Mesh: " << mesh.ndof() << " P2 degrees of freedom, " << mesh.triangles.size()
              << " triangles, ports " << left_evaluations.size() << "/"
-             << right_evaluations.size() << " points.\n";
+             << right_evaluations.size() << " points, h_max=" << h_max << ".\n";
 
         const vector<size_t> profile =
             Fem::compute_profile_enhanced(mesh, {left_tag, right_tag});
@@ -450,32 +671,64 @@ int main(int argc, char** argv) {
                                 ("Mass_matrix_" + config.defect_name + ".csv"),
                             mass, profile);
 
-        const string data_suffix = config.defect_name + "_" + ratio_label(config.contrast_ratio);
+        const string output_suffix = data_suffix(config);
         auto left_output = open_output(config.output_dir /
-                                       ("pinn_boundary_left_" + data_suffix + ".csv"));
+                                       ("pinn_boundary_left_" + output_suffix + ".csv"));
         auto right_output = open_output(config.output_dir /
-                                        ("pinn_boundary_right_" + data_suffix + ".csv"));
+                                        ("pinn_boundary_right_" + output_suffix + ".csv"));
         auto field_output = open_output(config.output_dir /
-                                        ("fem_field_" + data_suffix + ".csv"));
-        left_output << "f,k0,mode,x,y,Re_U,Im_U\n";
-        right_output << "f,k0,mode,x,y,Re_U,Im_U\n";
-        field_output << "f,k0,mode,node_id,x,y,Re_U,Im_U\n";
+                                        ("fem_field_" + output_suffix + ".csv"));
+        left_output << "incidence,f,k0,mode,x,y,Re_U,Im_U\n";
+        right_output << "incidence,f,k0,mode,x,y,Re_U,Im_U\n";
+        field_output << "incidence,f,k0,mode,node_id,x,y,Re_U,Im_U\n";
 
         const int highest_requested_mode = *max_element(config.modes.begin(), config.modes.end());
         const double pi = acos(-1.0);
+        const map<int, double> contrasts_by_tag = tag_contrast_map(config);
 
         for (double frequency : config.frequencies) {
             const double k0 = 2.0 * pi * frequency / config.c0;
-            const double kd = k0 / config.contrast_ratio;
+            const double omega = 2.0 * pi * frequency;
             const int number_of_dtn_modes =
                 max(static_cast<int>(floor(mesh.Ly * k0 / pi)) + 5,
                     highest_requested_mode + 1);
 
-            cout << "Resolution f=" << frequency << " Hz, k0=" << k0
-                 << ", " << number_of_dtn_modes << " modes DtN...\n";
+            warn_if_polluted(frequency, "healthy medium", k0, h_max);
+            if (nodal_sound_speed.has_value()) {
+                const double min_speed =
+                    *min_element(nodal_sound_speed->begin(), nodal_sound_speed->end());
+                const double material_k = omega / min_speed;
+                const double duplicate_tolerance = 1e-12 * max(1.0, abs(k0));
+                if (abs(material_k - k0) > duplicate_tolerance) {
+                        warn_if_polluted(frequency, "nodal material", material_k, h_max);
+                }
+            } else {
+                for (const auto& tag_contrast : config.tag_contrasts) {
+                    const double material_k = k0 / tag_contrast.contrast;
+                    const double duplicate_tolerance = 1e-12 * max(1.0, abs(k0));
+                    if (abs(material_k - k0) > duplicate_tolerance) {
+                        warn_if_polluted(
+                            frequency,
+                            "tag " + to_string(tag_contrast.tag),
+                            material_k,
+                            h_max);
+                    }
+                }
+            }
+
+            cout << "Solving f=" << frequency << " Hz, k0=" << k0
+                 << ", " << number_of_dtn_modes << " DtN modes...\n";
 
             ProfileMatrix<complexe> system = stiffness;
-            Fem::B_matrix(mesh, system, k0, kd, -1.0);
+            if (nodal_sound_speed.has_value()) {
+                Fem::B_matrix_from_nodal_sound_speed(
+                    mesh, system, omega, *nodal_sound_speed, -1.0);
+            } else if (config.legacy_contrast_ratio.has_value()) {
+                const double kd = k0 / *config.legacy_contrast_ratio;
+                Fem::B_matrix(mesh, system, k0, kd, -1.0);
+            } else {
+                Fem::B_matrix_by_tag(mesh, system, k0, contrasts_by_tag, -1.0);
+            }
 
             FullMatrix<complexe> e_left =
                 Fem::compute_E(mesh, number_of_dtn_modes, left_tag, k0);
@@ -490,25 +743,35 @@ int main(int argc, char** argv) {
             for (int mode : config.modes) {
                 const complexe beta = Fem::compute_beta(k0, mesh.Ly, mode);
                 if (abs(imag(beta)) > 1e-12) {
-                    cerr << "Attention: le mode incident " << mode << " est evanescent a "
+                    cerr << "Warning: incident mode " << mode << " is evanescent at "
                          << frequency << " Hz.\n";
                 }
 
-                const vector<complexe> source =
-                    Fem::assemble_source_vector(mesh, e_left, mode, k0, mesh.xmin, 1.0);
-                vector<complexe> field(mesh.ndof());
-                system.solve(field, source);
+                for (int incidence : config.incidences) {
+                    const bool from_left = (incidence == -1);
+                    const FullMatrix<complexe>& source_e = from_left ? e_left : e_right;
+                    const double source_x = from_left ? mesh.xmin : mesh.xmax;
+                    const double phase_sign = from_left ? 1.0 : -1.0;
+                    const vector<complexe> source =
+                        Fem::assemble_source_vector(
+                            mesh, source_e, mode, k0, source_x, phase_sign);
+                    vector<complexe> field(mesh.ndof());
+                    system.solve(field, source);
 
-                export_boundary(left_output, left_evaluations, field, frequency, k0, mode);
-                export_boundary(right_output, right_evaluations, field, frequency, k0, mode);
-                export_field(field_output, mesh, field, frequency, k0, mode);
+                    export_boundary(left_output, left_evaluations, field,
+                                    incidence, frequency, k0, mode);
+                    export_boundary(right_output, right_evaluations, field,
+                                    incidence, frequency, k0, mode);
+                    export_field(field_output, mesh, field,
+                                 incidence, frequency, k0, mode);
+                }
             }
         }
 
-        cout << "Donnees FEM/PINN generees dans " << config.output_dir << '\n';
+        cout << "FEM/PINN data written to " << config.output_dir << '\n';
         return 0;
     } catch (const exception& error) {
-        cerr << "Erreur: " << error.what() << '\n';
+        cerr << "Error: " << error.what() << '\n';
         return 1;
     }
 }

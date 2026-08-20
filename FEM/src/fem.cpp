@@ -1,8 +1,40 @@
 #include "fem.hpp"
 
+namespace {
+
+template <typename WavenumberForTriangle>
+void assemble_B_matrix(const usim::MeshP2& mesh, ProfileMatrix<complexe>& B,
+                       double factor, WavenumberForTriangle wavenumber_for_triangle) {
+    auto qp = Fem::get_quadrature_points();
+    std::vector<double> phi(6);
+
+    for (const auto& tri : mesh.triangles) {
+        usim::Point2D p0 = mesh.nodes[tri.node_ids[0]];
+        usim::Point2D p1 = mesh.nodes[tri.node_ids[1]];
+        usim::Point2D p2 = mesh.nodes[tri.node_ids[2]];
+
+        double detJac = (p1.x-p0.x)*(p2.y-p0.y)-(p1.y-p0.y)*(p2.x-p0.x);
+        double k = wavenumber_for_triangle(tri);
+
+        for (const auto& q : qp) {
+            Fem::evaluate_shape_functions(q.x, q.y, phi);
+            double weight = q.w * std::abs(detJac);
+
+            for (int i = 0; i < 6; ++i) {
+                for (int j = 0; j <= i; ++j) {
+                    double val = phi[i] * phi[j] * weight * (k * k);
+                    B(tri.node_ids[i], tri.node_ids[j]) += val * factor;
+                }
+            }
+        }
+    }
+}
+
+} // namespace
+
 namespace Fem {
 
-// Ordre des noeuds : 0,1,2 (sommets) puis 3,4,5 (milieux)
+// Node order: 0,1,2 (vertices), then 3,4,5 (midpoints).
 
 void evaluate_shape_functions(double x, double y, std::vector<double>& phi) {
 
@@ -10,13 +42,13 @@ void evaluate_shape_functions(double x, double y, std::vector<double>& phi) {
     double lambda2 = x;
     double lambda3 = y;
 
-    phi[0] = lambda1 * (2.0 * lambda1 - 1.0); // Sommet 0
-    phi[1] = lambda2 * (2.0 * lambda2 - 1.0); // Sommet 1
-    phi[2] = lambda3 * (2.0 * lambda3 - 1.0); // Sommet 2
+    phi[0] = lambda1 * (2.0 * lambda1 - 1.0); // Vertex 0.
+    phi[1] = lambda2 * (2.0 * lambda2 - 1.0); // Vertex 1.
+    phi[2] = lambda3 * (2.0 * lambda3 - 1.0); // Vertex 2.
 
-    phi[3] = 4.0 * lambda1 * lambda2; // Milieu arête 0-1
-    phi[4] = 4.0 * lambda2 * lambda3; // Milieu arête 1-2
-    phi[5] = 4.0 * lambda1 * lambda3; // Milieu arête 0-2
+    phi[3] = 4.0 * lambda1 * lambda2; // Midpoint of edge 0-1.
+    phi[4] = 4.0 * lambda2 * lambda3; // Midpoint of edge 1-2.
+    phi[5] = 4.0 * lambda1 * lambda3; // Midpoint of edge 0-2.
 }
 
 void evaluate_gradients(double x, double y, FullMatrix<double>& grads) {
@@ -90,7 +122,7 @@ void reorder_mesh_rcm(usim::MeshP2& mesh) {
     int n = mesh.nodes.size();
     if (n == 0) return;
 
-    // 1. Construction du graphe d'adjacence
+    // 1. Build the adjacency graph.
     std::vector<std::set<int>> adj(n);
     for(const auto& tri : mesh.triangles) {
         for(int i=0; i<6; ++i) {
@@ -103,8 +135,8 @@ void reorder_mesh_rcm(usim::MeshP2& mesh) {
         }
     }
 
-    // 2. Recherche d'un noeud de départ pseudo-périphérique
-    // Heuristique : noeud de degré min, puis BFS pour trouver le plus éloigné
+    // 2. Find a pseudo-peripheral starting node.
+    // Heuristic: minimum-degree node, then BFS to find the farthest node.
     int start_node = 0;
     std::size_t min_deg = n + 1;
     for(int i=0; i<n; ++i) {
@@ -137,7 +169,7 @@ void reorder_mesh_rcm(usim::MeshP2& mesh) {
     std::vector<bool> visited(n, false);
 
     for(int i=0; i<n; ++i) {
-        // Gestion des composantes connexes (si le maillage est en plusieurs morceaux)
+        // Handle disconnected components (if the mesh has multiple pieces).
         int root = (i == 0) ? start_node : i;
         if(visited[root]) continue;
 
@@ -149,12 +181,12 @@ void reorder_mesh_rcm(usim::MeshP2& mesh) {
         while(!q.empty()) {
             int u = q.front(); q.pop();
 
-            // Récupérer les voisins non visités
+            // Collect unvisited neighbors.
             std::vector<int> neighbors;
             for(int v : adj[u]) {
                 if(!visited[v]) neighbors.push_back(v);
             }
-            // Trier par degré croissant
+            // Sort by increasing degree.
             std::sort(neighbors.begin(), neighbors.end(), [&](int a, int b){
                 return adj[a].size() < adj[b].size();
             });
@@ -170,7 +202,7 @@ void reorder_mesh_rcm(usim::MeshP2& mesh) {
     // 4. Reverse (RCM)
     std::reverse(perm.begin(), perm.end());
 
-    // 5. Application de la permutation au maillage
+    // 5. Apply the permutation to the mesh.
     std::vector<int> old_to_new(n);
     std::vector<usim::Point2D> new_nodes(n);
     for(int i=0; i<n; ++i) {
@@ -190,16 +222,16 @@ void reorder_mesh_rcm(usim::MeshP2& mesh) {
         std::size_t ndof = mesh.ndof();
         std::vector<std::size_t> p(ndof);
         
-        // Initialisation : p[i] = i (au moins la diagonale)
+        // Initialization: p[i] = i (at least the diagonal).
         for(std::size_t i=0; i<ndof; ++i) p[i] = i;
 
-        // Parcours des éléments pour mettre à jour la largeur de bande
+        // Traverse elements to update the bandwidth.
         for(const auto& tri : mesh.triangles) {
             for(int i=0; i<6; ++i) {
-                int u = tri.node_ids[i]; // Ligne potentielle
+                int u = tri.node_ids[i]; // Potential row.
                 for(int j=0; j<6; ++j) {
-                    int v = tri.node_ids[j]; // Colonne potentielle
-                    // Si v < p[u], on élargit le profil
+                    int v = tri.node_ids[j]; // Potential column.
+                    // If v < p[u], widen the profile.
                     if (v < static_cast<int>(p[u])) {
                         p[u] = v;
                     }
@@ -211,33 +243,33 @@ void reorder_mesh_rcm(usim::MeshP2& mesh) {
 
 std::vector<std::size_t> compute_profile_enhanced(const usim::MeshP2& mesh, const std::vector<int>& boundary_tags){
 
-    // 1. Profil standard basé sur les triangles
+    // 1. Standard profile based on triangles.
     std::vector<std::size_t> p = compute_profile(mesh);
 
-    // 2. Élargissement du profil pour les frontières
+    // 2. Widen the profile for boundary terms.
 
     for (int tag : boundary_tags) {
         std::vector<int> boundary_nodes;
-        // On parcourt les arêtes pour trouver les noeuds du bord 'tag'
+        // Traverse edges to find nodes on the boundary with the given tag.
         for(const auto& tri : mesh.triangles) {
             for(int i=0; i<3; ++i) {
                 if(tri.edge_ref[i] == tag) {
-                    // Les 3 noeuds de l'arête (2 sommets + 1 milieu)
+                    // The three edge nodes (two vertices and one midpoint).
                     boundary_nodes.push_back(tri.node_ids[i]);
                     boundary_nodes.push_back(tri.node_ids[(i+1)%3]);
                     boundary_nodes.push_back(tri.node_ids[i+3]);
                 }
             }
         }
-        // Suppression des doublons
+        // Remove duplicates.
         std::sort(boundary_nodes.begin(), boundary_nodes.end());
         boundary_nodes.erase(std::unique(boundary_nodes.begin(), boundary_nodes.end()), boundary_nodes.end());
 
-        // Pour chaque paire de noeuds (u, v) sur ce bord, on met à jour le profil
-        // car la matrice T va créer un coefficient non nul entre eux.
+        // For every node pair (u, v) on this boundary, update the profile
+        // because matrix T creates a non-zero coefficient between them.
         for (int u : boundary_nodes) {
             for (int v : boundary_nodes) {
-                if (u > v) { // On ne stocke que le triangle inférieur
+                if (u > v) { // Store only the lower triangle.
                     if (v < static_cast<int>(p[u])) {
                         p[u] = v;
                     }
@@ -251,7 +283,7 @@ std::vector<std::size_t> compute_profile_enhanced(const usim::MeshP2& mesh, cons
 double get_max_edge_length(const usim::MeshP2& mesh) {
     double h_max = 0.0;
     for (const auto& tri : mesh.triangles) {
-        // On vérifie les 3 arêtes principales du triangle (sommets 0-1, 1-2, 2-0)
+        // Check the three main triangle edges (vertices 0-1, 1-2, 2-0).
         int vertices[3] = {tri.node_ids[0], tri.node_ids[1], tri.node_ids[2]};
         for (int i = 0; i < 3; ++i) {
             usim::Point2D p1 = mesh.nodes[vertices[i]];
@@ -273,7 +305,8 @@ void A_matrix(const usim::MeshP2& mesh, ProfileMatrix<complexe>& A, double facto
         usim::Point2D p1 = mesh.nodes[tri.node_ids[1]];
         usim::Point2D p2 = mesh.nodes[tri.node_ids[2]];
 
-        //Passage (Reference -> Réel) F(S) = Bl*S + bl avec bl = S0, Bl = [S1-S0,S2-S0]
+        // Reference-to-physical map F(S) = B_l*S + b_l, with b_l = S0 and
+        // B_l = [S1-S0, S2-S0].
 
         double J00 = p1.x-p0.x; double J01 = p2.x-p0.x;
         double J10 = p1.y-p0.y; double J11 = p2.y-p0.y;
@@ -285,7 +318,7 @@ void A_matrix(const usim::MeshP2& mesh, ProfileMatrix<complexe>& A, double facto
         double iJ10 = -J10 * invDet;
         double iJ11 =  J00 * invDet;
 
-        // Boucle sur les points de quadrature
+    // Loop over quadrature points.
         for (const auto& q : qp) {
             evaluate_gradients(q.x, q.y, dphi_ref);
             double weight = q.w * std::abs(detJac) * factor;
@@ -333,38 +366,68 @@ void M_matrix(const usim::MeshP2& mesh, ProfileMatrix<complexe>& M, double facto
 }
 
 void B_matrix(const usim::MeshP2& mesh, ProfileMatrix<complexe>& B, double k0, double k_d_val, double factor){
-    auto qp = get_quadrature_points();
+    assemble_B_matrix(mesh, B, factor, [=](const usim::TriangleP2& tri) {
+        return tri.is_defect ? k_d_val : k0;
+    });
+}
+
+void B_matrix_by_tag(const usim::MeshP2& mesh, ProfileMatrix<complexe>& B, double k0,
+                     const std::map<int, double>& tag_contrasts, double factor) {
+    assemble_B_matrix(mesh, B, factor, [&](const usim::TriangleP2& tri) {
+        const auto match = tag_contrasts.find(tri.ref);
+        const double contrast = (match == tag_contrasts.end()) ? 1.0 : match->second;
+        return k0 / contrast;
+    });
+}
+
+void B_matrix_from_nodal_sound_speed(const usim::MeshP2& mesh,
+                                     ProfileMatrix<complexe>& B,
+                                     double omega,
+                                     const std::vector<double>& sound_speed,
+                                     double factor) {
+    if (sound_speed.size() != mesh.ndof()) {
+        throw std::invalid_argument(
+            "B_matrix_from_nodal_sound_speed: sound-speed size must equal mesh ndof");
+    }
+    if (!(omega > 0.0) || !std::isfinite(omega)) {
+        throw std::invalid_argument(
+            "B_matrix_from_nodal_sound_speed: omega must be finite and positive");
+    }
+    std::vector<double> squared_slowness(sound_speed.size());
+    for (std::size_t index = 0; index < sound_speed.size(); ++index) {
+        const double speed = sound_speed[index];
+        if (!(speed > 0.0) || !std::isfinite(speed)) {
+            throw std::invalid_argument(
+                "B_matrix_from_nodal_sound_speed: sound speeds must be finite and positive");
+        }
+        squared_slowness[index] = 1.0 / (speed * speed);
+    }
+
+    const auto quadrature_points = get_quadrature_points();
     std::vector<double> phi(6);
+    for (const auto& triangle : mesh.triangles) {
+        const auto& p0 = mesh.nodes[triangle.node_ids[0]];
+        const auto& p1 = mesh.nodes[triangle.node_ids[1]];
+        const auto& p2 = mesh.nodes[triangle.node_ids[2]];
+        const double determinant =
+            (p1.x - p0.x) * (p2.y - p0.y) - (p1.y - p0.y) * (p2.x - p0.x);
 
-    for (const auto& tri : mesh.triangles) {
-
-        // Coordonnées des 3 sommets du triangle (p0, p1, p2)
-
-        usim::Point2D p0 = mesh.nodes[tri.node_ids[0]];
-        usim::Point2D p1 = mesh.nodes[tri.node_ids[1]];
-        usim::Point2D p2 = mesh.nodes[tri.node_ids[2]];
-
-        // detJ (Jacobien géométrique)
-        double detJac = (p1.x-p0.x)*(p2.y-p0.y)-(p1.y-p0.y)*(p2.x-p0.x);
-
-        // CORRECTION : Utilisation de is_defect pour choisir le bon k
-        double k = (tri.is_defect) ? k_d_val : k0;
-
-        // Voir section 1.2 "Modélisation des défauts"
-
-        // Boucle quadrature
-        for (const auto& q : qp) {
-            evaluate_shape_functions(q.x, q.y, phi);
-
-            double weight = q.w * std::abs(detJac);
-
-            // Double boucle sur les fonctions de base
+        for (const auto& point : quadrature_points) {
+            evaluate_shape_functions(point.x, point.y, phi);
+            double material = 0.0;
+            for (int local = 0; local < 6; ++local) {
+                material += phi[local] * squared_slowness[triangle.node_ids[local]];
+            }
+            if (!(material > 0.0) || !std::isfinite(material)) {
+                throw std::runtime_error(
+                    "Non-positive interpolated squared slowness at a quadrature point");
+            }
+            const double weight = point.w * std::abs(determinant);
+            const double coefficient = omega * omega * material * weight * factor;
             for (int i = 0; i < 6; ++i) {
                 for (int j = 0; j <= i; ++j) {
-                    
-                    double val = phi[i] * phi[j] * weight * (k * k);
-                    
-                    B(tri.node_ids[i],tri.node_ids[j]) += val * factor;
+                    B(triangle.node_ids[i], triangle.node_ids[j]) +=
+                        coefficient * phi[i] * phi[j];
                 }
             }
         }
@@ -372,7 +435,7 @@ void B_matrix(const usim::MeshP2& mesh, ProfileMatrix<complexe>& B, double k0, d
 }
 
 // -------------------------------------------------------------------------
-// Quadrature 1D (Gauss-Legendre) pour les bords
+// One-dimensional Gauss-Legendre quadrature on boundaries.
 // -------------------------------------------------------------------------
 std::vector<QuadraturePoint> get_quadrature_points_1d(){
     std::vector<QuadraturePoint> qp(3);
@@ -385,11 +448,11 @@ std::vector<QuadraturePoint> get_quadrature_points_1d(){
     return qp;
 }
 
-// phi[0] : t=-1 (gauche), phi[1] : t=1 (droite), phi[2] : t=0 (milieu)
+// phi[0]: t=-1 (left), phi[1]: t=1 (right), phi[2]: t=0 (midpoint).
 void evaluate_shape_functions_1d(double t, std::vector<double>& phi){
-    phi[0] = 0.5 * t * (t - 1.0); // Sommet gauche
-    phi[1] = 0.5 * t * (t + 1.0); // Sommet droite
-    phi[2] = 1.0 - t * t;         // Milieu
+    phi[0] = 0.5 * t * (t - 1.0); // Left endpoint.
+    phi[1] = 0.5 * t * (t + 1.0); // Right endpoint.
+    phi[2] = 1.0 - t * t;         // Midpoint.
 }
 
 double evaluate_c_1d(double y, double h, int n){
@@ -404,53 +467,54 @@ complexe compute_beta(double k0, double h, int n){
 FullMatrix<complexe> compute_E(const usim::MeshP2& mesh, int N_modes, int boundary_tag, [[maybe_unused]] double k0) {
     
     int ndof = mesh.ndof();
-    // E est une matrice (Ndof x N_modes)
+    // E is an (Ndof x N_modes) matrix.
     FullMatrix<complexe> E(ndof, N_modes); 
 
-    auto qp = get_quadrature_points_1d(); // Quadrature de Gauss 1D
+    auto qp = get_quadrature_points_1d(); // One-dimensional Gauss quadrature.
     std::vector<double> phi_1d(3);
-    double h = mesh.Ly; // Hauteur du guide
+    double h = mesh.Ly; // Waveguide height.
 
-    // Boucle sur tous les triangles pour trouver les arêtes du bord
+    // Traverse all triangles to find boundary edges.
     for (const auto& tri : mesh.triangles) {
         for (int edge_i = 0; edge_i < 3; ++edge_i) {
             
-            // Si l'arête est sur la frontière demandée (ex: tag 1 pour gauche, 2 pour droite)
+            // If the edge belongs to the requested boundary (for example, tag 1
+            // for the left side or tag 2 for the right side).
             if (tri.edge_ref[edge_i] == boundary_tag) {
                 
-                // Indices locaux des noeuds de l'arête (A, B) et milieu (M)
+                // Local node indices for the edge endpoints (A, B) and midpoint (M).
                 int idx_A = edge_i;
                 int idx_B = (edge_i + 1) % 3;
                 int idx_M = edge_i + 3;
 
-                // Indices globaux dans la matrice
+                // Global matrix indices.
                 int nodes_global[3] = {
                     tri.node_ids[idx_A],
                     tri.node_ids[idx_B], 
                     tri.node_ids[idx_M]
                 };
 
-                // Coordonnées physiques pour calculer la longueur (Jacobien)
+                // Physical coordinates used to compute the edge length (Jacobian).
                 usim::Point2D A = mesh.nodes[nodes_global[0]];
                 usim::Point2D B = mesh.nodes[nodes_global[1]];
                 
-                // Longueur de l'arête (segment vertical)
+                // Edge length (vertical segment).
                 double edge_length = std::sqrt(std::pow(B.x - A.x, 2) + std::pow(B.y - A.y, 2));
                 double detJac = edge_length / 2.0;
 
-                // Boucle sur les points d'intégration
+                // Loop over integration points.
                 for (const auto& q : qp) {
-                    double t = q.x; // Coordonnée ref [-1, 1]
+                    double t = q.x; // Reference coordinate in [-1, 1].
                     double w = q.w;
                     
-                    // 1. Fonctions de forme 1D au point t
+                    // 1. One-dimensional shape functions at t.
                     evaluate_shape_functions_1d(t, phi_1d);
 
-                    // 2. Coordonnée physique Y au point d'intégration
+                    // 2. Physical Y coordinate at the integration point.
 
-                    double y_phys = 0.5 * ((B.y + A.y) + t * (B.y - A.y)) - mesh.ymin; // Shift si le maillage n'est pas centré
+                    double y_phys = 0.5 * ((B.y + A.y) + t * (B.y - A.y)) - mesh.ymin; // Shift if the mesh is not centered.
 
-                    // 3. Remplissage de E
+                    // 3. Fill E.
                     for (int i = 0; i < 3; ++i) {
                         for (int n = 0; n < N_modes; ++n) {
 
@@ -479,10 +543,10 @@ void T_matrix(ProfileMatrix<complexe>& K, FullMatrix<complexe>& E, FullMatrix<co
     int Ndof = E.rows();
     int Nmodes = D.rows();
 
-    // Optimisation : Identifier les DOFs actifs (ceux sur le bord)
-    // E est creuse (non nulle seulement sur le bord), on évite la boucle N^2
+    // Optimization: identify active DOFs (those on the boundary).
+    // E is sparse (non-zero only on the boundary), so avoid an N^2 loop.
     std::vector<int> active_dofs;
-    active_dofs.reserve(Ndof / 10); // Estimation
+    active_dofs.reserve(Ndof / 10); // Estimate.
     for(int i=0; i<Ndof; ++i) {
         for(int n=0; n<Nmodes; ++n) {
             if(std::abs(E(i,n)) > 1e-14) { active_dofs.push_back(i); break; }
@@ -492,11 +556,11 @@ void T_matrix(ProfileMatrix<complexe>& K, FullMatrix<complexe>& E, FullMatrix<co
     for (int i : active_dofs) {
         
         for (int j : active_dofs) { 
-            if (j > i) continue; // Symétrie : j <= i
+            if (j > i) continue; // Symmetry: j <= i.
             complexe val_T_ij = 0.0;
             
             for (int n = 0; n < Nmodes; ++n) {
-                // Calcul à la volée pour économiser la matrice temporaire ED
+                // Compute on the fly to avoid a temporary ED matrix.
                 val_T_ij += E(i, n) * D(n, n) * E(j, n);
             }
 
@@ -515,7 +579,7 @@ std::vector<complexe> assemble_source_vector(const usim::MeshP2& mesh, const Ful
     complexe beta = compute_beta(k0, mesh.Ly, n_inc);
     complexe coeff = -2.0 * std::complex<double>(0,1) * beta * std::exp(coef*std::complex<double>(0,1) * beta * L);
 
-    // Remplissage du vecteur
+    // Fill the vector.
 
     for (int i = 0; i < Ndof; ++i) {
         G[i] = coeff * E(i, n_inc); 

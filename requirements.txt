@@ -11,6 +11,10 @@ optax
 # Scientific computing and data analysis
 numpy
 pandas
+scipy
 
 # Plotting and visualization
 matplotlib
+
+# Test suite
+pytest

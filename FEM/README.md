@@ -1,102 +1,87 @@
-# FEM Data Generator for the PINN
+# P2 FEM data generator
 
-This directory contains a P2 FEM solver for a rectangular acoustic waveguide
-and the `generate_pinn_data.x` executable. The generator solves the Helmholtz
-problem for multiple frequencies and incident modes, then exports the complex
-traces used by the PINN along with the P2 geometric matrices.
+`generate_pinn_data.x` solves the Helmholtz problem in a rectangular acoustic
+waveguide and exports the fields, boundary traces, mesh, mass matrix, and
+stiffness matrix used by the PINN workflows.
 
-## Expected Mesh
+Run the examples below from the repository root.
 
-The mesh must use the Gmsh v2 ASCII format and the following physical groups:
-
-- background surface: tag `1`;
-- defect: tag `2`;
-- left port at `x=-L`: tag `11`;
-- right port at `x=+L`: tag `12`;
-- top and bottom boundaries: tags `13` and `14`.
-
-The domain must be horizontally centered, and both ports must span the full
-height of the waveguide.
-
-## Building
-
-With Make:
+## Build
 
 ```bash
-make
+make -C FEM
 ```
 
-With CMake:
+The executable is `FEM/generate_pinn_data.x`. A CMake build is also available:
 
 ```bash
-cmake -S . -B cmake-build
-cmake --build cmake-build
+cmake -S FEM -B FEM/cmake-build
+cmake --build FEM/cmake-build
 ```
 
-Make creates `./generate_pinn_data.x`; CMake creates
-`cmake-build/generate_pinn_data.x`.
+## Mesh contract
 
-## Usage
+Input meshes must be Gmsh v2 ASCII files with these physical tags:
+
+- surface `1`: healthy background;
+- surfaces `2`, `3`, ...: material regions;
+- curves `11` and `12`: complete left and right ports;
+- curves `13` and `14`: top and bottom rigid walls.
+
+The domain must be horizontally centered. Exported P2 degrees of freedom use
+reverse Cuthill–McKee (RCM) ordering.
+
+## Generate a dataset
+
+This command generates the data expected by the
+`circlebottomright_1200_A.json` inverse configuration:
 
 ```bash
-./generate_pinn_data.x \
-  --mesh data/test_us_barhalfup_centree.msh \
-  --defectname barhalfup \
-  --freqs 600,800 \
-  --modes 0,1,2 \
-  --outputdir ../pinn_waveguide_2d/data \
+FEM/generate_pinn_data.x \
+  --mesh FEM/data/test_us_defaut_circlebottomright.msh \
+  --defectname circlebottomright \
+  --freqs 1200 \
+  --modes 0,1,2,3 \
+  --outputdir FEM/pinn_data \
   --c0 340 \
-  --contrast 0.8 \
+  --tag-contrasts 2:0.8 \
+  --incidence -1 \
   --numberofdatapoints 31
 ```
 
-Required arguments:
+Required options are `--mesh`, `--defectname`, `--freqs`, `--modes`,
+`--outputdir`, and `--c0`, plus exactly one material definition:
 
-- `--mesh`: path to the mesh;
-- `--defectname`: identifier used in file names;
-- `--freqs`: comma-separated positive frequencies;
-- `--modes`: comma-separated mode indices;
-- `--outputdir`: output directory, created if necessary;
-- `--c0`: wave speed in the background medium;
-- `--contrast`: `c_defect/c0` ratio.
+- `--contrast 0.8`: legacy `c_defect/c0` ratio for surface `2`;
+- `--tag-contrasts 2:0.8,3:1.2`: one `c_tag/c0` ratio per material tag;
+- `--nodal-sound-speed PATH`: continuous sound-speed map with the header
+  `node_id,x,y,c` and one row per reordered P2 degree of freedom.
 
-`--numberofdatapoints N` requests exactly `N` uniformly spaced points per port,
-including the endpoints. Values are interpolated using the P2 shape functions.
-If this option is omitted, all P2 degrees of freedom on the ports are exported.
+Unlisted material tags use `c0`. `--incidence` accepts `-1`, `1`, or `-1,1`
+and defaults to `-1` (source from the left). `--numberofdatapoints N` exports
+`N` uniformly spaced samples per port; without it, all port P2 nodes are used.
 
-The ratio is encoded without a decimal point: `0.8` becomes `ratio0p8`.
+Use `FEM/generate_pinn_data.x --help` for the complete CLI reference.
 
-## Generated Files
+## Outputs
 
-For `defectname=barhalfup` and `contrast=0.8`:
-
-- `pinn_boundary_left_barhalfup_ratio0p8.csv`;
-- `pinn_boundary_right_barhalfup_ratio0p8.csv`;
-- `Stiff_matrix_barhalfup.csv`;
-- `Mass_matrix_barhalfup.csv`;
-- `fem_field_barhalfup_ratio0p8.csv`.
-
-The boundary files contain all frequencies and modes:
+With `--defectname circlebottomright` and `--tag-contrasts`, the generated
+files are:
 
 ```text
-f,k0,mode,x,y,Re_U,Im_U
+pinn_boundary_left_circlebottomright.csv
+pinn_boundary_right_circlebottomright.csv
+fem_field_circlebottomright.csv
+Stiff_matrix_circlebottomright.csv
+Mass_matrix_circlebottomright.csv
+mesh_nodes_circlebottomright.csv
+mesh_triangles_circlebottomright.csv
 ```
 
-The field file contains all P2 degrees of freedom in the RCM ordering shared
-with the matrices:
+The legacy `--contrast` option adds a `_ratio...` suffix to the boundary and
+field filenames. Matrices and mesh files always use only `defectname`.
 
-```text
-f,k0,mode,node_id,x,y,Re_U,Im_U
-```
-
-The stiffness and mass matrices are purely geometric and independent of the
-frequency and wave-speed ratio. They are stored in COO format using only their
-lower triangles:
-
-```text
-row,col,value
-```
-
-To reconstruct a full matrix, copy each off-diagonal entry to its symmetric
-position. Indices are zero-based and correspond directly to the field file's
-`node_id` values.
+Boundary rows follow
+`incidence,f,k0,mode,x,y,Re_U,Im_U`; field rows add `node_id` before `x`.
+Mass and stiffness matrices are lower-triangular COO files with
+`row,col,value`; their zero-based indices match the exported mesh and field.
