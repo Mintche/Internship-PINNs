@@ -454,13 +454,23 @@ def pressure_gradient_statistics(
     weights,
     *,
     freeze_sigma: bool,
+    include_data: bool = True,
+    homogeneous_material: bool = False,
 ) -> dict[str, jax.Array]:
     def component_gradient(component):
         def objective(params):
             if freeze_sigma:
                 params = {**params, "sigma": jax.lax.stop_gradient(params["sigma"])}
             value, values = pressure_objective(
-                params, material_params, physics, context, variant, points, weights
+                params,
+                material_params,
+                physics,
+                context,
+                variant,
+                points,
+                weights,
+                include_data=include_data,
+                homogeneous_material=homogeneous_material,
             )
             return value if component == "objective" else values[component]
         return jax.grad(objective)(field_params)
@@ -468,6 +478,81 @@ def pressure_gradient_statistics(
     names = (*FIELD_COMPONENTS, "objective")
     gradients = {name: component_gradient(name) for name in names}
     return {f"{name}_gradient_l2_norm": tree_l2_norm(gradients[name]) for name in names}
+
+
+def field_component_gradient_norms(
+    field_params: Mapping[str, Any],
+    material_params: Mapping[str, Any],
+    physics: PhysicsContext,
+    context: CaseContext,
+    variant: VariantSpec,
+    points: CollocationPoints,
+    *,
+    freeze_sigma: bool,
+    include_data: bool = True,
+    homogeneous_material: bool = False,
+) -> jax.Array:
+    """Return only the four raw field-component norms used by adweights."""
+
+    def component_norm(component: str) -> jax.Array:
+        def objective(candidate):
+            if freeze_sigma:
+                candidate = {
+                    **candidate,
+                    "sigma": jax.lax.stop_gradient(candidate["sigma"]),
+                }
+            return pressure_loss_components(
+                candidate,
+                material_params,
+                physics,
+                context,
+                variant,
+                points,
+                include_data=include_data,
+                homogeneous_material=homogeneous_material,
+            )[component]
+
+        return tree_l2_norm(jax.grad(objective)(field_params))
+
+    return jnp.stack(tuple(component_norm(name) for name in FIELD_COMPONENTS))
+
+
+def packed_field_component_gradient_norms(
+    packed_field_params: Mapping[str, Any],
+    material_params: Mapping[str, Any],
+    physics: PhysicsContext,
+    contexts: Sequence[CaseContext],
+    b_bases: jax.Array,
+    variant: VariantSpec,
+    points: CollocationPoints,
+    *,
+    freeze_sigma: bool,
+    include_data: bool = True,
+    homogeneous_material: bool = False,
+) -> jax.Array:
+    """Return an ``(acquisition, component)`` matrix for a compiled evaluator."""
+    contexts = tuple(contexts)
+    field_params = unpack_field_parameters(packed_field_params)
+    if len(field_params) != len(contexts):
+        raise ValueError("Packed field parameters and contexts are not aligned")
+    if b_bases.shape[0] != len(contexts):
+        raise ValueError("Packed Fourier bases have an invalid leading dimension")
+    return jnp.stack(
+        tuple(
+            field_component_gradient_norms(
+                params,
+                material_params,
+                physics,
+                replace(context, b_base=b_base),
+                variant,
+                points,
+                freeze_sigma=freeze_sigma,
+                include_data=include_data,
+                homogeneous_material=homogeneous_material,
+            )
+            for params, context, b_base in zip(field_params, contexts, b_bases)
+        )
+    )
 
 
 def material_snapshot_statistics(
@@ -567,6 +652,36 @@ def material_case_gradient_norms(
         )(material_params)
         norms.append(tree_l2_norm(gradient))
     return jnp.stack(tuple(norms))
+
+
+def packed_material_case_gradient_norms(
+    material_params: Mapping[str, Any],
+    packed_field_params: Mapping[str, Any],
+    physics: PhysicsContext,
+    contexts: Sequence[CaseContext],
+    b_bases: jax.Array,
+    variant: VariantSpec,
+    points: CollocationPoints,
+) -> jax.Array:
+    """Return all material case-gradient norms from one compiled call."""
+    contexts = tuple(contexts)
+    field_params = unpack_field_parameters(packed_field_params)
+    if len(field_params) != len(contexts):
+        raise ValueError("Packed field parameters and contexts are not aligned")
+    if b_bases.shape[0] != len(contexts):
+        raise ValueError("Packed Fourier bases have an invalid leading dimension")
+    dynamic_contexts = tuple(
+        replace(context, b_base=b_base)
+        for context, b_base in zip(contexts, b_bases)
+    )
+    return material_case_gradient_norms(
+        material_params,
+        field_params,
+        physics,
+        dynamic_contexts,
+        variant,
+        points,
+    )
 
 
 def physical_pressure_prediction(

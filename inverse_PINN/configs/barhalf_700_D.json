@@ -3,7 +3,7 @@
     "height": 0.6,
     "half_length": 1.0,
     "c0": 340.0,
-    "celerity_ratio_bounds": [0.6, 1.4],
+    "celerity_ratio_bounds": [0.6, 1.01],
 "truth_regions": [
   {
     "shape": "rectangle",

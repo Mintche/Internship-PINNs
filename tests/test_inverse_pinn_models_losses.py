@@ -11,9 +11,14 @@ from inverse_PINN.data import BoundaryTrace
 from inverse_PINN.losses import (
     build_case_context,
     build_physics_context,
+    field_component_gradient_norms,
+    material_case_gradient_norms,
     material_objective,
+    packed_field_component_gradient_norms,
+    packed_material_case_gradient_norms,
     pair_to_complex,
     pointwise_pde_residual,
+    pressure_gradient_statistics,
     pressure_loss_components,
 )
 from inverse_PINN.models import (
@@ -216,3 +221,88 @@ def test_tv_value_and_gradient_are_not_evaluated_when_disabled(monkeypatch):
     )
     assert diagnostics["tv"] is None
     assert diagnostics["tv_gradient_norm"] is None
+
+
+def test_compiled_packed_adweight_norms_match_direct_evaluators():
+    variant, physics, field, material, context, points = _physics_fixture()
+    packed = pack_field_parameters((field.params, field.params))
+    contexts = (context, context)
+    b_bases = jnp.stack((field.b_base, field.b_base))
+
+    compiled_field = jax.jit(
+        lambda packed_params, material_params, bases, batch: (
+            packed_field_component_gradient_norms(
+                packed_params,
+                material_params,
+                physics,
+                contexts,
+                bases,
+                variant,
+                batch,
+                freeze_sigma=False,
+            )
+        )
+    )
+    field_norms = compiled_field(packed, material, b_bases, points)
+    statistics = pressure_gradient_statistics(
+        field.params,
+        material,
+        physics,
+        context,
+        variant,
+        points,
+        jnp.ones((4,)),
+        freeze_sigma=False,
+    )
+    expected_field = jnp.asarray(
+        [
+            statistics[f"{name}_gradient_l2_norm"]
+            for name in ("pde", "neumann", "dtn", "data")
+        ]
+    )
+    assert field_norms.shape == (2, 4)
+    np.testing.assert_allclose(field_norms[0], expected_field, rtol=2e-5, atol=1e-7)
+    np.testing.assert_allclose(field_norms[1], expected_field, rtol=2e-5, atol=1e-7)
+
+    compiled_material = jax.jit(
+        lambda material_params, packed_params, bases, batch: (
+            packed_material_case_gradient_norms(
+                material_params,
+                packed_params,
+                physics,
+                contexts,
+                bases,
+                variant,
+                batch,
+            )
+        )
+    )
+    material_norms = compiled_material(material, packed, b_bases, points)
+    expected_material = material_case_gradient_norms(
+        material,
+        (field.params,),
+        physics,
+        (context,),
+        variant,
+        points,
+    )[0]
+    assert material_norms.shape == (2,)
+    np.testing.assert_allclose(
+        material_norms, jnp.repeat(expected_material, 2), rtol=2e-5, atol=1e-7
+    )
+
+
+def test_warmup_field_adweight_data_norm_is_zero_when_data_is_excluded():
+    variant, physics, field, material, context, points = _physics_fixture()
+    norms = field_component_gradient_norms(
+        field.params,
+        material,
+        physics,
+        context,
+        variant,
+        points,
+        freeze_sigma=False,
+        include_data=False,
+        homogeneous_material=True,
+    )
+    assert float(norms[-1]) == 0.0

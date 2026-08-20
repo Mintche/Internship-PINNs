@@ -6,20 +6,27 @@
     "celerity_ratio_bounds": [0.6, 1.4],
 "truth_regions": [
   {
-    "shape": "rectangle",
-    "bounds": [-0.2, 0.2, 0.0, 0.3],
+    "shape": "circle",
+    "center": [-0.3, 0.4],
+    "radius": 0.1,
     "speed_ratio": 0.8
+  },
+  {
+    "shape": "circle",
+    "center": [0.3, 0.2],
+    "radius": 0.1,
+    "speed_ratio": 1.2
   }
 ]
   },
   "data": {
-    "boundary_left": "FEM/pinn_data/pinn_boundary_left_barhalf.csv",
-    "boundary_right": "FEM/pinn_data/pinn_boundary_right_barhalf.csv",
-    "fem_field": "FEM/pinn_data/fem_field_barhalf.csv",
-    "mass_matrix": "FEM/pinn_data/Mass_matrix_barhalf.csv",
-    "stiffness_matrix": "FEM/pinn_data/Stiff_matrix_barhalf.csv",
-    "mesh_nodes": "FEM/pinn_data/mesh_nodes_barhalf.csv",
-    "mesh_triangles": "FEM/pinn_data/mesh_triangles_barhalf.csv"
+    "boundary_left": "FEM/pinn_data/pinn_boundary_left_twocirc.csv",
+    "boundary_right": "FEM/pinn_data/pinn_boundary_right_twocirc.csv",
+    "fem_field": "FEM/pinn_data/fem_field_twocirc.csv",
+    "mass_matrix": "FEM/pinn_data/Mass_matrix_twocirc.csv",
+    "stiffness_matrix": "FEM/pinn_data/Stiff_matrix_twocirc.csv",
+    "mesh_nodes": "FEM/pinn_data/mesh_nodes_twocirc.csv",
+    "mesh_triangles": "FEM/pinn_data/mesh_triangles_twocirc.csv"
   },
   "models": {
     "fourier_features": 64,
@@ -51,7 +58,7 @@
     "field_learning_rate": 0.001,
     "material_learning_rate": 0.001,
     "cosine_decay_start": 10000,
-    "consine_decay_stop": 15000,
+    "consine_decay_stop": 20000,
     "cosine_decay_alpha": 0.1,
     "sigma_learning_rate": 0.01,
     "sigma_decay_fraction": 0.5,
@@ -80,7 +87,10 @@
     {
       "cases": {
         "-1": {
-          "700": [0,1,2]
+          "1200": [0,1,2,3]
+        },
+        "1": {
+          "1200": [0,1,2,3]
         }
       },
       "warmup": {

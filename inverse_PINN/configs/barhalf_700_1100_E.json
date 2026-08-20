@@ -3,7 +3,7 @@
     "height": 0.6,
     "half_length": 1.0,
     "c0": 340.0,
-    "celerity_ratio_bounds": [0.6, 1.4],
+    "celerity_ratio_bounds": [0.6, 1.01],
 "truth_regions": [
   {
     "shape": "rectangle",
@@ -51,7 +51,7 @@
     "field_learning_rate": 0.001,
     "material_learning_rate": 0.001,
     "cosine_decay_start": 10000,
-    "consine_decay_stop": 15000,
+    "consine_decay_stop": 20000,
     "cosine_decay_alpha": 0.1,
     "sigma_learning_rate": 0.01,
     "sigma_decay_fraction": 0.5,
@@ -81,6 +81,9 @@
       "cases": {
         "-1": {
           "700": [0,1,2]
+        },
+        "1": {
+          "700": [0,1,2]
         }
       },
       "warmup": {
@@ -88,7 +91,24 @@
         "lbfgs_steps": 0
       },
       "inverse": {
-        "adam_steps": 40000,
+        "adam_steps": 30000,
+        "lbfgs_cycles": 0,
+        "lbfgs_field_steps": 0,
+        "lbfgs_material_steps": 0
+      }
+    },
+    {
+      "cases": {
+        "-1": {
+          "700": [0,1,2],"1100": [0,1,2,3]
+        }
+      },
+      "warmup": {
+        "adam_steps": 5000,
+        "lbfgs_steps": 0
+      },
+      "inverse": {
+        "adam_steps": 20000,
         "lbfgs_cycles": 0,
         "lbfgs_field_steps": 0,
         "lbfgs_material_steps": 0

@@ -35,9 +35,10 @@ from .losses import (
     build_case_context,
     build_physics_context,
     celerity_metrics,
-    material_case_gradient_norms,
     material_objective,
     material_snapshot_statistics,
+    packed_field_component_gradient_norms,
+    packed_material_case_gradient_norms,
     packed_pressure_objective,
     physical_pressure_prediction,
     pressure_gradient_statistics,
@@ -202,6 +203,12 @@ def _append_adweight_rows(
     labels: Sequence[str],
     case_id: str,
 ) -> None:
+    lambdas, inverse_weights, effective_weights = (
+        np.asarray(value)
+        for value in jax.device_get(
+            (state.lambdas, state.inverse_weights, state.effective_weights)
+        )
+    )
     for index, label in enumerate(labels):
         rows.append(
             {
@@ -210,9 +217,9 @@ def _append_adweight_rows(
                 "scope": scope,
                 "case_id": case_id,
                 "component": label,
-                "lambda": _float(state.lambdas[index]),
-                "inverse_weight": _float(state.inverse_weights[index]),
-                "effective_weight": _float(state.effective_weights[index]),
+                "lambda": float(lambdas[index]),
+                "inverse_weight": float(inverse_weights[index]),
+                "effective_weight": float(effective_weights[index]),
                 "update_index": state.update_index,
             }
         )
@@ -336,6 +343,59 @@ def _make_material_monitor(
         }
 
     return monitor
+
+
+def _make_field_adweight_evaluator(
+    physics,
+    contexts: Sequence[CaseContext],
+    variant: VariantSpec,
+    *,
+    freeze_sigma: bool,
+    include_data: bool = True,
+    homogeneous_material: bool = False,
+):
+    contexts = tuple(contexts)
+
+    @jax.jit
+    def evaluator(
+        packed_field_params, material_params, b_bases, points
+    ):
+        return packed_field_component_gradient_norms(
+            packed_field_params,
+            material_params,
+            physics,
+            contexts,
+            b_bases,
+            variant,
+            points,
+            freeze_sigma=freeze_sigma,
+            include_data=include_data,
+            homogeneous_material=homogeneous_material,
+        )
+
+    return evaluator
+
+
+def _make_material_adweight_evaluator(
+    physics,
+    contexts: Sequence[CaseContext],
+    variant: VariantSpec,
+):
+    contexts = tuple(contexts)
+
+    @jax.jit
+    def evaluator(material_params, packed_field_params, b_bases, points):
+        return packed_material_case_gradient_norms(
+            material_params,
+            packed_field_params,
+            physics,
+            contexts,
+            b_bases,
+            variant,
+            points,
+        )
+
+    return evaluator
 
 
 def _append_pressure_common_loss_row(
@@ -517,6 +577,28 @@ def _run_warmup(
             optimizer, physics, contexts, variant, config.sampling.adam,
             homogeneous_material=homogeneous_material, freeze_sigma=True,
         )
+        unfrozen_adweight_evaluator = (
+            _make_field_adweight_evaluator(
+                physics,
+                contexts,
+                variant,
+                freeze_sigma=False,
+                include_data=False,
+                homogeneous_material=homogeneous_material,
+            )
+            if variant.field_adweights else None
+        )
+        frozen_adweight_evaluator = (
+            _make_field_adweight_evaluator(
+                physics,
+                contexts,
+                variant,
+                freeze_sigma=True,
+                include_data=False,
+                homogeneous_material=homogeneous_material,
+            )
+            if variant.field_adweights else None
+        )
         compile_key = jax.random.key(
             stable_seed("compile", package_index, "warmup", len(cases))
         )
@@ -532,6 +614,22 @@ def _run_warmup(
                 jnp.stack(current_weights()), b_bases,
         )
         _ready(compiled)
+        if unfrozen_adweight_evaluator is not None:
+            compile_points = uniform_collocation_points(
+                compile_key, config.sampling.adam
+            )
+            _ready(
+                unfrozen_adweight_evaluator(
+                    packed_params, material_params, b_bases, compile_points
+                )
+            )
+            if train_steps < budget.adam_steps:
+                assert frozen_adweight_evaluator is not None
+                _ready(
+                    frozen_adweight_evaluator(
+                        packed_params, material_params, b_bases, compile_points
+                    )
+                )
         compilation_seconds += time.perf_counter() - compile_started
 
         training_block_started = time.perf_counter()
@@ -548,16 +646,25 @@ def _run_warmup(
                 points = uniform_collocation_points(
                     collocation_key, config.sampling.adam
                 )
-                unpacked_params = unpack_field_parameters(packed_params)
-                for case, context, params in zip(cases, contexts, unpacked_params):
-                    weights = _warmup_weights(config, variant, adaptive[case])
-                    statistics = pressure_gradient_statistics(
-                        params, material_params, physics, context, variant,
-                        points, weights, freeze_sigma=frozen,
+                evaluator = (
+                    frozen_adweight_evaluator
+                    if frozen else unfrozen_adweight_evaluator
+                )
+                if evaluator is None:
+                    raise RuntimeError("Missing compiled field-adweight evaluator")
+                norms_by_case = np.asarray(
+                    jax.device_get(
+                        evaluator(
+                            packed_params, material_params, b_bases, points
+                        )
+                    ),
+                    dtype=float,
+                )
+                if not np.all(np.isfinite(norms_by_case)) or np.any(norms_by_case < 0.0):
+                    raise FloatingPointError(
+                        f"Non-finite field-adweight norms before warmup Adam {step}"
                     )
-                    norms = jnp.asarray(
-                        [statistics[f"{name}_gradient_l2_norm"] for name in FIELD_COMPONENTS]
-                    )
+                for case, norms in zip(cases, norms_by_case):
                     if step > 1:
                         options = config.loss.field_adweights
                         adaptive[case] = update_state(
@@ -625,6 +732,8 @@ def _run_warmup(
                     statistics = pressure_gradient_statistics(
                         params, material_params, physics, context, variant,
                         points, case_weights, freeze_sigma=frozen,
+                        include_data=False,
+                        homogeneous_material=homogeneous_material,
                     )
                     pressure_gradient_rows.append(
                         {
@@ -934,6 +1043,30 @@ def run_training(
                 freeze_sigma=True, tv_weight=tv_weight,
                 tv_epsilon_squared=config.loss.tv.epsilon_squared,
             )
+            unfrozen_field_adweight_evaluator = (
+                _make_field_adweight_evaluator(
+                    physics,
+                    active_contexts,
+                    variant,
+                    freeze_sigma=False,
+                )
+                if variant.field_adweights else None
+            )
+            frozen_field_adweight_evaluator = (
+                _make_field_adweight_evaluator(
+                    physics,
+                    active_contexts,
+                    variant,
+                    freeze_sigma=True,
+                )
+                if variant.field_adweights else None
+            )
+            material_adweight_evaluator = (
+                _make_material_adweight_evaluator(
+                    physics, active_contexts, variant
+                )
+                if variant.material_adweights else None
+            )
             compile_key = jax.random.key(
                 stable_seed("compile", package_index, "inverse")
             )
@@ -960,6 +1093,41 @@ def run_training(
                     config.optimization.data_initial_factor, b_bases,
                 )
                 _ready(compiled)
+            if (
+                unfrozen_field_adweight_evaluator is not None
+                or material_adweight_evaluator is not None
+            ):
+                compile_points = uniform_collocation_points(
+                    compile_key, config.sampling.adam
+                )
+                if unfrozen_field_adweight_evaluator is not None:
+                    _ready(
+                        unfrozen_field_adweight_evaluator(
+                            packed_field_params,
+                            material_params,
+                            b_bases,
+                            compile_points,
+                        )
+                    )
+                    if sigma_steps < adam_steps:
+                        assert frozen_field_adweight_evaluator is not None
+                        _ready(
+                            frozen_field_adweight_evaluator(
+                                packed_field_params,
+                                material_params,
+                                b_bases,
+                                compile_points,
+                            )
+                        )
+                if material_adweight_evaluator is not None:
+                    _ready(
+                        material_adweight_evaluator(
+                            material_params,
+                            packed_field_params,
+                            b_bases,
+                            compile_points,
+                        )
+                    )
             compilation_seconds += time.perf_counter() - compile_started
             configured_snapshots = snapshot_steps(
                 adam_steps, config.logging.material_snapshot_fractions
@@ -983,26 +1151,35 @@ def run_training(
                     and (step - 1)
                     % config.loss.material_adweights.update_interval_adam == 0
                 )
-                field_params = None
-                if field_adweight_event or material_adweight_event:
-                    field_params = unpack_field_parameters(packed_field_params)
 
                 if field_adweight_event:
-                    assert field_params is not None
                     points = uniform_collocation_points(
                         collocation_key, config.sampling.adam
                     )
-                    for index, (case, context) in enumerate(zip(active, active_contexts)):
-                        current_weights = _field_weights(
-                            config, variant, field_adaptive[case], data_factor
+                    evaluator = (
+                        frozen_field_adweight_evaluator
+                        if frozen else unfrozen_field_adweight_evaluator
+                    )
+                    if evaluator is None:
+                        raise RuntimeError(
+                            "Missing compiled field-adweight evaluator"
                         )
-                        statistics = pressure_gradient_statistics(
-                            field_params[index], material_params, physics, context,
-                            variant, points, current_weights, freeze_sigma=frozen,
+                    norms_by_case = np.asarray(
+                        jax.device_get(
+                            evaluator(
+                                packed_field_params,
+                                material_params,
+                                b_bases,
+                                points,
+                            )
+                        ),
+                        dtype=float,
+                    )
+                    if not np.all(np.isfinite(norms_by_case)) or np.any(norms_by_case < 0.0):
+                        raise FloatingPointError(
+                            f"Non-finite field-adweight norms before inverse Adam {step}"
                         )
-                        norms = jnp.asarray(
-                            [statistics[f"{name}_gradient_l2_norm"] for name in FIELD_COMPONENTS]
-                        )
+                    for case, norms in zip(active, norms_by_case):
                         options = config.loss.field_adweights
                         if step > 1:
                             field_adaptive[case] = update_state(
@@ -1017,15 +1194,29 @@ def run_training(
 
                 if material_adweight_event:
                     assert material_adaptive is not None
-                    assert field_params is not None
                     if points is None:
                         points = uniform_collocation_points(
                             collocation_key, config.sampling.adam
                         )
-                    norms = material_case_gradient_norms(
-                        material_params, field_params, physics, active_contexts,
-                        variant, points,
+                    if material_adweight_evaluator is None:
+                        raise RuntimeError(
+                            "Missing compiled material-adweight evaluator"
+                        )
+                    norms = np.asarray(
+                        jax.device_get(
+                            material_adweight_evaluator(
+                                material_params,
+                                packed_field_params,
+                                b_bases,
+                                points,
+                            )
+                        ),
+                        dtype=float,
                     )
+                    if not np.all(np.isfinite(norms)) or np.any(norms < 0.0):
+                        raise FloatingPointError(
+                            f"Non-finite material-adweight norms before inverse Adam {step}"
+                        )
                     options = config.loss.material_adweights
                     if step > 1:
                         material_adaptive = update_state(

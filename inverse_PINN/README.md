@@ -1,127 +1,104 @@
 # Modular inverse PINN
 
-`inverse_PINN` is the current all-at-once inverse workflow. The parameters of
-all active pressure networks are packed into one pytree and updated from their
-mean loss with a single optimizer state. It jointly learns those complex
-pressure fields and a bounded slowness/material network. Training and plotting
-are separate: the training module never imports Matplotlib.
+`inverse_PINN` jointly learns one complex pressure field per acquisition and a
+bounded slowness/material map. Training and plotting are separate; training
+does not import Matplotlib.
 
-## Commands
+Run every command from the repository root.
 
-Generate the FEM files referenced by the JSON configuration first; see
-[`../FEM/README.md`](../FEM/README.md). Then run one variant and seed:
+## Prepare data
+
+Each JSON configuration names its boundary traces, FEM reference, matrices,
+and reordered P2 mesh. Generate those files first with the tool documented in
+[`../FEM/README.md`](../FEM/README.md).
+
+For example, `circlebottomright_1200_A.json` expects data generated with
+`--defectname circlebottomright`, frequency `1200`, modes `0,1,2,3`, incidence
+`-1`, and `--tag-contrasts 2:0.8`.
+
+## Run
+
+One variant and seed:
 
 ```bash
-python -m inverse_PINN.cli run \
-  --config inverse_PINN/configs/circlebottomright_smoke.json \
+.venv/bin/python -m inverse_PINN.cli run \
+  --config inverse_PINN/configs/circlebottomright_1200_A.json \
   --variant fourier_total \
   --seed 0
 ```
 
-Run a complete variant/seed campaign:
+A Cartesian product of variants and seeds:
 
 ```bash
-python -m inverse_PINN.cli campaign \
-  --config inverse_PINN/configs/circlebottomright_smoke.json \
+.venv/bin/python -m inverse_PINN.cli campaign \
+  --config inverse_PINN/configs/circlebottomright_1200_A.json \
   --variants fourier_total,fourier_scattered \
   --seeds 0,1
 ```
 
-Both commands reject an existing output directory. The campaign creates
-`<output_root>/<config-stem>_campaign/runs/`; each run has one directory per
-training package. The checked-in configuration is deliberately a tiny smoke
-test and should not be used as a scientific budget without modification.
+Both commands reject an existing output directory. A single run is written to
+`<output_root>/<config-stem>/<variant>_seed<seed>/`; a campaign is written to
+`<output_root>/<config-stem>_campaign/runs/`.
+
+The checked-in configurations use full optimization and sampling budgets.
+Copy one and reduce its `training_packages`, sampling sizes, and logging grid
+before using it as a smoke test.
 
 ## Variants
 
-Variant names are strict and token-ordered:
+Canonical names contain, in order:
 
-- architecture: `fourier` or `fourier_modified`;
-- formulation: `total` or `scattered`;
-- optional suffixes, in this order: `_field_adweights`,
-  `_material_adweights`, `_tv`.
+1. architecture: `fourier` or `fourier_modified`;
+2. formulation: `total` or `scattered`;
+3. optional `_field_adweights`, `_material_adweights`, and `_tv` suffixes in
+   that order.
 
 For example,
 `fourier_modified_scattered_field_adweights_material_adweights_tv` enables all
-three optional mechanisms. The two architectures, two formulations, and eight
-modifier combinations produce 32 accepted names. Fourier scales are trained
-for the configured fraction of Adam updates and then frozen.
+three modifiers. The combinations produce 32 accepted variants.
 
-The four field loss components are PDE, Neumann, combined DtN, and boundary-data
-terms. Monitoring records only their package-wide means and the common pressure
-objective; it does not recompute or save one pressure loss per acquisition. The
-material history is global as well. Per-acquisition work is reserved for the
-explicit gradient diagnostics, snapshots and final FEM metrics. The material
-objective can include per-case PDE terms and total variation. L-BFGS budgets
-are supported separately for the field and material phases.
+## Configuration notes
 
-## Configuration
+Configuration parsing is strict: unknown or missing keys, missing files,
+invalid material regions, and evanescent incident cases are rejected before
+training. Relative paths are resolved from the repository root.
 
-`config.py` validates the JSON strictly: unknown or missing keys, invalid
-geometry/material regions, evanescent incident cases, and missing data files
-are rejected before training. Paths are resolved relative to the repository
-root unless they are absolute.
+`training_packages` defines the acquisition curriculum and the warm-up/inverse
+Adam and L-BFGS budgets. Field loss weights use the order
+`[PDE, Neumann, DtN, boundary data]`. `data_transition_steps` ramps the data
+term during inverse Adam training. The learning-rate schedule uses the JSON
+key `consine_decay_stop` (spelling kept for compatibility).
 
-The `training_packages` list defines the curriculum. Each package declares its
-active cases plus warm-up and inverse budgets. The configuration also controls
-collocation counts, Sobol sampling, logging intervals, snapshot fractions,
-learning-rate schedules, loss weights, adaptive weights, and TV regularization.
-`optimization.data_transition_steps` fixes the number of Adam updates used to
-ramp the data-loss factor from `data_initial_factor` to one, independently of
-the total inverse budget.
-The field and material Adam rates stay constant through
-`optimization.cosine_decay_start`, follow a cosine decay until
-`optimization.consine_decay_stop`, then remain at
-`optimization.cosine_decay_alpha` times their initial values. This schedule is
-restarted for every warm-up or inverse Adam phase; the sigma schedule remains
-independent.
+Adaptive-weight gradient evaluators are compiled before the comparable
+training timer starts. Their update intervals directly affect cost; the
+checked-in configurations use `update_interval_adam: 500`.
 
-Console progress reports show the current global pressure objective and the
-package-wide mean PDE, boundary (`Neumann + DtN`), and data components. The
-three displayed components are unweighted; `global` uses the current configured
-or adaptive weights.
+Fourier scales are trained for `sigma_decay_fraction` of each Adam phase and
+then frozen. The persistent JAX cache defaults to `inverse_PINN/cache/`; set
+`JAX_COMPILATION_CACHE_DIR` before launch to use another directory.
 
-The default smoke configuration expects these generated files in
-`FEM/pinn_data/`:
+## Results and figures
 
-```text
-pinn_boundary_left_circlebottomrightforward_ratio0p8.csv
-pinn_boundary_right_circlebottomrightforward_ratio0p8.csv
-fem_field_circlebottomrightforward_ratio0p8.csv
-Mass_matrix_circlebottomrightforward.csv
-Stiff_matrix_circlebottomrightforward.csv
-mesh_nodes_circlebottomrightforward.csv
-mesh_triangles_circlebottomrightforward.csv
-```
+Each run contains a manifest and summary, then one `packages/pkg.../`
+directory per curriculum stage. A package stores loss, gradient, adaptive
+weight, sigma and timing histories; best pressure/material checkpoints;
+celerity snapshots; and final pressure/celerity metrics.
 
-## Run artifacts and plotting
-
-Every package writes the following main artifacts:
-
-- `pressure_common_loss_history.csv` et `material_loss_history.csv`;
-- `pressure_gradient_history.csv`, `material_snapshot_diagnostics.csv`, and
-  `material_gradient_cosines.csv`;
-- `adweights_history.csv`, `sigma_history.csv`, and `timing.csv`;
-- `pressure_weights_best.npz` and `slowness_weights_best.npz`;
-- `celerity_snapshots.npz`, `pressure_metrics.csv`,
-  `celerity_metrics.json`, and `summary.json`.
-
-Plot completed runs offline:
+Generate figures after training:
 
 ```bash
-MPLCONFIGDIR=/tmp/matplotlib python -m inverse_PINN.plot_results \
-  --campaign-root inverse_PINN/results/circlebottomright_smoke_campaign \
+MPLCONFIGDIR=/tmp/matplotlib .venv/bin/python -m inverse_PINN.plot_results \
+  --campaign-root inverse_PINN/results/circlebottomright_1200_A_campaign \
   --cosines
 ```
 
-The command creates PDF field, pressure-misfit, common-pressure-loss,
-reconstructed-celerity, celerity-snapshot, and optional gradient-cosine figures
-inside each package's `figures/` directory. The `--cosines` option reads the
-snapshot diagnostics already saved during training; it does not recompute
-training gradients.
+The command searches below the supplied root and creates a `figures/`
+directory in each package. `--cosines` plots diagnostics already recorded
+during training; it does not recompute gradients.
 
-JAX's persistent compilation cache is enabled automatically in
-`inverse_PINN/cache/` (ignored by Git). Consequently, later processes can reuse
-compatible executables. A change in shapes, architecture, variant, platform,
-JAX/XLA version, or relevant static configuration still requires compilation.
-`JAX_COMPILATION_CACHE_DIR` can be set before launch to use another directory.
+## Tests
+
+```bash
+MPLCONFIGDIR=/tmp/matplotlib JAX_PLATFORMS=cpu \
+  .venv/bin/python -m pytest -q tests/test_inverse_pinn_*.py
+```
